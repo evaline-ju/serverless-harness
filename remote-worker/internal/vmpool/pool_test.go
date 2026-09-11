@@ -317,3 +317,35 @@ func TestExecTimesOutDuringColdAcquire(t *testing.T) {
 		t.Fatalf("%d VMs live after a timeout during cold acquire, want 0", n)
 	}
 }
+
+// TestExecTimesOutDuringResume pins fix-round-2: a TimeoutS expiry while Resume is
+// in flight must classify as ErrTimeout, not as a RefuseSpawn resume failure — the
+// same misclassification Finding 1 fixed for acquire, one step later in Exec.
+func TestExecTimesOutDuringResume(t *testing.T) {
+	p, lc, clk := testPool(t)
+	resuming := make(chan struct{})
+	release := make(chan struct{})
+	lc.setResumeFn(func(_ *fakeVM, ctx context.Context) error {
+		close(resuming)
+		<-release
+		return ctx.Err()
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Exec(context.Background(), "run-a", Exec{Command: "sleep 99", TimeoutS: 5}, &capturingSink{})
+		done <- err
+	}()
+	<-resuming
+	clk.Advance(5 * time.Second)
+	close(release)
+	err := <-done
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("err = %v, want ErrTimeout", err)
+	}
+	if got := p.Stats().Refusals[RefuseSpawn]; got != 0 {
+		t.Fatalf("Refusals[%s] = %d, want 0 — a timeout during Resume must not be counted as a spawn failure", RefuseSpawn, got)
+	}
+	if n := lc.liveCount(); n != 0 {
+		t.Fatalf("%d VMs live after a timeout during Resume, want 0", n)
+	}
+}

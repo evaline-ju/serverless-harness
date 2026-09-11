@@ -25,6 +25,7 @@ type fakeLauncher struct {
 	restoreErr    error
 	beforeRestore func(RestoreRequest)
 	runFn         func(*fakeVM, Command, Sink) (Result, error)
+	resumeFn      func(*fakeVM, context.Context) error
 	destroyErr    error
 	keyOverride   string // hand back a VM bound to this key instead of the requested one
 }
@@ -77,6 +78,17 @@ func (l *fakeLauncher) setRunFn(f func(*fakeVM, Command, Sink) (Result, error)) 
 	l.mu.Unlock()
 }
 
+// setResumeFn installs a hook run inside fakeVM.Resume, AFTER the double-resume and
+// resume-after-destroy checks and outside the fakeVM lock — same placement as runFn
+// relative to Run — so a test can block a Resume in flight (e.g. to exercise a
+// TimeoutS expiry or an abort landing mid-Resume) without touching the fake's
+// existing strictness about resume state.
+func (l *fakeLauncher) setResumeFn(f func(*fakeVM, context.Context) error) {
+	l.mu.Lock()
+	l.resumeFn = f
+	l.mu.Unlock()
+}
+
 func (l *fakeLauncher) setKeyOverride(k string) { l.mu.Lock(); l.keyOverride = k; l.mu.Unlock() }
 
 func (l *fakeLauncher) createdCount() int { l.mu.Lock(); defer l.mu.Unlock(); return l.created }
@@ -95,6 +107,12 @@ func (l *fakeLauncher) getRunFn() func(*fakeVM, Command, Sink) (Result, error) {
 	return l.runFn
 }
 
+func (l *fakeLauncher) getResumeFn() func(*fakeVM, context.Context) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.resumeFn
+}
+
 type fakeVM struct {
 	lc           *fakeLauncher
 	id, key, dir string
@@ -109,14 +127,19 @@ func (v *fakeVM) Key() string { return v.key }
 
 func (v *fakeVM) Resume(ctx context.Context) error {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	if v.destroyed {
+		v.mu.Unlock()
 		return fmt.Errorf("fakeVM %s: Resume after Destroy", v.id)
 	}
 	if v.resumed {
+		v.mu.Unlock()
 		return fmt.Errorf("fakeVM %s: Resume twice", v.id)
 	}
 	v.resumed = true
+	v.mu.Unlock()
+	if fn := v.lc.getResumeFn(); fn != nil {
+		return fn(v, ctx)
+	}
 	return nil
 }
 

@@ -74,6 +74,25 @@ func (p *pool) refuse(r RefusalReason, format string, a ...any) error {
 	return refusal(r, format, a...)
 }
 
+// classify maps an error from any timeout-bounded step onto the sentinel the wire
+// contract needs, or returns nil if the step's error is not a cancellation at all and
+// the caller should classify it on its own terms.
+//
+// Timeout is tested BEFORE abort, and that order is load-bearing: the timer cancels
+// runCtx, so checking the abort case first would report every timeout as an abort and
+// the worker would emit a terminal signal frame where the contract requires
+// ExecError{"timeout:<n>"}. The outer ctx is what distinguishes a genuine abort from
+// the timer's own cancellation, which is why it — and not runCtx — is the argument.
+func (p *pool) classify(ctx context.Context, timedOut *atomic.Bool, timeoutS uint32) error {
+	switch {
+	case timedOut.Load():
+		return fmt.Errorf("%w:%d", ErrTimeout, timeoutS)
+	case ctx.Err() != nil:
+		return ErrAborted
+	}
+	return nil
+}
+
 func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, error) {
 	if err := checkKey(key); err != nil {
 		if r := ReasonOf(err); r != "" {
@@ -100,16 +119,8 @@ func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, 
 
 	vm, err := p.acquire(runCtx, key)
 	if err != nil {
-		// Same three-way classification the post-Run switch below does, and for the
-		// same reason: a timeout also cancels runCtx, so timeout must be tested
-		// first or every acquire timeout would report as an abort. Note ctx.Err(),
-		// not runCtx.Err() — the outer context is what distinguishes a real abort
-		// from the timer's own cancellation.
-		switch {
-		case timedOut.Load():
-			return Result{}, fmt.Errorf("%w:%d", ErrTimeout, e.TimeoutS)
-		case ctx.Err() != nil:
-			return Result{}, ErrAborted
+		if cErr := p.classify(ctx, &timedOut, e.TimeoutS); cErr != nil {
+			return Result{}, cErr
 		}
 		return Result{}, err
 	}
@@ -121,6 +132,9 @@ func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, 
 		return Result{}, fmt.Errorf("%w: popped %q for %q", ErrKeyMismatch, vm.Key(), key)
 	}
 	if err := vm.Resume(runCtx); err != nil {
+		if cErr := p.classify(ctx, &timedOut, e.TimeoutS); cErr != nil {
+			return Result{}, cErr
+		}
 		return Result{}, p.refuse(RefuseSpawn, "resume %q: %v", key, err)
 	}
 
@@ -132,14 +146,8 @@ func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, 
 		CapBytes:  OutputCapBytes,
 	}, out)
 
-	// Order matters: a timeout also cancels runCtx, so timeout is checked first or
-	// every timeout would report as an abort and the worker would emit End{-1}
-	// instead of ExecError{"timeout:<n>"}.
-	switch {
-	case timedOut.Load():
-		return res, fmt.Errorf("%w:%d", ErrTimeout, e.TimeoutS)
-	case ctx.Err() != nil:
-		return res, ErrAborted
+	if cErr := p.classify(ctx, &timedOut, e.TimeoutS); cErr != nil {
+		return res, cErr
 	}
 	return res, runErr
 }
