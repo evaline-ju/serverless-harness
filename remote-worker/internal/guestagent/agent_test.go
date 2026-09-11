@@ -2,6 +2,7 @@ package guestagent
 
 import (
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -168,6 +169,70 @@ func TestAgentReportsATimeoutRatherThanHanging(t *testing.T) {
 	// explicit frame instead of silence.
 	if !strings.HasPrefix(errMsg, "timeout:") {
 		t.Fatalf("agent error = %q, want a timeout: prefix", errMsg)
+	}
+}
+
+// TestAgentCapsEachStreamAtSourceAndReportsDropped above drives 4096 bytes against
+// the 32 KiB MaxFrame read buffer, so the whole unterminated line fits in a single
+// drainUntilNonce Read() call and the carry-over path added in fix round 1 is never
+// taken — that test would pass identically against the pre-rewrite ReadBytes('\n')
+// implementation, which is exactly the regression this test guards against.
+//
+// 160 KiB is five times MaxFrame, forcing drainUntilNonce through several Read()
+// cycles on one line with no newline at all, carrying a small remainder across each
+// boundary. The exact byte counts (not just "capped, roughly") are what would catch
+// an off-by-one in that carry-over, which is the one way the rewrite could go subtly
+// wrong.
+func TestAgentBoundsDrainAcrossMultipleReadCycles(t *testing.T) {
+	const total = 160 * 1024 // 5x MaxFrame (32 KiB): forces multiple Read() cycles.
+	const cap = 1000
+
+	a := newTestAgent(t)
+	start := time.Now()
+	stdout, _, end, errMsg := drive(t, a, Request{
+		Command:  fmt.Sprintf("head -c %d /dev/zero | tr '\\0' 'a'", total),
+		CapBytes: cap,
+	}, nil)
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("drive took %s: a bounded drain must not buffer the whole line before capping", elapsed)
+	}
+	if errMsg != "" {
+		t.Fatalf("agent error: %s", errMsg)
+	}
+	if len(stdout) != cap {
+		t.Fatalf("forwarded %d stdout bytes, want exactly %d", len(stdout), cap)
+	}
+	if end.DroppedStdout != int64(total-cap) {
+		t.Fatalf("DroppedStdout = %d, want exactly %d", end.DroppedStdout, total-cap)
+	}
+}
+
+// TestAgentReportsATimeoutRatherThanHanging above only checks the FIRST command's
+// error. Nothing drives a second command afterwards, so neither killShell actually
+// running nor ServeConn's dead-check actually gating dispatch is pinned by it —
+// either could be deleted and that test would still pass.
+//
+// This test drives a second, unrelated command on the SAME Agent after a timeout and
+// asserts it fails fast with an explicit error mentioning the dead agent, rather than
+// hanging (the orphaned drain goroutines racing a new command's, per fix round 1's
+// Finding 3) or succeeding against a shell that no longer exists.
+func TestAgentRejectsCommandsOnADeadAgentAfterATimeout(t *testing.T) {
+	a := newTestAgent(t)
+	_, _, _, errMsg := drive(t, a, Request{Command: "sleep 30", TimeoutS: 1, CapBytes: 1 << 20}, nil)
+	if !strings.HasPrefix(errMsg, "timeout:") {
+		t.Fatalf("first command's error = %q, want a timeout: prefix", errMsg)
+	}
+
+	start := time.Now()
+	_, _, _, errMsg2 := drive(t, a, Request{Command: "echo hi", CapBytes: 1 << 20}, nil)
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("second command took %s: a dead Agent must fail fast, not hang", elapsed)
+	}
+	if errMsg2 == "" {
+		t.Fatal("second command on a dead agent succeeded; want an error")
+	}
+	if !strings.Contains(errMsg2, "dead") {
+		t.Fatalf("second command's error = %q, want it to mention the agent is dead", errMsg2)
 	}
 }
 
