@@ -95,10 +95,7 @@ func (p *pool) classify(ctx context.Context, timedOut *atomic.Bool, timeoutS uin
 
 func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, error) {
 	if err := checkKey(key); err != nil {
-		if r := ReasonOf(err); r != "" {
-			p.counters.refuse(r)
-		}
-		return Result{}, err
+		return Result{}, p.countRefusal(err)
 	}
 
 	// The timeout must bound the WHOLE Exec, including a cold acquire's VM boot —
@@ -165,7 +162,7 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, error) {
 	rp, fresh, err := p.runLocked(key)
 	if err != nil {
 		p.mu.Unlock()
-		return nil, err
+		return nil, p.countRefusal(err)
 	}
 	rp.lastExec = p.clk.Now()
 
@@ -186,6 +183,10 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, error) {
 		cause = ColdParked
 	}
 	rp.parked = false
+	if err := p.admitLocked(false); err != nil {
+		p.mu.Unlock()
+		return nil, p.countRefusal(err)
+	}
 	rp.inFlight++
 	dir, id := rp.dir, p.nextIDLocked()
 	p.mu.Unlock()
@@ -243,6 +244,9 @@ func (p *pool) destroy(key string, vm VM) {
 func (p *pool) runLocked(key string) (*runPool, bool, error) {
 	if rp := p.runs[key]; rp != nil {
 		return rp, false, nil
+	}
+	if err := p.admitLocked(true); err != nil {
+		return nil, false, err
 	}
 	dir, err := p.workspaceDir(key)
 	if err != nil {
@@ -307,8 +311,8 @@ func (p *pool) Stats() Stats {
 		if rp.idleFor(now) > half {
 			s.IdleStandbyResidency += len(rp.ready)
 		}
-		s.CommittedBytes += int64(len(rp.ready)+rp.inFlight+rp.warming) * p.perVMBytes()
 	}
+	s.CommittedBytes = p.committedLocked()
 	p.mu.Unlock()
 	p.counters.snapshot(&s)
 	return s
