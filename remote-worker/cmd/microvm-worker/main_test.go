@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -71,5 +72,65 @@ func TestPoolConfigRefusesAMissingMemoryBudget(t *testing.T) {
 	// the OOM killer, whose size-ranked favourites include microvm-worker itself.
 	if err == nil || !strings.Contains(err.Error(), "SH_MAX_COMMITTED_MB") {
 		t.Fatalf("err = %v, want it to name SH_MAX_COMMITTED_MB", err)
+	}
+}
+
+// Fix-round item 5: the manifest's InstanceType must be verified against the
+// running host, additively alongside the existing verify+pin+probe block.
+
+func fixedHost(t string) func(context.Context) string {
+	return func(context.Context) string { return t }
+}
+
+func TestVerifyInstanceTypeAcceptsAMatch(t *testing.T) {
+	get := envFrom(map[string]string{})
+	if err := verifyInstanceType(get, "c6i.large", fixedHost("c6i.large")); err != nil {
+		t.Fatalf("matching instance types should not be refused: %v", err)
+	}
+}
+
+func TestVerifyInstanceTypeRefusesAMismatchNamingBothValues(t *testing.T) {
+	get := envFrom(map[string]string{})
+	err := verifyInstanceType(get, "c6i.large", fixedHost("m5.xlarge"))
+	if err == nil {
+		t.Fatal("a mismatched instance type must be refused")
+	}
+	if !strings.Contains(err.Error(), "c6i.large") || !strings.Contains(err.Error(), "m5.xlarge") {
+		t.Fatalf("err = %v, want it to name both the manifest and host instance types", err)
+	}
+}
+
+func TestVerifyInstanceTypeOverrideEnvBypassesAMismatch(t *testing.T) {
+	get := envFrom(map[string]string{"SH_ALLOW_INSTANCE_TYPE_MISMATCH": "true"})
+	if err := verifyInstanceType(get, "c6i.large", fixedHost("m5.xlarge")); err != nil {
+		t.Fatalf("the override env var should bypass a mismatch: %v", err)
+	}
+}
+
+func TestVerifyInstanceTypeSkipsWhenManifestHasNoRecordedType(t *testing.T) {
+	get := envFrom(map[string]string{})
+	// An older manifest with no InstanceType recorded: nothing to compare, so this
+	// must fail open, not closed.
+	if err := verifyInstanceType(get, "", fixedHost("m5.xlarge")); err != nil {
+		t.Fatalf("an empty manifest InstanceType must not be refused: %v", err)
+	}
+}
+
+func TestVerifyInstanceTypeSkipsWhenHostIsUndetectable(t *testing.T) {
+	get := envFrom(map[string]string{})
+	// No metadata service and no stable host identity available: fail open rather
+	// than block every worker's startup on an environment this check cannot reach.
+	if err := verifyInstanceType(get, "c6i.large", fixedHost("")); err != nil {
+		t.Fatalf("an undetectable host must not be refused: %v", err)
+	}
+}
+
+// stableHostIdentity itself is exercised only for "never returns empty" -- the
+// metadata-service probes need real network access this test suite must not
+// depend on, and are covered by design (fail-open on every non-2xx/timeout/error)
+// rather than by hitting real cloud endpoints from a unit test.
+func TestStableHostIdentityNeverReturnsEmpty(t *testing.T) {
+	if got := stableHostIdentity(); got == "" {
+		t.Fatal("stableHostIdentity must always return a non-empty fallback")
 	}
 }

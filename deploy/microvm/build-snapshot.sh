@@ -407,55 +407,208 @@ quiesce_guest() {
   "$STAGE/guest_client" -uds "$uds" -port 1024 -timeout-s 10 -command 'sync' >/dev/null 2>&1
 }
 
-boot_quiesce_snapshot_firecracker() {
-  local api_sock="$STAGE/firecracker-api.sock" vsock_uds="$STAGE/vsock.sock" console_log="$STAGE/console.log"
-  log "starting firecracker ($api_sock)"
-  # A real invocation configures boot-source/drives/vsock/machine-config over
-  # $api_sock (PUT /boot-source, /drives/rootfs, /vsock, /machine-config), then
-  # InstanceStart via PUT /actions -- omitted here because it needs a running
-  # firecracker binary and /dev/kvm, neither available off a KVM host (spec's Task
-  # 12 KVM gate covers exercising this for real).
-  firecracker --api-sock "$api_sock" >"$console_log" 2>&1 &
-  local fc_pid=$!
-  trap 'kill "$fc_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+# ---------------------------------------------------------------------------
+# Jail helpers (fix-round items 1, 2, 9): both VMM arms boot and restore
+# chrooted into a directory whose ONLY structure is the fixed, jail-relative
+# basenames baked into their configs -- /kernel, /rootfs, /workspace.img,
+# /vsock.sock, /run/<api-sock> -- because that is the one thing that makes a
+# recorded path still resolve after the process that recorded it, and the
+# directory it was chrooted into, are both gone. This is not invented here: it
+# is remote-worker/internal/vmpool/launcher_firecracker.go's own jailer
+# convention (apiSockRelPath, vsockRelPath, the fileVMState/fileMemory/
+# fileKernel/fileRootfs/fileAgent hardlink set, workspace.img), copied
+# verbatim rather than re-derived, per this round's own instruction that the
+# launcher wins on any disagreement. No disagreement was found.
+# ---------------------------------------------------------------------------
 
-  curl -s --unix-socket "$api_sock" -X PUT 'http://localhost/boot-source' \
-    -d "{\"kernel_image_path\":\"$KERNEL\",\"boot_args\":\"console=ttyS0 reboot=k panic=1 pci=off\"}" >/dev/null
-  curl -s --unix-socket "$api_sock" -X PUT 'http://localhost/drives/rootfs' \
-    -d "{\"drive_id\":\"rootfs\",\"path_on_host\":\"$STAGE/rootfs\",\"is_root_device\":true,\"is_read_only\":false}" >/dev/null
-  curl -s --unix-socket "$api_sock" -X PUT 'http://localhost/vsock' \
-    -d "{\"vsock_id\":\"vsock0\",\"guest_cid\":3,\"uds_path\":\"$vsock_uds\"}" >/dev/null
-  curl -s --unix-socket "$api_sock" -X PUT 'http://localhost/machine-config' \
-    -d "{\"mem_size_mib\":$GUEST_RAM_MB,\"vcpu_count\":1}" >/dev/null
-  curl -s --unix-socket "$api_sock" -X PUT 'http://localhost/actions' \
-    -d '{"action_type":"InstanceStart"}' >/dev/null
+# DefaultWorkspaceImageBytes in launcher_firecracker.go: 2 GiB, "matches the
+# brief's own test fixtures". Kept identical here so a golden snapshot built
+# by this script presents the guest the same /dev/vdb capacity the production
+# launcher's lazily-created workspace.img would.
+WORKSPACE_IMAGE_BYTES=$((2 * 1024 * 1024 * 1024))
+
+require_root() {
+  # Item 4: the API socket either VMM creates is root-owned the moment the VMM
+  # creates it, and both boot/verify paths now chroot and bind-mount /dev/kvm
+  # into a jail -- both need root. Failing loudly here beats failing confusingly
+  # at the first `curl --unix-socket`/`mount --bind` permission error.
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "build-snapshot.sh: must run as root (needed for chroot, mount --bind" >&2
+    echo "  /dev/kvm, and the VMM's own root-owned API socket)" >&2
+    exit 1
+  fi
+}
+
+# api_put issues a PUT with JSON body $3 to path $2 on the VMM's Unix-socket API
+# $1, and treats a transport failure OR a non-2xx response as fatal (item 4). The
+# previous form (`curl -s ... >/dev/null`) swallowed both kinds of failure and let
+# the build limp on to a snapshot silently missing whatever the call configured.
+api_put() {
+  local sock="$1" path="$2" body="$3" resp status
+  resp="$(curl -s -S --unix-socket "$sock" -w '\n%{http_code}' -X PUT "http://localhost${path}" -d "$body")" || {
+    echo "build-snapshot.sh: PUT $path: curl could not reach $sock" >&2
+    exit 1
+  }
+  status="${resp##*$'\n'}"
+  case "$status" in
+    2??) ;;
+    *)
+      echo "build-snapshot.sh: PUT $path returned HTTP $status: ${resp%$'\n'*}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# hardlink_or_copy_bin resolves $1 on PATH and hardlinks (falling back to a copy
+# across filesystems) it into $2, so a chrooted VMM process can execve it from
+# inside its own jail -- chroot resolves the command it execs AFTER changing
+# root, so the binary must physically exist inside the jail, not just on $PATH.
+hardlink_or_copy_bin() {
+  local name="$1" dst="$2" src
+  src="$(command -v "$name")" || {
+    echo "build-snapshot.sh: $name not found on PATH" >&2
+    exit 1
+  }
+  rm -f "$dst"
+  ln "$src" "$dst" 2>/dev/null || cp -p "$src" "$dst"
+  chmod 0555 "$dst"
+}
+
+# jail_mount_dev bind-mounts /dev/kvm (mandatory -- the VMM cannot start without
+# it) and /dev/urandom (best-effort) into $1/dev, so a process chrooted into $1
+# can still reach them by their normal absolute device paths.
+jail_mount_dev() {
+  local jail="$1"
+  mkdir -p "$jail/dev"
+  : >"$jail/dev/kvm"
+  if ! mount --bind /dev/kvm "$jail/dev/kvm"; then
+    echo "build-snapshot.sh: could not bind-mount /dev/kvm into the jail at $jail" >&2
+    exit 1
+  fi
+  : >"$jail/dev/urandom" 2>/dev/null || true
+  mount --bind /dev/urandom "$jail/dev/urandom" 2>/dev/null || true
+}
+
+# jail_unmount_dev is the inverse of jail_mount_dev, and MUST run before rm -rf on
+# the jail: an active bind mount is a live mountpoint, and rm -rf through one
+# fails (or worse, on some setups silently no-ops) rather than actually clearing
+# the directory. Best-effort and safe to call even if nothing was mounted.
+jail_unmount_dev() {
+  local jail="$1"
+  umount "$jail/dev/urandom" 2>/dev/null || true
+  umount "$jail/dev/kvm" 2>/dev/null || true
+}
+
+# ensure_workspace_image creates $1 as a sparse ext4 filesystem of
+# WORKSPACE_IMAGE_BYTES -- the exact recipe (truncate, then mkfs.ext4 -F) of
+# launcher_firecracker.go's ensureWorkspaceImage, so the golden snapshot's second
+# drive is byte-for-byte the kind of image the production launcher creates.
+ensure_workspace_image() {
+  local path="$1"
+  truncate -s "$WORKSPACE_IMAGE_BYTES" "$path"
+  mkfs.ext4 -q -F "$path" >/dev/null
+}
+
+boot_quiesce_snapshot_firecracker() {
+  local jail="$STAGE"
+  local api_sock="$jail/run/firecracker.socket" vsock_uds="$jail/vsock.sock" console_log="$STAGE/console.log"
+  log "preparing the firecracker build jail at $jail (items 1, 2: jail-relative paths only)"
+  mkdir -p "$jail/run"
+  hardlink_or_copy_bin firecracker "$jail/firecracker"
+  jail_mount_dev "$jail"
+  # Item 2: a second, non-root, read-write drive so a restored VM has something
+  # for the per-run workspace to mount -- launcher_firecracker.go's Restore hard-
+  # links a workspace.img into every jail at this exact path expecting the golden
+  # snapshot to already have a matching drive configured; without one there is no
+  # PUT /drives/workspace at restore time (Firecracker's snapshot/load has no such
+  # call), so the drive has to already exist in the snapshotted config.
+  ensure_workspace_image "$jail/workspace.img"
+
+  log "starting firecracker chrooted into $jail ($api_sock)"
+  # Item 3: stdin redirected -- a backgrounded VMM that inherits this script's
+  # controlling terminal can be sent SIGTTIN and hang forever the moment it
+  # touches stdin, indistinguishable from a slow boot from the outside.
+  chroot "$jail" /firecracker --api-sock /run/firecracker.socket \
+    </dev/null >"$console_log" 2>&1 &
+  local fc_pid=$!
+  trap 'jail_unmount_dev "'"$jail"'"; kill "$fc_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+
+  # Item 1: kernel_image_path and the rootfs drive's path_on_host are now
+  # jail-relative ("/kernel", "/rootfs"), exactly like launcher_firecracker.go's
+  # own hardlink set -- not "$STAGE/kernel"/"$STAGE/rootfs", which is this bug in
+  # the first place: $STAGE is deleted by this script's own EXIT trap the moment
+  # the build finishes, and every subsequent LoadSnapshot would fail.
+  api_put "$api_sock" /boot-source \
+    "{\"kernel_image_path\":\"/kernel\",\"boot_args\":\"console=ttyS0 reboot=k panic=1 pci=off\"}"
+  api_put "$api_sock" /drives/rootfs \
+    "{\"drive_id\":\"rootfs\",\"path_on_host\":\"/rootfs\",\"is_root_device\":true,\"is_read_only\":false}"
+  api_put "$api_sock" /drives/workspace \
+    "{\"drive_id\":\"workspace\",\"path_on_host\":\"/workspace.img\",\"is_root_device\":false,\"is_read_only\":false}"
+  api_put "$api_sock" /vsock \
+    "{\"vsock_id\":\"vsock0\",\"guest_cid\":3,\"uds_path\":\"/vsock.sock\"}"
+  api_put "$api_sock" /machine-config \
+    "{\"mem_size_mib\":$GUEST_RAM_MB,\"vcpu_count\":1}"
+  api_put "$api_sock" /actions '{"action_type":"InstanceStart"}'
 
   wait_for_agent "$vsock_uds" "$console_log"
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
   quiesce_guest "$vsock_uds"
 
   log "snapshotting (PUT /snapshot/create, resuming nothing afterwards)"
-  curl -s --unix-socket "$api_sock" -X PUT 'http://localhost/vm' -d '{"state":"Paused"}' >/dev/null
-  curl -s --unix-socket "$api_sock" -X PUT 'http://localhost/snapshot/create' \
-    -d "{\"snapshot_path\":\"$STAGE/vmstate\",\"mem_file_path\":\"$STAGE/memfile\",\"snapshot_type\":\"Full\",\"resume_vm\":false}" >/dev/null
+  api_put "$api_sock" /vm '{"state":"Paused"}'
+  api_put "$api_sock" /snapshot/create \
+    "{\"snapshot_path\":\"/vmstate\",\"mem_file_path\":\"/memfile\",\"snapshot_type\":\"Full\",\"resume_vm\":false}"
 
   kill "$fc_pid" 2>/dev/null || true
+  wait "$fc_pid" 2>/dev/null || true
+  jail_unmount_dev "$jail"
   trap 'rm -rf "$STAGE"' EXIT
 }
 
 boot_quiesce_snapshot_cloud_hypervisor() {
-  local api_sock="$STAGE/ch-api.sock" vsock_uds="$STAGE/vsock.sock" console_log="$STAGE/console.log"
-  log "starting cloud-hypervisor ($api_sock)"
-  cloud-hypervisor --api-socket "$api_sock" \
-    --kernel "$KERNEL" \
-    --disk "path=$STAGE/rootfs" \
-    --vsock "cid=3,socket=$vsock_uds" \
+  local jail="$STAGE"
+  local api_sock="$jail/run/ch-api.sock" vsock_uds="$jail/vsock.sock" console_log="$STAGE/console.log"
+  log "preparing the cloud-hypervisor build jail at $jail (item 9: same jail-relative convention as the firecracker arm)"
+  mkdir -p "$jail/run"
+  hardlink_or_copy_bin cloud-hypervisor "$jail/cloud-hypervisor"
+  jail_mount_dev "$jail"
+
+  log "starting cloud-hypervisor chrooted into $jail ($api_sock)"
+  # Item 7: Cloud Hypervisor has no is_root_device-style flag the way Firecracker
+  # does -- without an explicit root= the guest kernel panics looking for its root
+  # device (docs/notes/cloud-hypervisor-tutorial.md, hands-on reproduced there).
+  # pci=off is Firecracker's own arg (its virtio devices are MMIO-only) and is
+  # deliberately DROPPED here: Cloud Hypervisor's virtio devices default to the
+  # PCI transport and need PCI enumerated to be found at all -- confirmed by the
+  # tutorial's own hands-on-tested, working boot cmdline, which never passes
+  # pci=off either.
+  #
+  # Item 8: readonly=on verified against the installed cloud-hypervisor v53.0's
+  # own `--disk` help text (full grammar includes
+  # "path=...,readonly=on|off,...,lock_granularity=byte-range|full"). Cloud
+  # Hypervisor holds an advisory per-disk write lock that Firecracker does not, so
+  # a writable disk here would block every concurrent restore against the same
+  # rootfs file. lock_granularity is the documented alternative for a future case
+  # that needs the disk writable under concurrency; not used here.
+  #
+  # Item 9: path=/rootfs is jail-relative, exactly like the firecracker arm's
+  # path_on_host, chrooted into $jail -- "$STAGE/rootfs" is the same
+  # gone-once-the-script-exits bug items 1/2 fix for firecracker.
+  #
+  # Item 3/10: stdin redirected -- same SIGTTIN hazard as the firecracker launch.
+  chroot "$jail" /cloud-hypervisor \
+    --api-socket /run/ch-api.sock \
+    --kernel /kernel \
+    --cmdline "console=ttyS0 root=/dev/vda rw reboot=k panic=1" \
+    --disk "path=/rootfs,readonly=on" \
+    --vsock "cid=3,socket=/vsock.sock" \
     --memory "size=${GUEST_RAM_MB}M" \
     --cpus boot=1 \
-    --console file="$console_log" \
-    --serial off >/dev/null 2>&1 &
+    --console "file=/console.log" \
+    --serial off \
+    </dev/null >/dev/null 2>&1 &
   local ch_pid=$!
-  trap 'kill "$ch_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+  trap 'jail_unmount_dev "'"$jail"'"; kill "$ch_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
 
   wait_for_agent "$vsock_uds" "$console_log"
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
@@ -463,18 +616,31 @@ boot_quiesce_snapshot_cloud_hypervisor() {
 
   log "snapshotting (ch-remote pause + snapshot, no resume afterwards)"
   ch-remote --api-socket "$api_sock" pause
-  ch-remote --api-socket "$api_sock" snapshot "file://$STAGE/ch-snapshot"
-  # Cloud Hypervisor writes one snapshot directory rather than separate
-  # vmstate/memfile files; split it so both VMMs feed write_manifest identically.
-  mv "$STAGE/ch-snapshot/state.json" "$STAGE/vmstate"
-  mv "$STAGE/ch-snapshot/memory-ranges" "$STAGE/memfile"
+  ch-remote --api-socket "$api_sock" snapshot "file:///ch-snapshot"
+  # Cloud Hypervisor writes one snapshot directory (config.json, state.json,
+  # memory-ranges) rather than separate vmstate/memfile files. config.json is kept
+  # (as ch-config.json) rather than discarded: vm.restore replays the WHOLE
+  # directory, config.json included, and the tutorial documents it as the vehicle
+  # for editing a restored snapshot's paths between snapshot and restore (§9a) --
+  # dropping it, as the previous form of this script did, left restore with no
+  # config to replay at all. state.json/memory-ranges are split out under the
+  # vmstate/memfile names so both VMMs feed write_manifest identically.
+  cp "$jail/ch-snapshot/config.json" "$STAGE/ch-config.json"
+  mv "$jail/ch-snapshot/state.json" "$STAGE/vmstate"
+  mv "$jail/ch-snapshot/memory-ranges" "$STAGE/memfile"
 
   kill "$ch_pid" 2>/dev/null || true
+  wait "$ch_pid" 2>/dev/null || true
+  jail_unmount_dev "$jail"
   trap 'rm -rf "$STAGE"' EXIT
 }
 
 boot_quiesce_snapshot() {
   write_guest_client
+  # The kernel is copied into $STAGE BEFORE booting (not in write_manifest, where
+  # it used to happen): both VMM arms above now need it in place, at the
+  # jail-relative name "/kernel", before they ever start the VMM.
+  cp "$KERNEL" "$STAGE/kernel"
   case "$VMM" in
     firecracker) boot_quiesce_snapshot_firecracker ;;
     cloud-hypervisor) boot_quiesce_snapshot_cloud_hypervisor ;;
@@ -486,7 +652,9 @@ boot_quiesce_snapshot() {
 # ---------------------------------------------------------------------------
 write_manifest() {
   log "writing manifest.json"
-  cp "$KERNEL" "$STAGE/kernel"
+  # $STAGE/kernel is copied by boot_quiesce_snapshot, before either VMM arm
+  # boots -- both now need it in place at the jail-relative name "/kernel"
+  # pre-boot, not just afterwards for hashing.
 
   local khash rhash ahash hash caps_json built_at
   khash="sha256:$(sha256sum "$STAGE/kernel" | cut -d' ' -f1)"
@@ -523,11 +691,20 @@ MANIFEST
 lock_down() {
   log "locking down $OUT (root-owned, read-only)"
   mkdir -p "$OUT"
-  for f in vmstate memfile kernel rootfs agent manifest.json; do
+  files=(vmstate memfile kernel rootfs agent manifest.json)
+  # cloud-hypervisor's snapshot is a directory (config.json, state.json,
+  # memory-ranges), not just the vmstate/memfile pair -- config.json has to ship
+  # too, or vm.restore's source_url has nothing to replay at restore time.
+  if [ "$VMM" = "cloud-hypervisor" ]; then
+    files+=(ch-config.json)
+  fi
+  for f in "${files[@]}"; do
     install -m 0644 "$STAGE/$f" "$OUT/$f"
   done
   chown -R root:root "$OUT"
-  chmod 0444 "$OUT"/vmstate "$OUT"/memfile "$OUT"/kernel "$OUT"/rootfs "$OUT"/agent "$OUT"/manifest.json
+  for f in "${files[@]}"; do
+    chmod 0444 "$OUT/$f"
+  done
   chmod 0555 "$OUT"
 }
 
@@ -544,19 +721,43 @@ verify_restore() {
 }
 
 verify_restore_firecracker() {
-  local api_sock="$STAGE/verify-api.sock" vsock_uds="$STAGE/verify-vsock.sock"
-  firecracker --api-sock "$api_sock" >"$STAGE/verify-console.log" 2>&1 &
-  local fc_pid=$!
-  trap 'kill "$fc_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+  # Items 1/2/9's whole point: prove the snapshot in $OUT is portable by
+  # restoring it into a FRESH jail at a DIFFERENT absolute path than the one it
+  # was built under -- if $OUT still baked in an absolute, build-time path, this
+  # jail would never see it and LoadSnapshot would fail exactly like the
+  # original bug this round fixes.
+  local jail="$STAGE/verify-jail"
+  local api_sock="$jail/run/verify-api.sock" vsock_uds="$jail/vsock.sock"
+  mkdir -p "$jail/run"
+  hardlink_or_copy_bin firecracker "$jail/firecracker"
+  jail_mount_dev "$jail"
+  ln "$OUT/vmstate" "$jail/vmstate"
+  ln "$OUT/memfile" "$jail/memfile"
+  ln "$OUT/rootfs" "$jail/rootfs"
+  ensure_workspace_image "$jail/workspace.img"
 
-  curl -s --unix-socket "$api_sock" -X PUT 'http://localhost/vsock' \
-    -d "{\"vsock_id\":\"vsock0\",\"guest_cid\":3,\"uds_path\":\"$vsock_uds\"}" >/dev/null
-  curl -s --unix-socket "$api_sock" -X PUT 'http://localhost/snapshot/load' \
-    -d "{\"snapshot_path\":\"$OUT/vmstate\",\"mem_file_path\":\"$OUT/memfile\",\"resume_vm\":true}" >/dev/null
+  chroot "$jail" /firecracker --api-sock /run/verify-api.sock \
+    </dev/null >"$STAGE/verify-console.log" 2>&1 &
+  local fc_pid=$!
+  trap 'jail_unmount_dev "'"$jail"'"; kill "$fc_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+
+  # Wire format confirmed against fcapi.go's loadSnapshotRequest struct:
+  # snapshot_path is top-level, the memory file nests under mem_backend as
+  # {backend_path, backend_type} -- NOT the flat mem_file_path field, which
+  # belongs to the separate /snapshot/create request. vsock_override lets the
+  # vsock UDS path move between snapshot and restore; here it does not move
+  # (both are /vsock.sock, jail-relative) but is still supplied to match the
+  # launcher's own restore call shape.
+  api_put "$api_sock" /vsock \
+    "{\"vsock_id\":\"vsock0\",\"guest_cid\":3,\"uds_path\":\"/vsock.sock\"}"
+  api_put "$api_sock" /snapshot/load \
+    "{\"snapshot_path\":\"/vmstate\",\"mem_backend\":{\"backend_path\":\"/memfile\",\"backend_type\":\"File\"},\"vsock_override\":\"/vsock.sock\",\"resume_vm\":true}"
 
   local exit_code=0
   "$STAGE/guest_client" -uds "$vsock_uds" -port 1024 -timeout-s 30 -command true || exit_code=$?
   kill "$fc_pid" 2>/dev/null || true
+  wait "$fc_pid" 2>/dev/null || true
+  jail_unmount_dev "$jail"
   trap 'rm -rf "$STAGE"' EXIT
   if [ "$exit_code" -ne 0 ]; then
     echo "build-snapshot.sh: the fresh snapshot restored but \`true\` exited $exit_code" >&2
@@ -565,16 +766,43 @@ verify_restore_firecracker() {
 }
 
 verify_restore_cloud_hypervisor() {
-  local api_sock="$STAGE/verify-ch-api.sock" vsock_uds="$STAGE/verify-vsock.sock"
-  cloud-hypervisor --api-socket "$api_sock" \
-    --restore "source_url=file://$OUT" \
-    --vsock "cid=3,socket=$vsock_uds" >/dev/null 2>&1 &
+  # Same portability check as the firecracker arm, restoring into a fresh jail
+  # at a different absolute path than the one used to build $OUT.
+  #
+  # Self-discovered 11th finding: the previous form of this function passed
+  # `--restore source_url=file://$OUT` as a CLI flag. cloud-hypervisor has no
+  # such flag -- docs/notes/cloud-hypervisor-tutorial.md's own hands-on-tested
+  # restore procedure (Sec 6a-6c) always starts a BARE cloud-hypervisor process
+  # against only --api-socket, then issues `PUT /api/v1/vm.restore` with body
+  # {"source_url":..., "resume":true}; a web search for a --restore CLI flag
+  # found no confirmation either. Rebuilt on the API-call pattern below.
+  local jail="$STAGE/verify-jail"
+  local api_sock="$jail/run/verify-ch-api.sock" vsock_uds="$jail/vsock.sock"
+  mkdir -p "$jail/run" "$jail/ch-snapshot"
+  hardlink_or_copy_bin cloud-hypervisor "$jail/cloud-hypervisor"
+  jail_mount_dev "$jail"
+  ln "$OUT/rootfs" "$jail/rootfs"
+  # vm.restore replays the whole snapshot directory, not just memory state, so
+  # config.json (shipped as ch-config.json, see lock_down/item 9's corollary)
+  # has to be put back next to the state files under their original names
+  # before the restore call.
+  ln "$OUT/ch-config.json" "$jail/ch-snapshot/config.json"
+  ln "$OUT/vmstate" "$jail/ch-snapshot/state.json"
+  ln "$OUT/memfile" "$jail/ch-snapshot/memory-ranges"
+
+  chroot "$jail" /cloud-hypervisor --api-socket /run/verify-ch-api.sock \
+    </dev/null >"$STAGE/verify-console.log" 2>&1 &
   local ch_pid=$!
-  trap 'kill "$ch_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+  trap 'jail_unmount_dev "'"$jail"'"; kill "$ch_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+
+  api_put "$api_sock" /api/v1/vm.restore \
+    '{"source_url":"file:///ch-snapshot","resume":true}'
 
   local exit_code=0
   "$STAGE/guest_client" -uds "$vsock_uds" -port 1024 -timeout-s 30 -command true || exit_code=$?
   kill "$ch_pid" 2>/dev/null || true
+  wait "$ch_pid" 2>/dev/null || true
+  jail_unmount_dev "$jail"
   trap 'rm -rf "$STAGE"' EXIT
   if [ "$exit_code" -ne 0 ]; then
     echo "build-snapshot.sh: the fresh snapshot restored but \`true\` exited $exit_code" >&2
@@ -584,6 +812,7 @@ verify_restore_cloud_hypervisor() {
 
 # ---------------------------------------------------------------------------
 main() {
+  require_root
   preflight
   build_agent
   assemble_rootfs

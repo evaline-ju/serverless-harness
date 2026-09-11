@@ -16,12 +16,16 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -149,6 +153,158 @@ func launcherFor(kind vmpool.VMMKind, get func(string) string, snapDir string) (
 	}
 }
 
+// --- Item 5 (fix round): verify the manifest's recorded InstanceType against the
+// running host. This is ADDITIVE to the existing verify+pin+probe block in main():
+// man.Verify above only checks the snapshot's own internal hashes, never the host
+// it is about to be restored onto, and spec §2.4 requires identical hardware for a
+// restore to be safe at all (device/BAR/CPU-feature assumptions baked into the
+// paused VM state). None of vmpool's existing exported API is touched.
+
+// instanceTypeCheckOverrideEnv opts a host OUT of this check for deliberate
+// cross-host use (e.g. local dev, or a documented compatible substitute type). Off
+// by default: silence here would mean every worker on the fleet restoring onto the
+// wrong hardware and finding out only when a guest first misbehaves.
+const instanceTypeCheckOverrideEnv = "SH_ALLOW_INSTANCE_TYPE_MISMATCH"
+
+// metadataTimeout bounds each individual cloud metadata probe. These services only
+// answer on the host's own link-local address and either respond in single-digit
+// milliseconds or not at all (wrong cloud, or no metadata service present) --
+// generous enough to tolerate a slow VM, short enough that probing three clouds in
+// turn on a bare-metal box costs a human-imperceptible fraction of a second.
+const metadataTimeout = 300 * time.Millisecond
+
+// detectHostInstanceType identifies the machine microvm-worker is running on, in
+// the same vocabulary build-snapshot.sh's --instance-type recorded in the manifest.
+// It tries each cloud provider's metadata service in turn -- generalized beyond EC2
+// deliberately, since nothing here should assume the fleet is EC2-only -- and falls
+// back to a stable, non-cloud host identity when none answer, so bare-metal and
+// other-hypervisor hosts still get a real check instead of none.
+func detectHostInstanceType(ctx context.Context) string {
+	if t := ec2InstanceType(ctx); t != "" {
+		return t
+	}
+	if t := gcpMachineType(ctx); t != "" {
+		return t
+	}
+	if t := azureVMSize(ctx); t != "" {
+		return t
+	}
+	return stableHostIdentity()
+}
+
+func metadataGET(ctx context.Context, url string, headers map[string]string) string {
+	ctx, cancel := context.WithTimeout(ctx, metadataTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return ""
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(body))
+}
+
+// ec2InstanceType speaks IMDSv2: a token must be minted (PUT /latest/api/token)
+// before EC2's metadata service will answer any meta-data GET.
+func ec2InstanceType(ctx context.Context) string {
+	tctx, cancel := context.WithTimeout(ctx, metadataTimeout)
+	defer cancel()
+	treq, err := http.NewRequestWithContext(tctx, http.MethodPut, "http://169.254.169.254/latest/api/token", nil)
+	if err != nil {
+		return ""
+	}
+	treq.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "60")
+	tresp, err := http.DefaultClient.Do(treq)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = tresp.Body.Close() }()
+	if tresp.StatusCode != http.StatusOK {
+		return ""
+	}
+	tokBytes, err := io.ReadAll(io.LimitReader(tresp.Body, 256))
+	if err != nil {
+		return ""
+	}
+	token := strings.TrimSpace(string(tokBytes))
+	return metadataGET(ctx, "http://169.254.169.254/latest/meta-data/instance-type",
+		map[string]string{"X-aws-ec2-metadata-token": token})
+}
+
+// gcpMachineType asks GCE's metadata server, which answers any request carrying the
+// Metadata-Flavor header without further auth.
+func gcpMachineType(ctx context.Context) string {
+	raw := metadataGET(ctx, "http://metadata.google.internal/computeMetadata/v1/instance/machine-type",
+		map[string]string{"Metadata-Flavor": "Google"})
+	// GCE returns "projects/<num>/machineTypes/<type>"; take the trailing segment so
+	// this is comparable to what build-snapshot.sh recorded.
+	if idx := strings.LastIndex(raw, "/"); idx >= 0 {
+		return raw[idx+1:]
+	}
+	return raw
+}
+
+// azureVMSize asks Azure IMDS, which (like GCE) answers any request carrying its
+// required header without further auth.
+func azureVMSize(ctx context.Context) string {
+	return metadataGET(ctx,
+		"http://169.254.169.254/metadata/instance/compute/vmSize?api-version=2021-02-01",
+		map[string]string{"Metadata": "true"})
+}
+
+// stableHostIdentity is the non-cloud fallback, used when no metadata service
+// answered. /sys/class/dmi/id/product_name is set by firmware/the hypervisor and
+// stable across reboots on real hardware and most non-cloud hypervisors alike;
+// runtime.GOOS/GOARCH is the last resort so this always returns SOMETHING rather
+// than an empty string a caller might mistake for "no host identity exists".
+func stableHostIdentity() string {
+	if b, err := os.ReadFile("/sys/class/dmi/id/product_name"); err == nil {
+		if s := strings.TrimSpace(string(b)); s != "" {
+			return s
+		}
+	}
+	return runtime.GOOS + "/" + runtime.GOARCH
+}
+
+// verifyInstanceType refuses loudly, naming both values, when the manifest's
+// recorded InstanceType does not match what detect reports for the running host --
+// unless the operator has explicitly opted out via instanceTypeCheckOverrideEnv.
+// detect is injected (rather than called directly) so tests exercise this without
+// touching the network. An empty manifestType (an old manifest predating this
+// field) or an undetectable host both fail OPEN, not closed: this check is meant to
+// catch a real, recorded mismatch, not to block startup when there is nothing to
+// compare.
+func verifyInstanceType(get func(string) string, manifestType string, detect func(context.Context) string) error {
+	if manifestType == "" {
+		return nil
+	}
+	if skip, err := strconv.ParseBool(get(instanceTypeCheckOverrideEnv)); err == nil && skip {
+		log.Printf("microvm-worker: %s=true, skipping instance-type verification (snapshot recorded %q)",
+			instanceTypeCheckOverrideEnv, manifestType)
+		return nil
+	}
+	host := detect(context.Background())
+	if host == "" || host == manifestType {
+		return nil
+	}
+	return fmt.Errorf("snapshot was built on instance type %q but this host reports %q "+
+		"(spec §2.4: restore requires identical hardware; set %s=true to override deliberately)",
+		manifestType, host, instanceTypeCheckOverrideEnv)
+}
+
 func nextBackoff(d time.Duration) time.Duration { return min(d*2, backoffMax) }
 
 func jitter(d time.Duration) time.Duration {
@@ -185,6 +341,9 @@ func main() {
 		log.Fatalf("microvm-worker: %v", err)
 	}
 	if err := man.Verify(snapDir); err != nil {
+		log.Fatalf("microvm-worker: %v", err)
+	}
+	if err := verifyInstanceType(get, man.InstanceType, detectHostInstanceType); err != nil {
 		log.Fatalf("microvm-worker: %v", err)
 	}
 	unpin, err := vmpool.PinMemoryFile(filepath.Join(snapDir, "memfile"))

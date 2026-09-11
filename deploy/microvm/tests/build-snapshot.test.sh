@@ -58,5 +58,53 @@ check "no SANDBOX_TOKEN in the build" \
 check "swap/cgroup preflight is present" \
   "$([ "$(grep -c 'cgroup' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 
+echo "== fix-round: rootfs/vmstate/memfile paths are jail-relative, not the ephemeral \$STAGE (items 1, 9)"
+check "no path_on_host under \$STAGE (item 1)" \
+  "$(grep -cF 'path_on_host\":\"$STAGE' "$SCRIPT")" "0"
+check "firecracker rootfs drive path is jail-relative /rootfs" \
+  "$([ "$(grep -cF 'path_on_host\":\"/rootfs\"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "cloud-hypervisor --disk path is jail-relative /rootfs (item 9)" \
+  "$([ "$(grep -cF -- '--disk "path=/rootfs' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "no snapshot_path/mem_file_path under \$OUT at restore time (item 9 corollary)" \
+  "$(grep -cE 'snapshot_path\\":\\"\$OUT|mem_file_path\\":\\"\$OUT' "$SCRIPT")" "0"
+
+echo "== fix-round: a workspace drive is provisioned for restored VMs (item 2)"
+check "a workspace drive is configured" \
+  "$([ "$(grep -c 'drive_id.*workspace\|/drives/workspace' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "ensure_workspace_image helper exists" \
+  "$([ "$(grep -c 'ensure_workspace_image()' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== fix-round: every backgrounded VMM has stdin redirected (items 3, 10)"
+check "count of backgrounded VMM launches equals count of </dev/null redirects" \
+  "$(grep -c '&$' "$SCRIPT")" "$(grep -c '</dev/null' "$SCRIPT")"
+check "at least four </dev/null redirects (build x2, verify x2)" \
+  "$([ "$(grep -c '</dev/null' "$SCRIPT")" -ge 4 ] && echo yes || echo no)" "yes"
+
+echo "== fix-round: every VMM API call is checked for failure (item 4)"
+check "require_root helper exists" \
+  "$([ "$(grep -c 'require_root()' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "require_root is called from main" \
+  "$([ "$(grep -c '^  require_root$' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "api_put helper (curl -s -S, status checked) exists" \
+  "$([ "$(grep -c 'api_put()' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "no bare unchecked curl PUT calls remain" \
+  "$(grep -c "curl -s --unix-socket" "$SCRIPT")" "0"
+
+echo "== fix-round: cloud-hypervisor boots with a cmdline and a read-only rootfs (items 7, 8)"
+check "--cmdline is passed to cloud-hypervisor" \
+  "$([ "$(grep -c -- '--cmdline "console=ttyS0 root=/dev/vda rw reboot=k panic=1"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "cloud-hypervisor rootfs disk is readonly=on" \
+  "$([ "$(grep -c -- 'readonly=on' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "pci=off is not passed to cloud-hypervisor's cmdline" \
+  "$(grep -c -- '--cmdline.*pci=off' "$SCRIPT")" "0"
+
+echo "== fix-round: cloud-hypervisor restore uses the vm.restore API, not a --restore flag (11th finding)"
+check "no --restore CLI flag" \
+  "$(grep -cF -- '--restore "' "$SCRIPT")" "0"
+check "vm.restore API call is present" \
+  "$([ "$(grep -c 'vm.restore' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "config.json is preserved for cloud-hypervisor restores (item 9 corollary)" \
+  "$([ "$(grep -c 'ch-config.json' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"
