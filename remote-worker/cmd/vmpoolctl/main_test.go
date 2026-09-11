@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -40,8 +42,38 @@ func TestRunsOneExecInAVMAndReportsItAsJSON(t *testing.T) {
 	if rec.P50AcquireUs == 0 || rec.P50RunUs == 0 || rec.P50DestroyUs == 0 {
 		t.Errorf("record = %+v, want the hot path decomposed into acquire/run/destroy", rec)
 	}
+	// Resume is a term too — on the Firecracker arm it performs the workspace
+	// mount, exactly a cost this benchmark exists to expose. The fake's Resume is
+	// a no-op so it may legitimately measure ~0us; what must hold is that the
+	// field is present in the contract, not that it's nonzero.
+	if !strings.Contains(out, `"p50_resume_us"`) || !strings.Contains(out, `"p95_resume_us"`) {
+		t.Errorf("record missing resume phase fields, out=%s", out)
+	}
 	if rec.VMM != "fake" {
 		t.Errorf("VMM = %q, want fake — spec §6 requires the substrate recorded in every run record", rec.VMM)
+	}
+}
+
+// TestAnUnquotedMultiWordCommandIsNotSilentlyTruncated guards against the worst
+// defect this CLI could have: silently measuring a different, possibly no-op
+// command while reporting a clean result. "-- echo hello world > out.txt" must run
+// in full, not just "echo" — checked here by an observable side effect (a file
+// written into the workspace), not just the exit status, because the broken
+// version of this code also exits 0 with plausible timings.
+func TestAnUnquotedMultiWordCommandIsNotSilentlyTruncated(t *testing.T) {
+	dir := t.TempDir()
+	out, err := run(t,
+		"--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+		"--key=run-b", "--iterations=1", "--", "echo", "hello", "world", ">", "out.txt")
+	if err != nil {
+		t.Fatalf("realMain: %v (out=%s)", err, out)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "run-b", "out.txt"))
+	if err != nil {
+		t.Fatalf("workspace file missing — the command was truncated to its first word: %v", err)
+	}
+	if want := "hello world"; strings.TrimSpace(string(got)) != want {
+		t.Fatalf("out.txt = %q, want %q", got, want)
 	}
 }
 

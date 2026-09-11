@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +37,8 @@ type runResult struct {
 	Refusals     map[string]uint64 `json:"refusals"`
 	P50AcquireUs int64             `json:"p50_acquire_us"`
 	P95AcquireUs int64             `json:"p95_acquire_us"`
+	P50ResumeUs  int64             `json:"p50_resume_us"`
+	P95ResumeUs  int64             `json:"p95_resume_us"`
 	P50RunUs     int64             `json:"p50_run_us"`
 	P95RunUs     int64             `json:"p95_run_us"`
 	P50DestroyUs int64             `json:"p50_destroy_us"`
@@ -72,8 +75,12 @@ func realMain(args []string, stdout io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	command := fs.Args()
-	if len(command) == 0 {
+	// Join rather than take command[0]: "-- echo hello world" means what it looks
+	// like, and an already-quoted single argument still passes through unchanged.
+	// Silently running only the first word would let a run measure a different,
+	// possibly no-op command while reporting a clean, plausible result.
+	command := strings.Join(fs.Args(), " ")
+	if command == "" {
 		return fmt.Errorf("a command is required after --")
 	}
 	if *iterations < 1 || *concurrency < 1 {
@@ -101,12 +108,12 @@ func realMain(args []string, stdout io.Writer) error {
 
 	host, _ := os.Hostname()
 	res := runResult{
-		VMM: *vmm, Host: host, Key: *key, Command: command[0],
+		VMM: *vmm, Host: host, Key: *key, Command: command,
 		Iterations: *iterations, Concurrency: *concurrency,
 		StandbyDepth: cfg.StandbyDepth, GuestRAMMB: *guestMB,
 	}
 
-	type sample struct{ acquire, run, destroy, total time.Duration }
+	type sample struct{ acquire, resume, run, destroy, total time.Duration }
 	samples := make([]sample, *iterations)
 	var firstErr error
 	var mu sync.Mutex
@@ -126,10 +133,10 @@ func realMain(args []string, stdout io.Writer) error {
 			// callbacks — never a guess. See vmpool.Phases.
 			ph := &vmpool.Phases{}
 			_, err := pool.ExecPhased(context.Background(), *key, vmpool.Exec{
-				ReqID: uint64(i + 1), Command: command[0], TimeoutS: uint32(*timeoutS), Streaming: true,
+				ReqID: uint64(i + 1), Command: command, TimeoutS: uint32(*timeoutS), Streaming: true,
 			}, discardSink{}, ph)
 			s.total = time.Since(t0)
-			s.acquire, s.run, s.destroy = ph.Acquire, ph.Run, ph.Destroy
+			s.acquire, s.resume, s.run, s.destroy = ph.Acquire, ph.Resume, ph.Run, ph.Destroy
 			mu.Lock()
 			samples[i] = s
 			if err != nil {
@@ -145,6 +152,7 @@ func realMain(args []string, stdout io.Writer) error {
 	res.WallMs = time.Since(start).Milliseconds()
 
 	res.P50AcquireUs, res.P95AcquireUs = pct(samples, func(s sample) time.Duration { return s.acquire })
+	res.P50ResumeUs, res.P95ResumeUs = pct(samples, func(s sample) time.Duration { return s.resume })
 	res.P50RunUs, res.P95RunUs = pct(samples, func(s sample) time.Duration { return s.run })
 	res.P50DestroyUs, res.P95DestroyUs = pct(samples, func(s sample) time.Duration { return s.destroy })
 	res.P50TotalUs, res.P95TotalUs = pct(samples, func(s sample) time.Duration { return s.total })
@@ -167,8 +175,8 @@ func realMain(args []string, stdout io.Writer) error {
 		}
 	} else {
 		fmt.Fprintf(stdout, "vmm=%s key=%s iters=%d conc=%d failures=%d\n", res.VMM, res.Key, res.Iterations, res.Concurrency, res.Failures)
-		fmt.Fprintf(stdout, "acquire p50=%dus p95=%dus  run p50=%dus p95=%dus  destroy p50=%dus p95=%dus  total p50=%dus p95=%dus\n",
-			res.P50AcquireUs, res.P95AcquireUs, res.P50RunUs, res.P95RunUs, res.P50DestroyUs, res.P95DestroyUs, res.P50TotalUs, res.P95TotalUs)
+		fmt.Fprintf(stdout, "acquire p50=%dus p95=%dus  resume p50=%dus p95=%dus  run p50=%dus p95=%dus  destroy p50=%dus p95=%dus  total p50=%dus p95=%dus\n",
+			res.P50AcquireUs, res.P95AcquireUs, res.P50ResumeUs, res.P95ResumeUs, res.P50RunUs, res.P95RunUs, res.P50DestroyUs, res.P95DestroyUs, res.P50TotalUs, res.P95TotalUs)
 		fmt.Fprintf(stdout, "warm=%d cold=%v refusals=%v\n", res.WarmAcquires, res.ColdAcquires, res.Refusals)
 	}
 	// A failed Exec is reported in the record AND as a non-zero exit, so a driver
