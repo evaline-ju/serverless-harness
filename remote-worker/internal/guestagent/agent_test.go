@@ -1,6 +1,7 @@
 package guestagent
 
 import (
+	"bufio"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -183,6 +184,90 @@ func TestAgentReportsATimeoutRatherThanHanging(t *testing.T) {
 // boundary. The exact byte counts (not just "capped, roughly") are what would catch
 // an off-by-one in that carry-over, which is the one way the rewrite could go subtly
 // wrong.
+// TestAgentBoundsDrainAcrossMultipleReadCycles above forces several Read() cycles,
+// but its sentinel is written as a separate small printf, so the sentinel always
+// lands wholly inside one 32 KiB read: the boundary-spanning case the carry-over
+// exists for is never produced. A revert to ReadBytes('\n') would also pass it,
+// since buffering the whole line and then capping yields identical observable
+// output and dropped counts -- only memory use differs, which a test cannot easily
+// see. (Both found by mutation-testing fix round 2: setting the carry-over to 0
+// left that test, and the cap test, green.)
+//
+// This test drives drainUntilNonce directly instead of through a real subprocess
+// pipe, because a subprocess pipe gives no way to guarantee which byte lands in
+// which Read() call -- the whole point here is putting the split *inside* the
+// nonce, not just forcing "a few" reads somewhere. An io.Pipe gives that guarantee:
+// bufio.Reader forwards a Read() whose buffer is exactly the bufio's own buffer
+// size (MaxFrame, matching how Agent builds a.stdout/a.stderr) straight through to
+// the underlying reader without going through its internal buffer, and io.Pipe
+// delivers one Write to exactly the Read call(s) that drain it. So writing exactly
+// MaxFrame bytes in a single Write reliably produces exactly one MaxFrame-sized
+// Read(), letting the test choose precisely where inside those bytes the nonce
+// begins. The pipe is deliberately never closed: the real parked shell does not
+// close its stdout either, so a carry-over that misses the nonce here must hang
+// waiting for more data, the same failure mode production would see -- not return
+// an error, which is why the assertion that matters most is a completion bound.
+func TestDrainUntilNonceHandlesANonceSplitAcrossAReadBoundary(t *testing.T) {
+	nonce, err := newNonce()
+	if err != nil {
+		t.Fatalf("newNonce: %v", err)
+	}
+	const exitCode = 7
+
+	// Split partway through the nonce itself, computed from len(nonce) and MaxFrame
+	// rather than a hard-coded offset: `before` bytes of the nonce land in the read
+	// ending exactly at the MaxFrame boundary, and the remaining len(nonce)-before
+	// land in the next one. If the nonce format ever changes length, this still
+	// splits inside it instead of silently degrading into a same-read match.
+	before := len(nonce) / 2
+	prefixLen := MaxFrame - before
+	prefix := strings.Repeat("a", prefixLen)
+	sentinelTail := fmt.Sprintf("%s %d\n", nonce, exitCode)
+
+	pr, pw := io.Pipe()
+	r := bufio.NewReaderSize(pr, MaxFrame)
+	t.Cleanup(func() { pw.Close() })
+
+	go func() {
+		// This first Write is exactly MaxFrame bytes (prefixLen + before), so
+		// drainUntilNonce's first Read() returns exactly this much and no more --
+		// see the function comment above for why that is guaranteed here.
+		_, _ = pw.Write([]byte(prefix + sentinelTail[:before]))
+		_, _ = pw.Write([]byte(sentinelTail[before:]))
+		// Deliberately not closed here (see t.Cleanup above): a live, never-EOF
+		// stream is what makes a missed nonce hang instead of erroring out.
+	}()
+
+	type result struct {
+		code int32
+		err  error
+	}
+	done := make(chan result, 1)
+	var got []byte
+	go func() {
+		code, err := drainUntilNonce(r, nonce, func(b []byte) { got = append(got, b...) }, true)
+		done <- result{code, err}
+	}()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("drainUntilNonce error: %v", res.err)
+		}
+		if res.code != exitCode {
+			t.Fatalf("exit code = %d, want %d: the sentinel was not parsed correctly across the split", res.code, exitCode)
+		}
+		if string(got) != prefix {
+			t.Fatalf("forwarded %d bytes, want exactly the %d-byte prefix (no sentinel fragment leaked)", len(got), len(prefix))
+		}
+	case <-time.After(5 * time.Second):
+		// The assertion that matters most: a broken carry-over does not return a
+		// wrong answer here, it hangs forever waiting for a nonce that already flew
+		// past it.
+		t.Fatal("drainUntilNonce did not return within 5s: a broken carry-over hangs waiting for a nonce split across the read boundary")
+	}
+}
+
 func TestAgentBoundsDrainAcrossMultipleReadCycles(t *testing.T) {
 	const total = 160 * 1024 // 5x MaxFrame (32 KiB): forces multiple Read() cycles.
 	const cap = 1000
