@@ -158,16 +158,29 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	jailRoot := filepath.Join(l.opts.ChrootBase, filepath.Base(l.opts.FirecrackerBin), req.ID, "root")
 
 	var cmd *exec.Cmd
-	cleanup := func() {
+	// cleanup mirrors Destroy's error handling below: a failure here (permission,
+	// EBUSY) must be surfaced, not swallowed, or the caller sees only the original
+	// failure with no signal that a stale jail or process was left behind — the
+	// same class of silent leak the never-return-a-VM rule exists to prevent, on
+	// the error path instead of the happy path. It is exactly how a prior aborted
+	// restore's leftovers cause the next restore's socket-already-in-use failure.
+	cleanup := func() error {
+		var errs []error
 		if cmd != nil && cmd.Process != nil {
-			_ = fcKillProcessGroup(cmd.Process.Pid)
+			pid := cmd.Process.Pid
+			if err := fcKillProcessGroup(pid); err != nil && !fcProcessNotFound(err) {
+				errs = append(errs, fmt.Errorf("kill -%d: %w", pid, err))
+			}
 			_ = cmd.Wait()
 		}
-		_ = os.RemoveAll(jailRoot)
+		if err := os.RemoveAll(jailRoot); err != nil {
+			errs = append(errs, fmt.Errorf("remove jail %s: %w", jailRoot, err))
+		}
+		return errors.Join(errs...)
 	}
 
 	if err := os.MkdirAll(filepath.Join(jailRoot, "run"), 0o700); err != nil {
-		return nil, fmt.Errorf("firecracker: restore %s: create jail: %w", req.ID, err)
+		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: create jail: %w", req.ID, err), cleanup())
 	}
 
 	// Hardlink the golden snapshot's components into the jail at fixed, jail-relative
@@ -185,8 +198,7 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		dst := filepath.Join(jailRoot, name)
 		_ = os.Remove(dst) // best-effort: a stale link from an aborted prior attempt at this same ID
 		if err := os.Link(src, dst); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("firecracker: restore %s: hardlink %s: %w", req.ID, name, err)
+			return nil, errors.Join(fmt.Errorf("firecracker: restore %s: hardlink %s: %w", req.ID, name, err), cleanup())
 		}
 		if err := os.Chown(dst, l.opts.UID, l.opts.GID); err != nil {
 			// Coordinator finding #3: the API socket (and, by the same mechanism, every
@@ -196,8 +208,7 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 			// privileges to. Firecracker cannot open a hardlink it cannot read once
 			// jailer setuid/setgid's into opts.UID/opts.GID, so this must be fatal
 			// rather than logged-and-ignored.
-			cleanup()
-			return nil, fmt.Errorf("firecracker: restore %s: chown %s to %d:%d: %w", req.ID, name, l.opts.UID, l.opts.GID, err)
+			return nil, errors.Join(fmt.Errorf("firecracker: restore %s: chown %s to %d:%d: %w", req.ID, name, l.opts.UID, l.opts.GID, err), cleanup())
 		}
 	}
 
@@ -211,18 +222,15 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	// /dev/vdb until the golden image is built with that drive already attached.
 	imgPath := filepath.Join(req.WorkspaceDir, "workspace.img")
 	if err := ensureWorkspaceImage(ctx, imgPath, l.opts.WorkspaceImageBytes); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("firecracker: restore %s: workspace image: %w", req.ID, err)
+		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: workspace image: %w", req.ID, err), cleanup())
 	}
 	workspaceDst := filepath.Join(jailRoot, "workspace.img")
 	_ = os.Remove(workspaceDst)
 	if err := os.Link(imgPath, workspaceDst); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("firecracker: restore %s: hardlink workspace.img: %w", req.ID, err)
+		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: hardlink workspace.img: %w", req.ID, err), cleanup())
 	}
 	if err := os.Chown(workspaceDst, l.opts.UID, l.opts.GID); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("firecracker: restore %s: chown workspace.img to %d:%d: %w", req.ID, l.opts.UID, l.opts.GID, err)
+		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: chown workspace.img to %d:%d: %w", req.ID, l.opts.UID, l.opts.GID, err), cleanup())
 	}
 
 	// Jailer execve's into FirecrackerBin after chroot/cgroup/uid/gid setup rather
@@ -232,6 +240,15 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	// Firecracker's own vcpu/seccomp machinery spawns, without also reaching this
 	// launcher's own process group (coordinator finding #2's neighbor: an unrelated
 	// SIGKILL storm is exactly the kind of accident a shared pgid invites).
+	//
+	// UNVERIFIED against real hardware, same as jailRoot above (none is available
+	// to this task — see the task-15 report): the flag shape itself (this exact
+	// set of jailer flags, "--" as the separator before the jailed binary's own
+	// argv, and putting --api-sock after it), AND the assumption that jailer
+	// resolves --api-sock (and, symmetrically, vsock's uds_path/vsock_override)
+	// relative to the jail root rather than to some other directory. If either
+	// assumption is wrong, waitForUnixSocket below times out rather than failing
+	// with a clear cause — that timeout is the first place to look.
 	args := []string{
 		"--id", req.ID,
 		"--exec-file", l.opts.FirecrackerBin,
@@ -256,14 +273,12 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	cmd.Stderr = io.Discard
 	fcIsolateProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("firecracker: restore %s: start jailer: %w", req.ID, err)
+		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: start jailer: %w", req.ID, err), cleanup())
 	}
 
 	apiSockHost := filepath.Join(jailRoot, apiSockRelPath)
 	if err := waitForUnixSocket(ctx, apiSockHost, 5*time.Second); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("firecracker: restore %s: API socket never appeared: %w", req.ID, err)
+		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: API socket never appeared: %w", req.ID, err), cleanup())
 	}
 
 	fc := newFCClient(apiSockHost)
@@ -276,8 +291,7 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	// uses it here instead of trying to guess or fix up the recorded path.
 	fc.setVsockOverride(vsockRelPath)
 	if err := fc.LoadSnapshot(ctx, filepath.Join("/", fileVMState), filepath.Join("/", fileMemory)); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("firecracker: restore %s: load snapshot: %w", req.ID, err)
+		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: load snapshot: %w", req.ID, err), cleanup())
 	}
 
 	return &firecrackerVM{
