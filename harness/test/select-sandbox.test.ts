@@ -181,6 +181,31 @@ describe('selectPoolSandbox remote dispatch', () => {
     expect(typeof sel?.transport?.exec).toBe('function');
     expect(sel?.config.pod).toBe('sbx-remote-1');
   });
+
+  it('gives the leased transport the run id as its workspace key', async () => {
+    const lease = fakeLease({ 'sbx-remote-1': 0 }, opts.cap);
+    let seen: { id: string; opts?: { workspaceKey?: string } } | undefined;
+    const fakeTransport = {
+      exec: async () => ({ stdout: Buffer.alloc(0), exitCode: 0, truncated: false }),
+      close: async () => {},
+    };
+    const sel = await selectPoolSandbox(env(), '/head', 'leaf-abc123', opts, {
+      listPods: async () => [],
+      lease,
+      records: fakeRecords([grpcRec]),
+      makeExecClient: () => fakeExecClient,
+      // capture what the transport was built with
+      makeTransport: (id, _client, transportOpts) => {
+        seen = { id, opts: transportOpts };
+        return fakeTransport;
+      },
+    });
+    expect(sel?.transport).toBeDefined();
+    // The run id IS the workspace key: leases are keyed by leaf run id
+    // (sandbox-lease.ts:3), so anything else here would key a workspace on
+    // something the lease does not own (spec §3.4).
+    expect(seen?.opts?.workspaceKey).toBe('leaf-abc123');
+  });
 });
 
 describe('selectPoolSandbox remote dispatch: ad-hoc RedisRecordStore lifecycle', () => {

@@ -49,6 +49,16 @@ export interface SelectDeps {
   records?: RecordStore;
   /** Builds the exec client for a leased grpc record; defaults to a real SandboxExecClient at SH_RELAY_ADDR. */
   makeExecClient?: (sandboxId: string) => ExecClientLike;
+  /**
+   * Builds the transport for a leased grpc record; defaults to GrpcRelayTransport.
+   * Injectable so a test can assert what the leased transport was built with — there
+   * is no other way to observe it without a real gRPC client.
+   */
+  makeTransport?: (
+    sandboxId: string,
+    client: ExecClientLike,
+    opts?: { workspaceKey?: string },
+  ) => SandboxTransport;
 }
 
 /** Lazily builds a real gRPC exec client — only reached on the grpc branch when the flag is on. */
@@ -115,10 +125,17 @@ export async function selectPoolSandbox(
     if (await lease.acquire(name, opts.cap, runId, opts.ttlMs)) {
       const config: K8sSandboxConfig = { pod: name, namespace, context, podCwd, headCwd };
       const rec = grpcById.get(name);
+      const make = deps.makeTransport ?? GrpcRelayTransport;
       const transport = rec
-        ? GrpcRelayTransport(
+        ? make(
             name,
             (deps.makeExecClient ?? ((id: string) => defaultExecClient(id, env)))(name),
+            // The lease's run id becomes the Exec's workspace_key. This is the ONLY
+            // harness change the microVM tier needs, and it is required for
+            // correctness rather than convenience: without it, consecutive
+            // leaseholders of one sandbox_id inherit the previous run's workspace
+            // (spec §3.4).
+            { workspaceKey: runId },
           )
         : undefined;
       return {

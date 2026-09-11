@@ -39,7 +39,18 @@ const DEFAULT_DEADLINE_MS = DEFAULT_EXEC_TIMEOUT_S * 1000;
 export function GrpcRelayTransport(
   sandboxId: string,
   client: ExecClientLike,
-  opts: { deadlineMs?: number; outputCapBytes?: number; reqIdSource?: () => number } = {},
+  opts: {
+    deadlineMs?: number;
+    outputCapBytes?: number;
+    reqIdSource?: () => number;
+    /**
+     * The lease's run id, sent on every Exec as `workspace_key` (spec §3.4).
+     * vmpool keys a per-run host-side workspace on it. Omitted (or '') means
+     * "today's single shared workspace" on the container path; microvm-worker
+     * refuses it, because on the VM path there is nothing to fall back to.
+     */
+    workspaceKey?: string;
+  } = {},
 ): SandboxTransport {
   const deadlineMs = opts.deadlineMs ?? DEFAULT_DEADLINE_MS;
   const outputCap = opts.outputCapBytes ?? DEFAULT_OUTPUT_CAP;
@@ -66,9 +77,10 @@ export function GrpcRelayTransport(
           // independently, and an explicit `timeout: 0` still means unbounded on both.
           timeoutS: execOpts.timeout ?? DEFAULT_EXEC_TIMEOUT_S,
           streaming: true,
-          // This transport has no per-run workspace concept yet -- an empty key is
-          // today's behaviour (a process-wide /workspace) for every caller on this path.
-          workspaceKey: '',
+          // The lease's run id, or '' when the caller supplied none (today's behaviour
+          // for every caller not on the microVM path, e.g. the container worker, which
+          // ignores this field entirely). See the opts.workspaceKey doc comment above.
+          workspaceKey: opts.workspaceKey ?? '',
         },
       });
 
