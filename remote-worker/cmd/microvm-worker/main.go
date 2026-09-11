@@ -118,10 +118,30 @@ func poolConfig(get func(string) string) (vmpool.Config, error) {
 // today's container (spec §3.3, §3.5). Spec §6's "KVM unavailable at startup" row
 // says fail the unit at start — and the strongest form of that is having no code path
 // that could do otherwise. §8's "nothing executes outside a VM" gate pins it.
-func launcherFor(kind vmpool.VMMKind) (vmpool.Launcher, error) {
+//
+// get and snapDir are threaded through (rather than read from the environment
+// inline) so this function stays a pure mapping from already-resolved config to a
+// Launcher — the same shape poolConfig above already uses.
+func launcherFor(kind vmpool.VMMKind, get func(string) string, snapDir string) (vmpool.Launcher, error) {
 	switch kind {
-	case vmpool.Firecracker, vmpool.CloudHypervisor:
-		// Tasks 15 and 16 return the real launchers here.
+	case vmpool.Firecracker:
+		wsImageMB, err := envInt64(get, "SH_WORKSPACE_IMAGE_MB", 2048)
+		if err != nil {
+			return nil, err
+		}
+		return vmpool.NewFirecrackerLauncher(vmpool.FirecrackerOptions{
+			SnapshotDir:         snapDir,
+			JailerBin:           env(get, "SH_JAILER_BIN", "/usr/bin/jailer"),
+			FirecrackerBin:      env(get, "SH_FIRECRACKER_BIN", "/usr/bin/firecracker"),
+			ChrootBase:          env(get, "SH_CHROOT_BASE", "/srv/jail"),
+			UID:                 os.Getuid(),
+			GID:                 os.Getgid(),
+			ParentCgroup:        env(get, "SH_PARENT_CGROUP", "microvm-vms.slice"),
+			WorkspaceImageBytes: wsImageMB << 20,
+			VsockPort:           1024,
+		})
+	case vmpool.CloudHypervisor:
+		// Task 16 returns the real launcher here.
 		return nil, fmt.Errorf("VMM %q is not implemented yet (Phase D)", kind)
 	default:
 		return nil, fmt.Errorf("SH_VMM=%q must be %q or %q; there is no host-execution fallback (spec §3.5)",
@@ -141,7 +161,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("microvm-worker: %v", err)
 	}
-	lc, err := launcherFor(cfg.VMM)
+	// snapDir must be resolved before launcherFor: the Firecracker arm's
+	// FirecrackerOptions.SnapshotDir IS this directory (the golden vmstate/memfile/
+	// kernel/rootfs/agent/manifest.json set), not cfg.SnapshotDir itself, which is
+	// only the parent directory a specific image lives under.
+	snapDir := filepath.Join(cfg.SnapshotDir, env(get, "SH_SNAPSHOT_IMAGE", "default"))
+	lc, err := launcherFor(cfg.VMM, get, snapDir)
 	if err != nil {
 		log.Fatalf("microvm-worker: %v", err)
 	}
@@ -155,7 +180,6 @@ func main() {
 	// the live stream (remote-worker/DESIGN.md:29-30): a worker that registers and then
 	// discovers it cannot restore has already been given work. Spec §6: fail at start,
 	// not on a user's first request.
-	snapDir := filepath.Join(cfg.SnapshotDir, env(get, "SH_SNAPSHOT_IMAGE", "default"))
 	man, err := vmpool.LoadManifest(snapDir)
 	if err != nil {
 		log.Fatalf("microvm-worker: %v", err)

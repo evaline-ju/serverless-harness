@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -87,7 +88,7 @@ func realMain(args []string, stdout io.Writer) error {
 		return fmt.Errorf("--iterations and --concurrency must be >= 1")
 	}
 
-	lc, err := launcher(*vmm)
+	lc, err := launcher(*vmm, *snapshotDir)
 	if err != nil {
 		return err
 	}
@@ -184,12 +185,52 @@ func realMain(args []string, stdout io.Writer) error {
 	return firstErr
 }
 
-func launcher(kind string) (vmpool.Launcher, error) {
+// envInt64 mirrors cmd/microvm-worker/main.go's helper of the same name — duplicated
+// rather than shared, since vmpoolctl and microvm-worker are separate binaries with no
+// third package either would otherwise depend on just for this.
+func envInt64(k string, def int64) (int64, error) {
+	v := os.Getenv(k)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s=%q must be a positive integer", k, v)
+	}
+	return n, nil
+}
+
+func envOrDefault(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func launcher(kind string, snapshotDir string) (vmpool.Launcher, error) {
 	switch kind {
 	case "fake":
 		return vmpool.NewFakeLauncher(), nil
-	case string(vmpool.Firecracker), string(vmpool.CloudHypervisor):
-		// Task 15/16 replace this with the real constructors; until then the CLI is
+	case string(vmpool.Firecracker):
+		// Reads the SAME env vars as cmd/microvm-worker/main.go's launcherFor, so E10's
+		// driver measures the production configuration rather than a CLI-only variant.
+		wsImageMB, err := envInt64("SH_WORKSPACE_IMAGE_MB", 2048)
+		if err != nil {
+			return nil, err
+		}
+		return vmpool.NewFirecrackerLauncher(vmpool.FirecrackerOptions{
+			SnapshotDir:         snapshotDir,
+			JailerBin:           envOrDefault("SH_JAILER_BIN", "/usr/bin/jailer"),
+			FirecrackerBin:      envOrDefault("SH_FIRECRACKER_BIN", "/usr/bin/firecracker"),
+			ChrootBase:          envOrDefault("SH_CHROOT_BASE", "/srv/jail"),
+			UID:                 os.Getuid(),
+			GID:                 os.Getgid(),
+			ParentCgroup:        envOrDefault("SH_PARENT_CGROUP", "microvm-vms.slice"),
+			WorkspaceImageBytes: wsImageMB << 20,
+			VsockPort:           1024,
+		})
+	case string(vmpool.CloudHypervisor):
+		// Task 16 replaces this with the real constructor; until then the CLI is
 		// honest about what it cannot do rather than silently running host bash.
 		return nil, fmt.Errorf("--vmm=%s is not wired yet (Phase D); use --vmm=fake off a KVM host", kind)
 	default:

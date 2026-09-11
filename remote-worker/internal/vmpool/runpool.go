@@ -1,6 +1,9 @@
 package vmpool
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // runPool is one workspace_key's state — spec §4.2's second state machine:
 //
@@ -35,6 +38,17 @@ type runPool struct {
 	// pending holds scheduled replenish timers so Close and Reclaim can cancel
 	// them; a timer that fires into a reclaimed run would resurrect it.
 	pending []Timer
+
+	// execGate is the ONE field here that is NOT guarded by pool.mu and takes a
+	// lock of its own — deliberately, because what it protects (a VM's Resume and
+	// Run, which dial vsock and block on a guest) must never happen while pool.mu
+	// is held. ExecPhased holds it from a successful acquire until this VM is
+	// destroyed, but only when the Launcher reports SerializesExecsPerRun():
+	// Firecracker's ext4 workspace is not a shared-disk filesystem, so a second
+	// guest mounting it rw while the first still holds it would corrupt it
+	// (spec §4.3). Zero value is an unlocked Mutex, so a run's first Exec needs no
+	// separate initialization.
+	execGate sync.Mutex
 }
 
 func (rp *runPool) signalSettledLocked() {

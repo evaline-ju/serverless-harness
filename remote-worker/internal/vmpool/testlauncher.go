@@ -35,6 +35,11 @@ func NewFakeLauncher() *FakeLauncher { return &FakeLauncher{live: map[string]str
 // never be served by this launcher: New compares the two and refuses a mismatch.
 func (l *FakeLauncher) Kind() VMMKind { return FakeVMM }
 
+// SerializesExecsPerRun is false: bash on the host filesystem arbitrates
+// concurrent access the same way Cloud Hypervisor's arm does — there is no
+// guest-owned ext4 mount for two Execs to race on.
+func (l *FakeLauncher) SerializesExecsPerRun() bool { return false }
+
 func (l *FakeLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

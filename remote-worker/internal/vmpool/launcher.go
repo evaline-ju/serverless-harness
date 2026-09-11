@@ -87,4 +87,12 @@ type Launcher interface {
 	// prediction 1 (memory binds before CPU) cannot be falsified for that wrong
 	// reason (spec §3.2).
 	Restore(ctx context.Context, req RestoreRequest) (VM, error)
+
+	// SerializesExecsPerRun reports that only ONE VM belonging to a given run may
+	// run a command at a time. True for the Firecracker arm: the workspace is an
+	// ext4 image, not a shared-disk filesystem, and only one guest may hold the rw
+	// mount at once (spec §4.3) — two concurrent Execs for the same run would mount
+	// it twice and corrupt it. False for Cloud Hypervisor, where the host
+	// filesystem (not a guest-owned block device) arbitrates concurrent access.
+	SerializesExecsPerRun() bool
 }

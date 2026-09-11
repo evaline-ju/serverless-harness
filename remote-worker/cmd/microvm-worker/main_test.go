@@ -38,12 +38,13 @@ func TestPoolConfigFromEnvironment(t *testing.T) {
 // that is having no code path that could: --vmm=fake exists in vmpoolctl and must
 // not be reachable here.
 func TestThereIsNoHostFallbackLauncher(t *testing.T) {
-	if _, err := launcherFor(vmpool.VMMKind("fake")); err == nil {
+	get := envFrom(map[string]string{})
+	if _, err := launcherFor(vmpool.VMMKind("fake"), get, t.TempDir()); err == nil {
 		t.Fatal("launcherFor accepted the host-bash fake — §3.5's privilege argument rests on " +
 			"nothing agent-influenced ever executing outside a VM")
 	}
 	for _, k := range []vmpool.VMMKind{"", "qemu", "gvisor"} {
-		if _, err := launcherFor(k); err == nil {
+		if _, err := launcherFor(k, get, t.TempDir()); err == nil {
 			t.Fatalf("launcherFor(%q) accepted an unknown VMM", k)
 		}
 	}

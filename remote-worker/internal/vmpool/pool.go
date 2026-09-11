@@ -52,6 +52,11 @@ type pool struct {
 	lc  Launcher
 	clk Clock
 
+	// serialize mirrors lc.SerializesExecsPerRun(), read once at construction: the
+	// Launcher (not Config) decides whether a run's ext4 workspace can tolerate two
+	// mounted guests at once, so ExecPhased consults this instead of Config.VMM.
+	serialize bool
+
 	mu     sync.Mutex
 	runs   map[string]*runPool
 	closed bool
@@ -83,7 +88,7 @@ func New(cfg Config, lc Launcher, clk Clock) (Pool, error) {
 	if clk == nil {
 		clk = RealClock()
 	}
-	p := &pool{cfg: cfg, lc: lc, clk: clk, runs: map[string]*runPool{}, counters: newCounters()}
+	p := &pool{cfg: cfg, lc: lc, clk: clk, serialize: lc.SerializesExecsPerRun(), runs: map[string]*runPool{}, counters: newCounters()}
 	// Sized so a full host's worth of sweeps queues rather than blocking; a full
 	// queue falls back to an inline destroy (see sweep).
 	p.reclaimQ = make(chan reclaimBatch, 64)
@@ -166,7 +171,7 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 	}
 
 	t0 := p.clk.Now()
-	vm, cause, err := p.acquire(runCtx, key)
+	vm, rp, cause, err := p.acquire(runCtx, key)
 	if ph != nil {
 		ph.Acquire = p.clk.Now().Sub(t0)
 		ph.Cold = cause
@@ -176,6 +181,17 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 			return Result{}, cErr
 		}
 		return Result{}, err
+	}
+	if p.serialize {
+		// Firecracker arm only. The workspace's ext4 image is not a shared-disk
+		// filesystem: two guests mounting it rw at once would corrupt it, so
+		// concurrent Execs for one run queue here — which is exactly the
+		// constraint E10 must measure the arm under rather than around
+		// (spec §4.3). Registered BEFORE the destroy defer below so that, on
+		// unwind, this VM is fully destroyed (and its mount released) before the
+		// gate opens for the next command — see rp.execGate's doc comment.
+		rp.execGate.Lock()
+		defer rp.execGate.Unlock()
 	}
 	// One identical teardown for abort, timeout and success (spec §4.1), and no
 	// early return below can leak a VM.
@@ -229,19 +245,19 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 // second one (spec §4.2), then loops. Looping rather than recursing is what keeps
 // the acquire counted exactly once — cold-acquire rate is E11's headline diagnostic,
 // and double-counting it would read as replenishment falling behind.
-func (p *pool) acquire(ctx context.Context, key string) (VM, ColdCause, error) {
+func (p *pool) acquire(ctx context.Context, key string) (VM, *runPool, ColdCause, error) {
 	counted := false
 	var cause ColdCause
 	for {
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
-			return nil, "", ErrClosed
+			return nil, nil, "", ErrClosed
 		}
 		rp, fresh, err := p.runLocked(key)
 		if err != nil {
 			p.mu.Unlock()
-			return nil, "", p.countRefusal(err)
+			return nil, nil, "", p.countRefusal(err)
 		}
 		rp.lastExec = p.clk.Now()
 
@@ -253,7 +269,7 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, ColdCause, error) {
 			if !counted {
 				p.counters.warmAcquire()
 			}
-			return vm, cause, nil
+			return vm, rp, cause, nil
 		}
 
 		if !counted {
@@ -276,13 +292,13 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, ColdCause, error) {
 			case <-settled:
 				continue
 			case <-ctx.Done():
-				return nil, "", ErrAborted
+				return nil, nil, "", ErrAborted
 			}
 		}
 
 		if err := p.admitLocked(false); err != nil {
 			p.mu.Unlock()
-			return nil, "", p.countRefusal(err)
+			return nil, nil, "", p.countRefusal(err)
 		}
 		rp.warming++
 		rp.inFlight++
@@ -304,13 +320,13 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, ColdCause, error) {
 				// real spawn failure apart from an ordinary cancellation, and it would
 				// make the worker emit an exec error where the wire contract wants an
 				// abort.
-				return nil, "", ErrAborted
+				return nil, nil, "", ErrAborted
 			}
-			return nil, "", p.refuse(RefuseSpawn, "restore for %q: %v", key, err)
+			return nil, nil, "", p.refuse(RefuseSpawn, "restore for %q: %v", key, err)
 		}
 		rp.backoff = 0
 		p.mu.Unlock()
-		return vm, cause, nil
+		return vm, rp, cause, nil
 	}
 }
 

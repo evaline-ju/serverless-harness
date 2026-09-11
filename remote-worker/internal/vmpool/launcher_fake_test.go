@@ -28,6 +28,7 @@ type fakeLauncher struct {
 	resumeFn      func(*fakeVM, context.Context) error
 	destroyErr    error
 	keyOverride   string // hand back a VM bound to this key instead of the requested one
+	serialize     bool   // SerializesExecsPerRun's return value; false unless a test sets it
 }
 
 func newFakeLauncher() *fakeLauncher {
@@ -37,6 +38,17 @@ func newFakeLauncher() *fakeLauncher {
 // Kind is Firecracker because Config.VMM must match and the arm is irrelevant to
 // every Phase A test; Task 16's tests set it to CloudHypervisor explicitly.
 func (l *fakeLauncher) Kind() VMMKind { return Firecracker }
+
+// SerializesExecsPerRun returns whatever setSerialize last set (false by default),
+// so most tests get the simpler unserialized behavior and only the tests that
+// exist to exercise the per-run gate opt in.
+func (l *fakeLauncher) SerializesExecsPerRun() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.serialize
+}
+
+func (l *fakeLauncher) setSerialize(v bool) { l.mu.Lock(); l.serialize = v; l.mu.Unlock() }
 
 func (l *fakeLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, error) {
 	l.mu.Lock()
