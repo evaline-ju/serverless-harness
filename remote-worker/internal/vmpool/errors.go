@@ -23,6 +23,18 @@ var ErrKeyMismatch = errors.New("vmpool: popped VM is bound to a different works
 // ErrClosed means the pool is shutting down.
 var ErrClosed = errors.New("vmpool: closed")
 
+// ErrShortResponse means the guest closed, or the connection cut, before an explicit
+// End frame arrived. Spec §5.4: "A missing or short response is an ExecError, counted
+// — never coerced into a zero exit with truncated output." Firecracker documents vsock
+// packet loss as expected for resumed guests, so this is a routine condition to
+// report, not an impossible one to assert away.
+var ErrShortResponse = errors.New("vmpool: guest closed before End")
+
+// ErrGuest wraps a KindError the agent sent — a fork failure, an unreadable command
+// file. The guest's own message is preserved, because "exec failed" without it is
+// undiagnosable at 200 VMs a second.
+var ErrGuest = errors.New("vmpool: guest error")
+
 // RefusalReason names why the pool declined. Spec §6 requires a memory-driven
 // refusal to be recorded DISTINCTLY from a MaxRuns refusal — "or the two ceilings
 // get conflated and neither is diagnosable" — and §7.3 reports ExecErrors by cause.
@@ -47,6 +59,16 @@ type RefusalError struct {
 }
 
 func (e *RefusalError) Error() string { return fmt.Sprintf("%s: %s", e.Reason, e.Detail) }
+
+// Unwrap lets errors.Is see ErrShortResponse through the RefusalError wrapper, so
+// callers can match on the sentinel while operators still get the counted reason via
+// ReasonOf.
+func (e *RefusalError) Unwrap() error {
+	if e.Reason == RefuseShortResponse {
+		return ErrShortResponse
+	}
+	return nil
+}
 
 func refusal(r RefusalReason, format string, a ...any) *RefusalError {
 	return &RefusalError{Reason: r, Detail: fmt.Sprintf(format, a...)}
