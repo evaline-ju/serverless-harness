@@ -20,8 +20,8 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -135,19 +135,6 @@ func jitter(d time.Duration) time.Duration {
 	return d + time.Duration(rand.Int64N(int64(d/2)+1))
 }
 
-func splitList(s string) []string {
-	if s == "" {
-		return nil
-	}
-	var out []string
-	for _, part := range strings.Split(s, ",") {
-		if p := strings.TrimSpace(part); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
 func main() {
 	get := os.Getenv
 	cfg, err := poolConfig(get)
@@ -163,6 +150,29 @@ func main() {
 		log.Fatalf("microvm-worker: %v", err)
 	}
 	defer func() { _ = pool.Close() }()
+
+	// Verify, pin and probe BEFORE the Attach stream opens, because registration IS
+	// the live stream (remote-worker/DESIGN.md:29-30): a worker that registers and then
+	// discovers it cannot restore has already been given work. Spec §6: fail at start,
+	// not on a user's first request.
+	snapDir := filepath.Join(cfg.SnapshotDir, env(get, "SH_SNAPSHOT_IMAGE", "default"))
+	man, err := vmpool.LoadManifest(snapDir)
+	if err != nil {
+		log.Fatalf("microvm-worker: %v", err)
+	}
+	if err := man.Verify(snapDir); err != nil {
+		log.Fatalf("microvm-worker: %v", err)
+	}
+	unpin, err := vmpool.PinMemoryFile(filepath.Join(snapDir, "memfile"))
+	if err != nil {
+		log.Fatalf("microvm-worker: %v", err)
+	}
+	defer func() { _ = unpin() }()
+	if err := pool.Probe(context.Background()); err != nil {
+		log.Fatalf("microvm-worker: %v", err)
+	}
+	log.Printf("microvm-worker: snapshot %s verified and pinned (%s, built %s on %s)",
+		man.Image, man.Hash, man.BuiltAt.Format(time.RFC3339), man.InstanceType)
 
 	relayAddr := env(get, "RELAY_ADDR", "localhost:8443")
 	token := env(get, "SANDBOX_TOKEN", "dev-token")
@@ -198,13 +208,14 @@ func main() {
 
 	// Capabilities are NOT probed from the worker's own PATH here: the commands run in
 	// a guest, so the worker's PATH says nothing about what an Exec can use. They come
-	// from the golden snapshot's manifest instead (Task 14 writes SH_CAPABILITIES from
-	// it); an unset value advertises nothing rather than lying.
+	// from the golden snapshot's manifest loaded above instead, which the build script
+	// fills by probing INSIDE the guest before snapshotting; an empty manifest field
+	// advertises nothing rather than lying.
 	sess := session.New(session.Config{
 		SandboxID:     env(get, "SANDBOX_ID", "sbx-microvm-1"),
 		Image:         env(get, "SANDBOX_IMAGE", ""),
 		Trust:         env(get, "SANDBOX_TRUST", "untrusted"),
-		Capabilities:  splitList(get("SH_CAPABILITIES")),
+		Capabilities:  man.Capabilities,
 		MaxConcurrent: maxConcurrent,
 	}, vmpool.Runner{Pool: pool})
 

@@ -17,7 +17,7 @@ test:
 # `set -e` so one failing test file fails the target instead of being scrolled past.
 # deploy/claude/tests covers the /promote slash-command asset, which nothing else type-checks.
 test-deploy:
-	@set -e; for t in deploy/knative/tests/*.test.sh deploy/claude/tests/*.test.sh; do echo "== $$t"; bash "$$t"; done
+	@set -e; for t in deploy/knative/tests/*.test.sh deploy/claude/tests/*.test.sh deploy/microvm/tests/*.test.sh; do echo "== $$t"; bash "$$t"; done
 
 # One recursive run, so this target and CI cannot drift apart by editing a list in one of
 # them -- which they had, in both directions (#191): config-bundle was checked only here,

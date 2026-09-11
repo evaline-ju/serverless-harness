@@ -36,6 +36,12 @@ type Pool interface {
 	// form. Dropping standbys alone is internal to the sweep (spec §4.4).
 	Reclaim(ctx context.Context, key string) error
 	Stats() Stats
+	// Probe restores one VM, runs a trivial command in it and destroys it, without
+	// otherwise touching the pool's accounting. Spec §6's last row: a pinned hash is
+	// not sufficient — a snapshot can be intact and still unrestorable on this host —
+	// so the caller (the worker's startup sequence) must fail at START, not on a
+	// user's first request.
+	Probe(ctx context.Context) error
 	// Close stops the sweep and destroys everything. Beyond spec §4.1's listing:
 	// §6 requires a shutdown that leaves no orphan VMs.
 	Close() error
