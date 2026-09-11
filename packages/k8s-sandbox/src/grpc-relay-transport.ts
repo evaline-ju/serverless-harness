@@ -66,6 +66,9 @@ export function GrpcRelayTransport(
           // independently, and an explicit `timeout: 0` still means unbounded on both.
           timeoutS: execOpts.timeout ?? DEFAULT_EXEC_TIMEOUT_S,
           streaming: true,
+          // This transport has no per-run workspace concept yet -- an empty key is
+          // today's behaviour (a process-wide /workspace) for every caller on this path.
+          workspaceKey: '',
         },
       });
 

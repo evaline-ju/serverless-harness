@@ -135,6 +135,21 @@ export interface Exec {
   timeoutS: number;
   /** true for bash/grep; false for read/write */
   streaming: boolean;
+  /**
+   * workspace_key is the lease's run id (harness/src/sandbox-lease.ts keys leases by
+   * leaf run id, and nothing else on the wire carries it). vmpool keys a per-run
+   * host-side workspace on it; without it, consecutive leaseholders of one
+   * sandbox_id would inherit the previous run's workspace — which is precisely
+   * today's situation with a process-wide /workspace, and precisely the cross-tenant
+   * leak the microVM tier exists to close (spec §2.3, §3.4).
+   *
+   * ADDITIVE. Empty means "today's single shared workspace" on the CONTAINER path,
+   * which is what lets remote-worker ignore the field entirely. microvm-worker
+   * REFUSES an empty value with a counted ExecError: on the VM path there is no
+   * correct workspace to choose and nothing to fall back to, and an empty string
+   * would blind three separate safeguards at once (spec §3.4).
+   */
+  workspaceKey: string;
 }
 
 export interface Abort {
@@ -695,7 +710,7 @@ export const Heartbeat: MessageFns<Heartbeat> = {
 };
 
 function createBaseExec(): Exec {
-  return { reqId: 0, command: "", stdin: new Uint8Array(0), timeoutS: 0, streaming: false };
+  return { reqId: 0, command: "", stdin: new Uint8Array(0), timeoutS: 0, streaming: false, workspaceKey: "" };
 }
 
 export const Exec: MessageFns<Exec> = {
@@ -714,6 +729,9 @@ export const Exec: MessageFns<Exec> = {
     }
     if (message.streaming !== false) {
       writer.uint32(40).bool(message.streaming);
+    }
+    if (message.workspaceKey !== "") {
+      writer.uint32(50).string(message.workspaceKey);
     }
     return writer;
   },
@@ -765,6 +783,14 @@ export const Exec: MessageFns<Exec> = {
           message.streaming = reader.bool();
           continue;
         }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.workspaceKey = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -781,6 +807,7 @@ export const Exec: MessageFns<Exec> = {
       stdin: isSet(object.stdin) ? bytesFromBase64(object.stdin) : new Uint8Array(0),
       timeoutS: isSet(object.timeoutS) ? globalThis.Number(object.timeoutS) : 0,
       streaming: isSet(object.streaming) ? globalThis.Boolean(object.streaming) : false,
+      workspaceKey: isSet(object.workspaceKey) ? globalThis.String(object.workspaceKey) : "",
     };
   },
 
@@ -801,6 +828,9 @@ export const Exec: MessageFns<Exec> = {
     if (message.streaming !== false) {
       obj.streaming = message.streaming;
     }
+    if (message.workspaceKey !== "") {
+      obj.workspaceKey = message.workspaceKey;
+    }
     return obj;
   },
 
@@ -814,6 +844,7 @@ export const Exec: MessageFns<Exec> = {
     message.stdin = object.stdin ?? new Uint8Array(0);
     message.timeoutS = object.timeoutS ?? 0;
     message.streaming = object.streaming ?? false;
+    message.workspaceKey = object.workspaceKey ?? "";
     return message;
   },
 };

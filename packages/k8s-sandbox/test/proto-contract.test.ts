@@ -29,11 +29,41 @@ describe('sandbox/v1 generated TypeScript stubs', () => {
         stdin: new Uint8Array([1, 2, 3]),
         timeoutS: 30,
         streaming: true,
+        workspaceKey: '',
       }).finish(),
     );
     expect(back.reqId).toBe(7);
     expect(back.streaming).toBe(true);
     expect(Array.from(back.stdin)).toEqual([1, 2, 3]);
+  });
+
+  it('carries workspace_key and defaults it to the empty string', () => {
+    const back = Exec.decode(
+      Exec.encode({
+        reqId: 1,
+        command: 'cat /workspace/README.md',
+        stdin: new Uint8Array(),
+        timeoutS: 30,
+        streaming: false,
+        workspaceKey: 'leaf-abc123',
+      }).finish(),
+    );
+    expect(back.workspaceKey).toBe('leaf-abc123');
+
+    // Additive and backward-compatible (spec §3.4): a worker or harness that never
+    // sets the field reads it as '', which is proto3's default and is exactly what
+    // remote-worker's "today's behaviour" pin depends on.
+    const old = Exec.decode(
+      Exec.encode({
+        reqId: 2,
+        command: 'true',
+        stdin: new Uint8Array(),
+        timeoutS: 0,
+        streaming: true,
+        workspaceKey: '',
+      }).finish(),
+    );
+    expect(old.workspaceKey).toBe('');
   });
 
   it('preserves a negative exit_code (sint32 zigzag)', () => {

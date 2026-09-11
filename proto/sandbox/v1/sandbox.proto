@@ -52,6 +52,20 @@ message Exec {
   bytes  stdin     = 3;                // raw bytes (protobuf is binary — no base64)
   uint32 timeout_s = 4;
   bool   streaming = 5;                // true for bash/grep; false for read/write
+
+  // workspace_key is the lease's run id (harness/src/sandbox-lease.ts keys leases by
+  // leaf run id, and nothing else on the wire carries it). vmpool keys a per-run
+  // host-side workspace on it; without it, consecutive leaseholders of one
+  // sandbox_id would inherit the previous run's workspace — which is precisely
+  // today's situation with a process-wide /workspace, and precisely the cross-tenant
+  // leak the microVM tier exists to close (spec §2.3, §3.4).
+  //
+  // ADDITIVE. Empty means "today's single shared workspace" on the CONTAINER path,
+  // which is what lets remote-worker ignore the field entirely. microvm-worker
+  // REFUSES an empty value with a counted ExecError: on the VM path there is no
+  // correct workspace to choose and nothing to fall back to, and an empty string
+  // would blind three separate safeguards at once (spec §3.4).
+  string workspace_key = 6;
 }
 message Abort     { uint64 req_id = 1; }
 

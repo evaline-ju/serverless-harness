@@ -566,3 +566,37 @@ func TestContractServeReturnsOnContextCancel(t *testing.T) {
 		t.Fatal("Serve did not return within 5s of cancelling the stream's context: shutdown hangs")
 	}
 }
+
+// Spec §8's second regression pin: `workspace_key` empty ⇒ today's behaviour ON THE
+// CONTAINER ARM. The new proto field is additive, so a new harness against
+// remote-worker and an old harness against remote-worker must behave identically.
+//
+// Deliberately NOT extended to microvm-worker: "as now" there would mean one shared
+// workspace for every run (spec §3.4), which is the leak this slice closes. The
+// complement — an empty key REFUSED on the VM path — is pinned in vmpool.
+func TestWorkspaceKeyIsIgnoredByTheContainerWorker(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  string
+	}{
+		{"old harness: field never set", ""},
+		{"new harness: field populated", "leaf-abc123"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			conn := h.attach(t)
+			conn.SendExec(t, &pb.Exec{
+				ReqId:        1,
+				Command:      "echo hi; echo oops >&2; exit 7",
+				TimeoutS:     10,
+				Streaming:    true,
+				WorkspaceKey: tc.key,
+			})
+			stdout, stderr, terminal := conn.Collect(t, 1)
+			if string(stdout) != "hi\n" || string(stderr) != "oops\n" || terminal.GetEnd().GetExitCode() != 7 {
+				t.Fatalf("stdout=%q stderr=%q terminal=%v — the container arm must not change behaviour with the field set",
+					stdout, stderr, terminal)
+			}
+		})
+	}
+}

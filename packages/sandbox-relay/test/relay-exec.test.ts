@@ -40,7 +40,14 @@ describe('relay Exec/Abort routing', () => {
 
     const events: any[] = [];
     const pump = (async () => {
-      for await (const ev of relay.routeExec('sbx-1', 1, 'echo hi', new Uint8Array(), 0, true))
+      for await (const ev of relay.routeExec('sbx-1', {
+        reqId: 1,
+        command: 'echo hi',
+        stdin: new Uint8Array(),
+        timeoutS: 0,
+        streaming: true,
+        workspaceKey: '',
+      }))
         events.push(ev);
     })();
 
@@ -78,7 +85,15 @@ describe('relay Exec/Abort routing', () => {
   it('Exec for an absent sandboxId throws', async () => {
     const relay = createRelay({ records, validateToken: () => true } as never);
     await expect(async () => {
-      for await (const _ of relay.routeExec('ghost', 1, 'x', new Uint8Array(), 0, true)) void _;
+      for await (const _ of relay.routeExec('ghost', {
+        reqId: 1,
+        command: 'x',
+        stdin: new Uint8Array(),
+        timeoutS: 0,
+        streaming: true,
+        workspaceKey: '',
+      }))
+        void _;
     }).rejects.toThrow(/no live worker/);
   });
 
@@ -101,7 +116,14 @@ describe('relay Exec/Abort routing', () => {
     const events: any[] = [];
     let finished = false;
     const pump = (async () => {
-      for await (const ev of relay.routeExec('sbx-1', 1, 'sleep 100', new Uint8Array(), 0, true))
+      for await (const ev of relay.routeExec('sbx-1', {
+        reqId: 1,
+        command: 'sleep 100',
+        stdin: new Uint8Array(),
+        timeoutS: 0,
+        streaming: true,
+        workspaceKey: '',
+      }))
         events.push(ev);
       finished = true;
     })();
@@ -143,7 +165,14 @@ describe('relay Exec/Abort routing', () => {
 
     const events: any[] = [];
     const pump = (async () => {
-      for await (const ev of relay.routeExec('sbx-1', 7, 'sleep 5', new Uint8Array(), 0, true))
+      for await (const ev of relay.routeExec('sbx-1', {
+        reqId: 7,
+        command: 'sleep 5',
+        stdin: new Uint8Array(),
+        timeoutS: 0,
+        streaming: true,
+        workspaceKey: '',
+      }))
         events.push(ev);
     })();
 
@@ -153,7 +182,14 @@ describe('relay Exec/Abort routing', () => {
 
     await expect(
       (async () => {
-        for await (const _ of relay.routeExec('sbx-1', 7, 'echo hi', new Uint8Array(), 0, true))
+        for await (const _ of relay.routeExec('sbx-1', {
+          reqId: 7,
+          command: 'echo hi',
+          stdin: new Uint8Array(),
+          timeoutS: 0,
+          streaming: true,
+          workspaceKey: '',
+        }))
           void _;
       })(),
     ).rejects.toThrow(/req_id 7 already in flight/);
@@ -161,5 +197,46 @@ describe('relay Exec/Abort routing', () => {
     // Clean up the first generator so the test doesn't leak a pending pump.
     s.emitData({ end: { reqId: 7, exitCode: 0 } });
     await pump;
+  });
+
+  it('forwards workspace_key to the worker unchanged', async () => {
+    const relay = createRelay({ records, validateToken: () => true } as never);
+    const s = fakeAttach();
+    relay.onAttach(s as never);
+    s.emitData({
+      hello: {
+        sandboxId: 'sbx-1',
+        labels: {},
+        capabilities: [],
+        image: '',
+        arch: 'amd64',
+        capacityMax: 1,
+        trust: 'trusted',
+      },
+    });
+
+    const events: any[] = [];
+    void (async () => {
+      for await (const ev of relay.routeExec('sbx-1', {
+        reqId: 11,
+        command: 'cat /workspace/README.md',
+        stdin: new Uint8Array(),
+        timeoutS: 0,
+        streaming: true,
+        workspaceKey: 'leaf-abc123',
+      }))
+        events.push(ev);
+    })();
+
+    // The relay is a bridge, not a translator: whatever the harness put on Exec must
+    // reach the worker byte-identical, because microvm-worker keys a per-run
+    // workspace on it and an altered key is a cross-run bleed (spec §3.4, §6).
+    await vi.waitFor(() =>
+      expect((s.written.at(-1) as { exec?: { workspaceKey?: string } })?.exec?.workspaceKey).toBe(
+        'leaf-abc123',
+      ),
+    );
+    s.emitData({ end: { reqId: 11, exitCode: 0, truncated: false } });
+    await vi.waitFor(() => expect(events.at(-1)?.end?.exitCode).toBe(0));
   });
 });
