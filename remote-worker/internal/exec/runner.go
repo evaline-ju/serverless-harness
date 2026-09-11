@@ -95,6 +95,11 @@ type Spec struct {
 	Stdin     []byte
 	TimeoutS  uint32
 	Streaming bool
+	// WorkspaceKey is Exec.workspace_key: the lease's run id. BashRunner IGNORES it —
+	// on the container path an empty key means today's single shared workspace, which
+	// is what makes the proto field additive (spec §3.4). vmpool.Runner keys a per-run
+	// host-side workspace on it and refuses an empty one.
+	WorkspaceKey string
 }
 
 // Sink receives output as it is produced. data is owned by the callee. Chunk is

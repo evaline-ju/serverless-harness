@@ -363,6 +363,28 @@ func TestExecEmitsEndWithExitCode(t *testing.T) {
 	}
 }
 
+// The wire's workspace_key must reach the Runner, because that is the only thing
+// vmpool can key a per-run workspace on (spec §3.4). BashRunner ignores it; a
+// Runner that needs it must be able to see it. scriptedRunner already records
+// every Spec it's handed, so no parallel recording-runner type is needed here.
+func TestRunnerReceivesTheWorkspaceKey(t *testing.T) {
+	st := newFakeStream()
+	r := &scriptedRunner{}
+	s := session.New(testConfig(), r)
+	serve(t, s, st)
+	waitFor(t, "hello", func() bool { return len(st.sent()) >= 1 })
+
+	st.exec(&pb.Exec{ReqId: 1, Command: "true", Streaming: true, WorkspaceKey: "leaf-abc123"})
+	waitFor(t, "terminal frame", func() bool { return terminalFor(st.sent(), 1) != nil })
+
+	if r.count() != 1 {
+		t.Fatalf("runner ran %d times, want 1", r.count())
+	}
+	if got := r.specs[0].WorkspaceKey; got != "leaf-abc123" {
+		t.Fatalf("Spec.WorkspaceKey = %q, want %q", got, "leaf-abc123")
+	}
+}
+
 // #189: output the runner dropped at BufferCap must reach the harness as
 // End.truncated. Nothing else can tell it — the harness's cap is the same 8 MiB
 // and trips on strictly-greater, so exactly-cap output reads as complete.
