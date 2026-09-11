@@ -174,7 +174,16 @@ const instanceTypeCheckOverrideEnv = "SH_ALLOW_INSTANCE_TYPE_MISMATCH"
 const metadataTimeout = 300 * time.Millisecond
 
 // detectHostInstanceType identifies the machine microvm-worker is running on, in
-// the same vocabulary build-snapshot.sh's --instance-type recorded in the manifest.
+// the same vocabulary build-snapshot.sh's manifest records for instance_type.
+//
+// Fix-round-2 item C: build-snapshot.sh's detect_host_instance_type (deploy/
+// microvm/build-snapshot.sh) auto-detects the build host using THIS EXACT
+// precedence -- EC2 IMDSv2, then GCP metadata, then Azure IMDS, then DMI
+// product_name -- and only lets --instance-type override that when explicitly
+// passed. That pairing is deliberate: if you change the order (or add/remove a
+// probe) here, change it there too, or a manifest and the worker verifying it
+// will silently drift onto different hardware identities again.
+//
 // It tries each cloud provider's metadata service in turn -- generalized beyond EC2
 // deliberately, since nothing here should assume the fleet is EC2-only -- and falls
 // back to a stable, non-cloud host identity when none answer, so bare-metal and

@@ -60,11 +60,17 @@ OUT=""
 usage() {
   cat >&2 <<'USAGE'
 build-snapshot.sh --kernel PATH --rootfs PATH --agent PATH --image NAME
-                  --instance-type TYPE [--vmm firecracker|cloud-hypervisor]
+                  [--instance-type TYPE] [--vmm firecracker|cloud-hypervisor]
                   [--guest-ram-mb 256] [--out DIR]
 
 Builds one golden snapshot, ON THE INSTANCE TYPE THAT WILL RUN IT (spec §2.4:
-restore requires identical hardware and software). Writes vmstate, memfile and a
+restore requires identical hardware and software). --instance-type is an OVERRIDE:
+left unset, the script auto-detects this host's identity (cloud metadata first,
+then /sys/class/dmi/id/product_name -- see detect_host_instance_type) using the
+SAME precedence remote-worker/cmd/microvm-worker/main.go's detectHostInstanceType
+uses to verify the snapshot at start, so builder and verifier agree by
+construction. Only pass --instance-type when you deliberately want the manifest to
+name something other than what this host reports. Writes vmstate, memfile and a
 manifest.json the worker verifies at start, then restores one VM to prove the
 artifact works.
 USAGE
@@ -114,7 +120,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "$KERNEL" ] || [ -z "$ROOTFS" ] || [ -z "$AGENT_SRC" ] || [ -z "$IMAGE" ] || [ -z "$INSTANCE_TYPE" ]; then
+if [ -z "$KERNEL" ] || [ -z "$ROOTFS" ] || [ -z "$AGENT_SRC" ] || [ -z "$IMAGE" ]; then
+  # Fix-round-2 item C: --instance-type is deliberately NOT required here -- it is
+  # an override over detect_host_instance_type's auto-detection, checked in
+  # preflight() once all the detection helpers below are defined.
   usage
 fi
 case "$VMM" in
@@ -132,6 +141,101 @@ trap 'rm -rf "$STAGE"' EXIT
 log() { echo "build-snapshot.sh: $*" >&2; }
 
 # ---------------------------------------------------------------------------
+# instance-type auto-detection (fix-round-2 item C)
+# ---------------------------------------------------------------------------
+# --instance-type used to be a required, operator-typed argument written verbatim
+# into the manifest. microvm-worker's detectHostInstanceType (remote-worker/cmd/
+# microvm-worker/main.go) never reads that string back from the operator -- at
+# verify time it PROBES the host itself (cloud metadata, then a DMI fallback) and
+# compares its own answer to the manifest. On the EC2 dev box IMDS answers and a
+# hand-typed --instance-type naturally agrees with it, so the two never disagree
+# there; on the real bare-metal deployment target no cloud metadata answers, the
+# worker falls all the way to /sys/class/dmi/id/product_name (something like
+# "PowerEdge R760"), and a hand-typed manifest string will not match it --
+# verifyInstanceType then refuses to start every worker on the fleet, and the only
+# escape (SH_ALLOW_INSTANCE_TYPE_MISMATCH=true) disables the check entirely.
+#
+# detect_host_instance_type below MUST use the exact same precedence as
+# detectHostInstanceType in remote-worker/cmd/microvm-worker/main.go: EC2 IMDSv2,
+# then GCP metadata, then Azure IMDS, then DMI product_name. If you change the
+# order (or add/remove a probe) on either side, change it on both -- this pairing
+# IS the contract, not just a comment. --instance-type remains available as a
+# deliberate OVERRIDE (e.g. a documented compatible substitute type), applied
+# after detection and before anything reads $INSTANCE_TYPE.
+metadata_get() {
+  # $1: URL, remaining args: extra curl flags/headers. 300ms mirrors
+  # metadataTimeout in main.go: these services answer in single-digit
+  # milliseconds or not at all (wrong cloud, or none present).
+  local url="$1"
+  shift
+  curl -fs -S --max-time 0.3 "$@" "$url" 2>/dev/null || true
+}
+
+ec2_instance_type() {
+  # IMDSv2: a token must be minted (PUT /latest/api/token) before EC2's metadata
+  # service answers any meta-data GET -- mirrors ec2InstanceType in main.go.
+  local token
+  token="$(curl -fs -S --max-time 0.3 -X PUT \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+    http://169.254.169.254/latest/api/token 2>/dev/null || true)"
+  [ -n "$token" ] || return 0
+  metadata_get "http://169.254.169.254/latest/meta-data/instance-type" \
+    -H "X-aws-ec2-metadata-token: $token"
+}
+
+gcp_machine_type() {
+  # GCE answers "projects/<num>/machineTypes/<type>"; take the trailing segment
+  # so this is comparable to what EC2/Azure return -- mirrors gcpMachineType.
+  local raw
+  raw="$(metadata_get "http://metadata.google.internal/computeMetadata/v1/instance/machine-type" \
+    -H "Metadata-Flavor: Google")"
+  printf '%s\n' "${raw##*/}"
+}
+
+azure_vm_size() {
+  # Mirrors azureVMSize: Azure IMDS answers any request carrying its required
+  # header without further auth.
+  metadata_get "http://169.254.169.254/metadata/instance/compute/vmSize?api-version=2021-02-01" \
+    -H "Metadata: true"
+}
+
+stable_host_identity() {
+  # Mirrors stableHostIdentity: /sys/class/dmi/id/product_name is set by
+  # firmware/the hypervisor and stable across reboots on real hardware and most
+  # non-cloud hypervisors alike. uname is this script's equivalent of main.go's
+  # runtime.GOOS/GOARCH last resort, so this always returns SOMETHING.
+  local pn
+  if [ -r /sys/class/dmi/id/product_name ]; then
+    pn="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+    if [ -n "$pn" ]; then
+      printf '%s\n' "$pn"
+      return
+    fi
+  fi
+  printf '%s/%s\n' "$(uname -s)" "$(uname -m)"
+}
+
+detect_host_instance_type() {
+  local t
+  t="$(ec2_instance_type)"
+  if [ -n "$t" ]; then
+    printf '%s\n' "$t"
+    return
+  fi
+  t="$(gcp_machine_type)"
+  if [ -n "$t" ]; then
+    printf '%s\n' "$t"
+    return
+  fi
+  t="$(azure_vm_size)"
+  if [ -n "$t" ]; then
+    printf '%s\n' "$t"
+    return
+  fi
+  stable_host_identity
+}
+
+# ---------------------------------------------------------------------------
 # 1. preflight
 # ---------------------------------------------------------------------------
 kernel_at_least() {
@@ -144,6 +248,14 @@ kernel_at_least() {
 
 preflight() {
   log "preflight: checking this host can build AND restore a snapshot"
+
+  if [ -z "$INSTANCE_TYPE" ]; then
+    # Fix-round-2 item C: detect using the same precedence the worker verifies
+    # with, instead of demanding the operator type (and keep in sync by hand)
+    # something the worker will independently re-derive at start.
+    INSTANCE_TYPE="$(detect_host_instance_type)"
+    log "preflight: --instance-type not given, detected '$INSTANCE_TYPE'"
+  fi
 
   if [ ! -e /dev/kvm ]; then
     echo "build-snapshot.sh: /dev/kvm is not present on this host. A golden snapshot" >&2
@@ -512,9 +624,20 @@ ensure_workspace_image() {
 boot_quiesce_snapshot_firecracker() {
   local jail="$STAGE"
   local api_sock="$jail/run/firecracker.socket" vsock_uds="$jail/vsock.sock" console_log="$STAGE/console.log"
+  local fc_pid=""
   log "preparing the firecracker build jail at $jail (items 1, 2: jail-relative paths only)"
   mkdir -p "$jail/run"
   hardlink_or_copy_bin firecracker "$jail/firecracker"
+  # Fix-round-2 item A: the trap is armed BEFORE jail_mount_dev runs, not after --
+  # a failure anywhere between the mount and the old trap-arm point (ensure_workspace_image's
+  # mkfs.ext4, the chroot itself) used to leave only the original `rm -rf "$STAGE"`
+  # trap active, leaking the /dev/kvm and /dev/urandom bind mounts (a live mountpoint
+  # under $STAGE that rm -rf then runs over, rather than clears). jail_unmount_dev is
+  # unconditionally best-effort (umount ... || true), so arming it before the mount
+  # exists is harmless -- it just no-ops if fired early. $fc_pid is looked up when
+  # the trap FIRES, not when it is set, so declaring it empty here and assigning it
+  # below is sufficient even under `set -u`.
+  trap 'jail_unmount_dev "'"$jail"'"; kill "$fc_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
   jail_mount_dev "$jail"
   # Item 2: a second, non-root, read-write drive so a restored VM has something
   # for the per-run workspace to mount -- launcher_firecracker.go's Restore hard-
@@ -530,8 +653,7 @@ boot_quiesce_snapshot_firecracker() {
   # touches stdin, indistinguishable from a slow boot from the outside.
   chroot "$jail" /firecracker --api-sock /run/firecracker.socket \
     </dev/null >"$console_log" 2>&1 &
-  local fc_pid=$!
-  trap 'jail_unmount_dev "'"$jail"'"; kill "$fc_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+  fc_pid=$!
 
   # Item 1: kernel_image_path and the rootfs drive's path_on_host are now
   # jail-relative ("/kernel", "/rootfs"), exactly like launcher_firecracker.go's
@@ -568,9 +690,13 @@ boot_quiesce_snapshot_firecracker() {
 boot_quiesce_snapshot_cloud_hypervisor() {
   local jail="$STAGE"
   local api_sock="$jail/run/ch-api.sock" vsock_uds="$jail/vsock.sock" console_log="$STAGE/console.log"
+  local ch_pid=""
   log "preparing the cloud-hypervisor build jail at $jail (item 9: same jail-relative convention as the firecracker arm)"
   mkdir -p "$jail/run"
   hardlink_or_copy_bin cloud-hypervisor "$jail/cloud-hypervisor"
+  # Fix-round-2 item A: trap armed before the mount, not after -- see the matching
+  # comment in boot_quiesce_snapshot_firecracker for why.
+  trap 'jail_unmount_dev "'"$jail"'"; kill "$ch_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
   jail_mount_dev "$jail"
 
   log "starting cloud-hypervisor chrooted into $jail ($api_sock)"
@@ -607,8 +733,7 @@ boot_quiesce_snapshot_cloud_hypervisor() {
     --console "file=/console.log" \
     --serial off \
     </dev/null >/dev/null 2>&1 &
-  local ch_pid=$!
-  trap 'jail_unmount_dev "'"$jail"'"; kill "$ch_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+  ch_pid=$!
 
   wait_for_agent "$vsock_uds" "$console_log"
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
@@ -728,8 +853,14 @@ verify_restore_firecracker() {
   # original bug this round fixes.
   local jail="$STAGE/verify-jail"
   local api_sock="$jail/run/verify-api.sock" vsock_uds="$jail/vsock.sock"
+  local fc_pid=""
   mkdir -p "$jail/run"
   hardlink_or_copy_bin firecracker "$jail/firecracker"
+  # Fix-round-2 item A: trap armed before the mount, not after -- a failing `ln`
+  # (e.g. cross-device) or ensure_workspace_image's mkfs.ext4 below used to run
+  # inside the leak window; see the matching comment in
+  # boot_quiesce_snapshot_firecracker for the full rationale.
+  trap 'jail_unmount_dev "'"$jail"'"; kill "$fc_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
   jail_mount_dev "$jail"
   ln "$OUT/vmstate" "$jail/vmstate"
   ln "$OUT/memfile" "$jail/memfile"
@@ -738,8 +869,7 @@ verify_restore_firecracker() {
 
   chroot "$jail" /firecracker --api-sock /run/verify-api.sock \
     </dev/null >"$STAGE/verify-console.log" 2>&1 &
-  local fc_pid=$!
-  trap 'jail_unmount_dev "'"$jail"'"; kill "$fc_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+  fc_pid=$!
 
   # Wire format confirmed against fcapi.go's loadSnapshotRequest struct:
   # snapshot_path is top-level, the memory file nests under mem_backend as
@@ -778,8 +908,12 @@ verify_restore_cloud_hypervisor() {
   # found no confirmation either. Rebuilt on the API-call pattern below.
   local jail="$STAGE/verify-jail"
   local api_sock="$jail/run/verify-ch-api.sock" vsock_uds="$jail/vsock.sock"
+  local ch_pid=""
   mkdir -p "$jail/run" "$jail/ch-snapshot"
   hardlink_or_copy_bin cloud-hypervisor "$jail/cloud-hypervisor"
+  # Fix-round-2 item A: trap armed before the mount, not after -- see the matching
+  # comment in boot_quiesce_snapshot_firecracker for the full rationale.
+  trap 'jail_unmount_dev "'"$jail"'"; kill "$ch_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
   jail_mount_dev "$jail"
   ln "$OUT/rootfs" "$jail/rootfs"
   # vm.restore replays the whole snapshot directory, not just memory state, so
@@ -792,8 +926,7 @@ verify_restore_cloud_hypervisor() {
 
   chroot "$jail" /cloud-hypervisor --api-socket /run/verify-ch-api.sock \
     </dev/null >"$STAGE/verify-console.log" 2>&1 &
-  local ch_pid=$!
-  trap 'jail_unmount_dev "'"$jail"'"; kill "$ch_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+  ch_pid=$!
 
   api_put "$api_sock" /api/v1/vm.restore \
     '{"source_url":"file:///ch-snapshot","resume":true}'
