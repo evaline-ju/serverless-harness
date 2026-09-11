@@ -43,6 +43,12 @@ type Agent struct {
 	stderr  *bufio.Reader
 	seq     uint64
 	clockOK atomic.Bool
+
+	// dead is set once a parked-shell command times out and the shell is killed to
+	// stop its orphaned drain goroutines (see runOnParkedShell). A dead Agent refuses
+	// every subsequent command: a host-side timeout destroys the VM anyway, so this
+	// is the Agent being honest about a fact rather than a limitation it imposes.
+	dead atomic.Bool
 }
 
 func NewAgent(opts AgentOptions) (*Agent, error) {
@@ -112,6 +118,31 @@ func (a *Agent) Close() error {
 	return nil
 }
 
+// killShell kills and reaps the parked shell and marks the Agent dead. It exists for
+// exactly one caller: a parked-shell command that timed out. Without this, the two
+// drainUntilNonce goroutines reading a.stdout/a.stderr are simply abandoned — they
+// never see EOF, the shell is never reaped, and (since this Agent is reused
+// sequentially in tests, and would be reused across commands in any long-lived
+// process) they race a later command's drain goroutines on the very same
+// *bufio.Reader. Killing the shell forces EOF on both pipes, so the orphaned
+// goroutines return on their own, and Wait reaps the child.
+//
+// Marking the Agent dead is deliberate, not incidental: it cannot serve another
+// command after this, which matches reality, because the host destroys the VM on a
+// timeout. ServeConn checks this flag up front so a later command on a dead Agent
+// gets a clear KindError frame instead of hanging or panicking against a shell that
+// is no longer there.
+func (a *Agent) killShell() {
+	a.dead.Store(true)
+	a.mu.Lock()
+	shell := a.shell
+	a.mu.Unlock()
+	if shell != nil && shell.Process != nil {
+		_ = shell.Process.Kill()
+		_ = shell.Wait()
+	}
+}
+
 // Serve accepts connections forever. At snapshot time the agent is blocked HERE:
 // Firecracker documents that listening vsock sockets survive restore with the CID
 // updated, so the parked accept() is documented behaviour rather than a trick
@@ -158,9 +189,22 @@ func (a *Agent) ServeConn(rw io.ReadWriteCloser) error {
 
 	// The host ALWAYS sends KindStdinEOF, whether or not HasStdin is set — draining
 	// only conditionally would desynchronise the stream on every no-stdin command.
+	// This must happen BEFORE the dead-agent check below, not after: the host has
+	// already committed to writing its stdin frames by the time this runs, so
+	// replying early without draining them risks a write that never finds a reader
+	// on the other end (a real hang, seen against the net.Pipe()-based test harness
+	// and a risk under socket backpressure too), not just an ill-timed response.
 	stdin, err := a.readStdin(rw)
 	if err != nil {
 		return WriteFrame(rw, KindError, []byte("reading stdin: "+err.Error()))
+	}
+
+	// A previous command's timeout killed the parked shell (see killShell): the
+	// Agent is deliberately single-use after that, the same way the VM behind it is
+	// about to be destroyed by the host. Fail explicitly, now that stdin has been
+	// drained, rather than dispatching into a shell that is no longer there.
+	if a.dead.Load() {
+		return WriteFrame(rw, KindError, []byte("guest-agent: a previous command timed out; the parked shell was killed and this agent is dead"))
 	}
 
 	capBytes := req.CapBytes
@@ -278,6 +322,14 @@ func (a *Agent) runOnParkedShell(req Request, w *frameWriter) (End, error) {
 		// The host's destroy is the real enforcement — teardown is the same path as
 		// success (spec §4.1). This exists so a longer host timeout still yields an
 		// explicit frame rather than silence.
+		//
+		// Killing the shell here (rather than just returning) is what stops the two
+		// drainUntilNonce goroutines above from being orphaned against a.stdout and
+		// a.stderr: killing forces EOF on both pipes, so they return on their own
+		// instead of sitting there to race a later command's goroutines on the same
+		// readers. See killShell's comment for why that deliberately makes the Agent
+		// single-use from here on.
+		a.killShell()
 		return End{}, fmt.Errorf("timeout:%d", req.TimeoutS)
 	}
 	if res.err != nil {
@@ -397,29 +449,71 @@ type writerFunc func([]byte)
 
 func (f writerFunc) Write(p []byte) (int, error) { f(p); return len(p), nil }
 
-// drainUntilNonce forwards bytes to emit until it sees the nonce line, returning the
-// exit code that line carries (stdout only). It reads line-wise because the nonce is
-// line-delimited, and forwards in MaxFrame slices so one long line still streams.
+// drainUntilNonce forwards bytes to emit until it sees the nonce, returning the exit
+// code carried after it on stdout (wantCode) or nothing (stderr).
+//
+// It reads in bounded MaxFrame slices via the reader's Read, not ReadBytes('\n'): a
+// command that emits one huge line with no newline at all (e.g. `yes | tr -d '\n'`)
+// must not be able to make the guest buffer without bound just because CapBytes is
+// enforced downstream in frameWriter — that would defeat the entire point of capping
+// in the guest. Only a small, fixed carry-over of one nonce's length minus one byte
+// is kept across reads, which is exactly enough to catch a nonce split across a read
+// boundary; everything else is emitted immediately, so peak extra memory here is
+// O(MaxFrame + len(nonce)), never O(command output).
 func drainUntilNonce(r *bufio.Reader, nonce string, emit func([]byte), wantCode bool) (int32, error) {
+	var carry []byte
+	buf := make([]byte, MaxFrame)
 	for {
-		line, err := r.ReadBytes('\n')
-		if len(line) > 0 {
-			if idx := indexNonce(line, nonce); idx >= 0 {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			combined := make([]byte, len(carry)+n)
+			copy(combined, carry)
+			copy(combined[len(carry):], buf[:n])
+
+			if idx := indexNonce(combined, nonce); idx >= 0 {
 				if idx > 0 {
-					emitChunked(emit, line[:idx])
+					emitChunked(emit, combined[:idx])
 				}
-				if !wantCode {
-					return 0, nil
-				}
-				return parseNonceCode(line[idx:], nonce)
+				return finishSentinelLine(r, combined[idx:], nonce, wantCode)
 			}
-			emitChunked(emit, line)
+
+			// No nonce in what we have. Emit all of it except a nonce-length-sized
+			// tail, in case the nonce straddles this read and the next one.
+			keep := len(nonce) - 1
+			if keep > len(combined) {
+				keep = len(combined)
+			}
+			emitChunked(emit, combined[:len(combined)-keep])
+			carry = append([]byte(nil), combined[len(combined)-keep:]...)
 		}
-		if err != nil {
+		if rerr != nil {
 			// The shell died before the nonce: report it rather than inventing a code.
-			return 0, fmt.Errorf("parked shell ended before its sentinel: %w", err)
+			return 0, fmt.Errorf("parked shell ended before its sentinel: %w", rerr)
 		}
 	}
+}
+
+// finishSentinelLine reads, a byte at a time, through the newline that ends the
+// sentinel line runOnParkedShell writes ("<nonce> <code>\n" on stdout, "<nonce>\n"
+// on stderr) and then parses the code if wantCode. tail already starts with the
+// nonce and may already contain the rest of the line. This is bounded regardless of
+// command output size: the sentinel line itself is only ever a few dozen bytes.
+//
+// Consuming through the newline (rather than stopping the moment the nonce is found)
+// matters even when !wantCode: leaving it unread would surface as a stray leading
+// byte on the very next command's drain of the same *bufio.Reader.
+func finishSentinelLine(r *bufio.Reader, tail []byte, nonce string, wantCode bool) (int32, error) {
+	for bytes.IndexByte(tail, '\n') < 0 {
+		b, err := r.ReadByte()
+		if err != nil {
+			return 0, fmt.Errorf("parked shell ended before its sentinel: %w", err)
+		}
+		tail = append(tail, b)
+	}
+	if !wantCode {
+		return 0, nil
+	}
+	return parseNonceCode(tail, nonce)
 }
 
 // indexNonce returns the byte offset of nonce within line, or -1 if absent.

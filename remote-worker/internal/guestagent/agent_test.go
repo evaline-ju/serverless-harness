@@ -5,8 +5,10 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -166,6 +168,41 @@ func TestAgentReportsATimeoutRatherThanHanging(t *testing.T) {
 	// explicit frame instead of silence.
 	if !strings.HasPrefix(errMsg, "timeout:") {
 		t.Fatalf("agent error = %q, want a timeout: prefix", errMsg)
+	}
+}
+
+// A review found that bash does not recompute $ or $PPID inside the "( ... )"
+// subshell runOnParkedShell sources commands in — only $BASHPID differs there — so
+// $PPID inside it is the parked shell's PARENT, which is the process running the
+// Agent (cmd/guest-agent's main in production; this test binary here). A command
+// using the common defensive idiom `trap 'kill $PPID' EXIT` therefore signals that
+// process, not the parked shell. main.go installs signal.Ignore for exactly this
+// reason; this test installs the same guard on itself (since here it is the test
+// binary, not a guest-agent process, that sits where $PPID points) and then proves
+// the parked shell AND the agent both survive the trap, with the command's own exit
+// code still reported.
+func TestAgentSurvivesTrapKillPPIDOnExit(t *testing.T) {
+	signal.Ignore(syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	t.Cleanup(func() { signal.Reset(syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP) })
+
+	a := newTestAgent(t)
+	pid := a.ShellPID()
+	_, _, end, errMsg := drive(t, a, Request{
+		Command: "trap 'kill $PPID' EXIT; echo hi; exit 3", CapBytes: 1 << 20,
+	}, nil)
+	if errMsg != "" {
+		t.Fatalf("agent error: %s", errMsg)
+	}
+	if end.ExitCode != 3 {
+		t.Fatalf("end.ExitCode = %d, want 3 (the command's own exit code, not a symptom of the agent dying)", end.ExitCode)
+	}
+	if a.ShellPID() != pid {
+		t.Fatalf("ShellPID changed %d -> %d: the parked shell did not survive the trap", pid, a.ShellPID())
+	}
+	// Not just the shell — the agent itself must still be alive. Prove it with a
+	// second, unrelated command over the same Agent.
+	if _, _, end2, errMsg2 := drive(t, a, Request{Command: "echo still alive", CapBytes: 1 << 20}, nil); errMsg2 != "" || end2.ExitCode != 0 {
+		t.Fatalf("second command after the trap: end=%+v err=%s", end2, errMsg2)
 	}
 }
 
