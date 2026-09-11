@@ -136,3 +136,16 @@ func (c *Config) Normalize() error {
 	}
 	return nil
 }
+
+// ReclaimScanIntervalForTest exposes the derived interval. Normalize runs inside
+// New, so a test that wants to advance exactly one tick cannot compute it from the
+// Config it passed in.
+func (c Config) ReclaimScanIntervalForTest() time.Duration {
+	if c.ReclaimScanInterval > 0 {
+		return c.ReclaimScanInterval
+	}
+	if c.StandbyIdle > 0 {
+		return c.StandbyIdle / 4
+	}
+	return DefaultStandbyIdle / 4
+}

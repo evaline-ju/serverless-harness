@@ -48,10 +48,17 @@ type pool struct {
 	seq    uint64
 
 	counters *counters
+
+	// ticker is spec §4.2's second sweep trigger: the per-Exec sweep alone cannot
+	// reclaim a run whose last Exec was also its last (Task 6).
+	ticker      Timer
+	reclaimQ    chan reclaimBatch
+	reclaimDone sync.WaitGroup
 }
 
-// New validates cfg and returns a Pool. It does NOT start the reclaim ticker —
-// Task 6 adds that, and until then the pool has nothing to reclaim on a timer.
+// New validates cfg and returns a Pool. It starts the reclaim goroutine and arms
+// the reclaim ticker (spec §4.2's second sweep trigger) before returning, so a
+// caller's very first Exec is already covered by both.
 func New(cfg Config, lc Launcher, clk Clock) (Pool, error) {
 	if err := cfg.Normalize(); err != nil {
 		return nil, err
@@ -66,7 +73,16 @@ func New(cfg Config, lc Launcher, clk Clock) (Pool, error) {
 	if clk == nil {
 		clk = RealClock()
 	}
-	return &pool{cfg: cfg, lc: lc, clk: clk, runs: map[string]*runPool{}, counters: newCounters()}, nil
+	p := &pool{cfg: cfg, lc: lc, clk: clk, runs: map[string]*runPool{}, counters: newCounters()}
+	// Sized so a full host's worth of sweeps queues rather than blocking; a full
+	// queue falls back to an inline destroy (see sweep).
+	p.reclaimQ = make(chan reclaimBatch, 64)
+	p.reclaimDone.Add(1)
+	go p.reclaimLoop()
+	p.mu.Lock()
+	p.armTickerLocked()
+	p.mu.Unlock()
+	return p, nil
 }
 
 func (p *pool) refuse(r RefusalReason, format string, a ...any) error {
@@ -94,6 +110,11 @@ func (p *pool) classify(ctx context.Context, timedOut *atomic.Bool, timeoutS uin
 }
 
 func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, error) {
+	// Trigger 1 of spec §4.2's two: a map walk over at most MaxRuns entries,
+	// microseconds, not a timer per run. The destroys it schedules happen on the
+	// reclaim goroutine, so this adds no munmap to the hot path.
+	p.sweep(p.clk.Now())
+
 	if err := checkKey(key); err != nil {
 		return Result{}, p.countRefusal(err)
 	}
@@ -364,6 +385,9 @@ func (p *pool) Close() error {
 		return nil
 	}
 	p.closed = true
+	if p.ticker != nil {
+		p.ticker.Stop()
+	}
 	var victims []VM
 	for _, rp := range p.runs {
 		victims = append(victims, rp.ready...)
@@ -384,5 +408,14 @@ func (p *pool) Close() error {
 			}
 		}
 	}
+
+	// p.closed is now true, and every sweep checks it under p.mu before sending on
+	// reclaimQ (see sweep) — so no sweep can still be attempting a send here, and
+	// closing the queue cannot race one. This drains the reclaim goroutine
+	// deterministically: Close does not return with a destroy still running on it,
+	// even though it does not (and never did — see acquire) wait for an in-flight
+	// cold warm.
+	close(p.reclaimQ)
+	p.reclaimDone.Wait()
 	return firstErr
 }
