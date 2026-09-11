@@ -47,3 +47,14 @@ func (rp *runPool) idleFor(now time.Time) time.Duration { return now.Sub(rp.last
 // busy reports whether anything about this run is in motion. A run with work in
 // flight or a warming pending is never swept, whatever its idle clock says.
 func (rp *runPool) busy() bool { return rp.inFlight > 0 || rp.warming > 0 }
+
+// forgetPending drops a fired timer so pending does not grow across a long run.
+// Caller holds pool.mu.
+func (rp *runPool) forgetPending(tm Timer) {
+	for i, t := range rp.pending {
+		if t == tm {
+			rp.pending = append(rp.pending[:i], rp.pending[i+1:]...)
+			return
+		}
+	}
+}

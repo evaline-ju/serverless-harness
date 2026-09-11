@@ -149,64 +149,94 @@ func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, 
 	return res, runErr
 }
 
-// acquire returns a VM bound to key, warm if one is Ready and cold otherwise.
-// Task 5 replaces the cold branch with "block on the warming already in flight
-// rather than starting a second one"; here there are no standbys yet, so a cold
-// acquire warms one synchronously.
+// acquire returns a VM bound to key: warm if one is Ready, cold otherwise.
+//
+// The cold path blocks on the warming already in flight rather than starting a
+// second one (spec §4.2), then loops. Looping rather than recursing is what keeps
+// the acquire counted exactly once — cold-acquire rate is E11's headline diagnostic,
+// and double-counting it would read as replenishment falling behind.
 func (p *pool) acquire(ctx context.Context, key string) (VM, error) {
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return nil, ErrClosed
-	}
-	rp, fresh, err := p.runLocked(key)
-	if err != nil {
-		p.mu.Unlock()
-		return nil, p.countRefusal(err)
-	}
-	rp.lastExec = p.clk.Now()
+	counted := false
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, ErrClosed
+		}
+		rp, fresh, err := p.runLocked(key)
+		if err != nil {
+			p.mu.Unlock()
+			return nil, p.countRefusal(err)
+		}
+		rp.lastExec = p.clk.Now()
 
-	if n := len(rp.ready); n > 0 {
-		vm := rp.ready[n-1]
-		rp.ready = rp.ready[:n-1]
+		if n := len(rp.ready); n > 0 {
+			vm := rp.ready[n-1]
+			rp.ready = rp.ready[:n-1]
+			rp.inFlight++
+			p.mu.Unlock()
+			if !counted {
+				p.counters.warmAcquire()
+			}
+			return vm, nil
+		}
+
+		if !counted {
+			cause := ColdExhausted
+			switch {
+			case fresh:
+				cause = ColdFirstExec
+			case rp.parked:
+				cause = ColdParked
+			}
+			p.counters.coldAcquire(cause)
+			counted = true
+		}
+		rp.parked = false
+
+		if rp.warming > 0 {
+			settled := rp.settled
+			p.mu.Unlock()
+			select {
+			case <-settled:
+				continue
+			case <-ctx.Done():
+				return nil, ErrAborted
+			}
+		}
+
+		if err := p.admitLocked(false); err != nil {
+			p.mu.Unlock()
+			return nil, p.countRefusal(err)
+		}
+		rp.warming++
 		rp.inFlight++
+		dir, id := rp.dir, p.nextIDLocked()
 		p.mu.Unlock()
-		p.counters.warmAcquire()
+
+		vm, err := p.warm(ctx, key, dir, id)
+
+		p.mu.Lock()
+		rp.warming--
+		rp.signalSettledLocked()
+		if err != nil {
+			rp.inFlight--
+			rp.backoff = nextBackoff(rp.backoff)
+			p.mu.Unlock()
+			if ctx.Err() != nil {
+				// An abort during a cold warm is not a spawn failure. Counting it as
+				// one pollutes the by-cause exec-error accounting, which has to tell a
+				// real spawn failure apart from an ordinary cancellation, and it would
+				// make the worker emit an exec error where the wire contract wants an
+				// abort.
+				return nil, ErrAborted
+			}
+			return nil, p.refuse(RefuseSpawn, "restore for %q: %v", key, err)
+		}
+		rp.backoff = 0
+		p.mu.Unlock()
 		return vm, nil
 	}
-
-	cause := ColdExhausted
-	switch {
-	case fresh:
-		cause = ColdFirstExec
-	case rp.parked:
-		cause = ColdParked
-	}
-	rp.parked = false
-	if err := p.admitLocked(false); err != nil {
-		p.mu.Unlock()
-		return nil, p.countRefusal(err)
-	}
-	rp.inFlight++
-	dir, id := rp.dir, p.nextIDLocked()
-	p.mu.Unlock()
-
-	p.counters.coldAcquire(cause)
-	vm, err := p.warm(ctx, key, dir, id)
-	if err != nil {
-		p.mu.Lock()
-		rp.inFlight--
-		p.mu.Unlock()
-		if ctx.Err() != nil {
-			// An abort during a cold warm is not a spawn failure. Counting it as one
-			// pollutes the by-cause exec-error accounting, which has to tell a real
-			// spawn failure apart from an ordinary cancellation, and it would make the
-			// worker emit an exec error where the wire contract wants an abort.
-			return nil, ErrAborted
-		}
-		return nil, p.refuse(RefuseSpawn, "restore for %q: %v", key, err)
-	}
-	return vm, nil
 }
 
 // warm creates the run's workspace if it does not exist and restores one VM into
@@ -230,8 +260,11 @@ func (p *pool) warm(ctx context.Context, key, dir, id string) (VM, error) {
 // one exec's error.
 func (p *pool) destroy(key string, vm VM) {
 	p.mu.Lock()
-	if rp := p.runs[key]; rp != nil && rp.inFlight > 0 {
-		rp.inFlight--
+	if rp := p.runs[key]; rp != nil {
+		if rp.inFlight > 0 {
+			rp.inFlight--
+		}
+		p.scheduleReplenishLocked(rp)
 	}
 	p.mu.Unlock()
 	if err := vm.Destroy(); err != nil {
