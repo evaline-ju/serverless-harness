@@ -82,21 +82,11 @@ func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, 
 		return Result{}, err
 	}
 
-	vm, err := p.acquire(ctx, key)
-	if err != nil {
-		return Result{}, err
-	}
-	// One identical teardown for abort, timeout and success (spec §4.1), and no
-	// early return below can leak a VM.
-	defer p.destroy(key, vm)
-
-	if vm.Key() != key {
-		return Result{}, fmt.Errorf("%w: popped %q for %q", ErrKeyMismatch, vm.Key(), key)
-	}
-	if err := vm.Resume(ctx); err != nil {
-		return Result{}, p.refuse(RefuseSpawn, "resume %q: %v", key, err)
-	}
-
+	// The timeout must bound the WHOLE Exec, including a cold acquire's VM boot —
+	// not just vm.Run — or a wedged VMM hangs until the relay stream dies. The
+	// container worker times its exec around the entire process spawn for the same
+	// reason: the harness cannot tell the two tiers apart, and spec §6 requires a
+	// cold-acquire storm to stay "counted, never queued unboundedly."
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var timedOut atomic.Bool
@@ -106,6 +96,32 @@ func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, 
 			cancel()
 		})
 		defer tm.Stop()
+	}
+
+	vm, err := p.acquire(runCtx, key)
+	if err != nil {
+		// Same three-way classification the post-Run switch below does, and for the
+		// same reason: a timeout also cancels runCtx, so timeout must be tested
+		// first or every acquire timeout would report as an abort. Note ctx.Err(),
+		// not runCtx.Err() — the outer context is what distinguishes a real abort
+		// from the timer's own cancellation.
+		switch {
+		case timedOut.Load():
+			return Result{}, fmt.Errorf("%w:%d", ErrTimeout, e.TimeoutS)
+		case ctx.Err() != nil:
+			return Result{}, ErrAborted
+		}
+		return Result{}, err
+	}
+	// One identical teardown for abort, timeout and success (spec §4.1), and no
+	// early return below can leak a VM.
+	defer p.destroy(key, vm)
+
+	if vm.Key() != key {
+		return Result{}, fmt.Errorf("%w: popped %q for %q", ErrKeyMismatch, vm.Key(), key)
+	}
+	if err := vm.Resume(runCtx); err != nil {
+		return Result{}, p.refuse(RefuseSpawn, "resume %q: %v", key, err)
 	}
 
 	res, runErr := vm.Run(runCtx, Command{
@@ -172,6 +188,13 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, error) {
 		p.mu.Lock()
 		rp.inFlight--
 		p.mu.Unlock()
+		if ctx.Err() != nil {
+			// An abort during a cold warm is not a spawn failure. Counting it as one
+			// pollutes the by-cause exec-error accounting, which has to tell a real
+			// spawn failure apart from an ordinary cancellation, and it would make the
+			// worker emit an exec error where the wire contract wants an abort.
+			return nil, ErrAborted
+		}
 		return nil, p.refuse(RefuseSpawn, "restore for %q: %v", key, err)
 	}
 	return vm, nil

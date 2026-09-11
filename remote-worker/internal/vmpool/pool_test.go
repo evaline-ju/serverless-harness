@@ -255,3 +255,65 @@ func TestCloseDestroysEverythingAndRefusesFurtherExecs(t *testing.T) {
 		t.Fatalf("Exec after Close: err = %v, want ErrClosed", err)
 	}
 }
+
+// TestExecAbortedDuringColdAcquireIsNotASpawnFailure pins fix-round-1 finding 1:
+// acquire's cold-warm error branch must check ctx.Err() BEFORE wrapping the
+// launcher's error as RefuseSpawn, or a plain cancellation during Restore is
+// misreported as a spawn failure — breaking the abort-sentinel-on-wire mapping
+// and polluting by-cause exec-error metrics.
+func TestExecAbortedDuringColdAcquireIsNotASpawnFailure(t *testing.T) {
+	p, lc, _ := testPool(t)
+	restoring := make(chan struct{})
+	release := make(chan struct{})
+	lc.setBeforeRestore(func(_ RestoreRequest) {
+		close(restoring)
+		<-release
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Exec(ctx, "run-a", Exec{Command: "true"}, &capturingSink{})
+		done <- err
+	}()
+	<-restoring
+	cancel()
+	close(release)
+	err := <-done
+	if !errors.Is(err, ErrAborted) {
+		t.Fatalf("err = %v, want ErrAborted", err)
+	}
+	if got := p.Stats().Refusals[RefuseSpawn]; got != 0 {
+		t.Fatalf("Refusals[%s] = %d, want 0 — an abort during acquire must not be counted as a spawn failure", RefuseSpawn, got)
+	}
+	if n := lc.liveCount(); n != 0 {
+		t.Fatalf("%d VMs live after an abort during cold acquire, want 0", n)
+	}
+}
+
+// TestExecTimesOutDuringColdAcquire pins fix-round-1 finding 2: TimeoutS must
+// bound the whole Exec, including a cold acquire's VM boot, not just vm.Run —
+// otherwise a wedged VMM hangs Exec indefinitely regardless of TimeoutS.
+func TestExecTimesOutDuringColdAcquire(t *testing.T) {
+	p, lc, clk := testPool(t)
+	restoring := make(chan struct{})
+	release := make(chan struct{})
+	lc.setBeforeRestore(func(_ RestoreRequest) {
+		close(restoring)
+		<-release
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Exec(context.Background(), "run-a", Exec{Command: "sleep 99", TimeoutS: 5}, &capturingSink{})
+		done <- err
+	}()
+	<-restoring
+	clk.Advance(5 * time.Second)
+	close(release)
+	err := <-done
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("err = %v, want ErrTimeout", err)
+	}
+	if n := lc.liveCount(); n != 0 {
+		t.Fatalf("%d VMs live after a timeout during cold acquire, want 0", n)
+	}
+}
