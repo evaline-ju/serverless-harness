@@ -28,6 +28,10 @@ type Pool interface {
 	// Exec acquires a standby VM bound to key's workspace, runs exactly one
 	// command, and destroys the VM before returning. A VM is NEVER reused.
 	Exec(ctx context.Context, key string, e Exec, out Sink) (Result, error)
+	// ExecPhased is Exec with the hot path decomposed into Phases, for vmpoolctl
+	// and E10's driver (spec §3.1). ph may be nil. There is exactly one
+	// implementation: Exec delegates to this with a throwaway Phases.
+	ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph *Phases) (Result, error)
 	// Reclaim drops a run's standby VMs AND its workspace directory — the full
 	// form. Dropping standbys alone is internal to the sweep (spec §4.4).
 	Reclaim(ctx context.Context, key string) error
@@ -110,6 +114,26 @@ func (p *pool) classify(ctx context.Context, timedOut *atomic.Bool, timeoutS uin
 }
 
 func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, error) {
+	return p.ExecPhased(ctx, key, e, out, nil)
+}
+
+// Phases is the hot path decomposed, filled by ExecPhased. E10 rung 2 measures
+// "vsock -> run -> response -> teardown" as separate terms, and a single round-trip
+// number cannot answer the 15ms question — it hides which term is the cost.
+type Phases struct {
+	Acquire time.Duration // pop a Ready VM, or warm one (a cold acquire)
+	Resume  time.Duration
+	Run     time.Duration
+	Destroy time.Duration
+	Cold    ColdCause // "" when the acquire was warm
+}
+
+// ExecPhased is Exec with instrumentation. Exec delegates to it with a throwaway
+// Phases, so there is exactly one implementation and the measured path IS the
+// production path (spec §3.1: "E10 must measure the production code path"). ph may
+// be nil — every stamp below guards for it — so callers that do not care about the
+// decomposition (i.e. Exec itself) pay nothing for it.
+func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph *Phases) (Result, error) {
 	// Trigger 1 of spec §4.2's two: a map walk over at most MaxRuns entries,
 	// microseconds, not a timer per run. The destroys it schedules happen on the
 	// reclaim goroutine, so this adds no munmap to the hot path.
@@ -135,7 +159,12 @@ func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, 
 		defer tm.Stop()
 	}
 
-	vm, err := p.acquire(runCtx, key)
+	t0 := p.clk.Now()
+	vm, cause, err := p.acquire(runCtx, key)
+	if ph != nil {
+		ph.Acquire = p.clk.Now().Sub(t0)
+		ph.Cold = cause
+	}
 	if err != nil {
 		if cErr := p.classify(ctx, &timedOut, e.TimeoutS); cErr != nil {
 			return Result{}, cErr
@@ -144,18 +173,30 @@ func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, 
 	}
 	// One identical teardown for abort, timeout and success (spec §4.1), and no
 	// early return below can leak a VM.
-	defer p.destroy(key, vm)
+	defer func() {
+		t0 := p.clk.Now()
+		p.destroy(key, vm)
+		if ph != nil {
+			ph.Destroy = p.clk.Now().Sub(t0)
+		}
+	}()
 
 	if vm.Key() != key {
 		return Result{}, fmt.Errorf("%w: popped %q for %q", ErrKeyMismatch, vm.Key(), key)
 	}
-	if err := vm.Resume(runCtx); err != nil {
+	t0 = p.clk.Now()
+	resumeErr := vm.Resume(runCtx)
+	if ph != nil {
+		ph.Resume = p.clk.Now().Sub(t0)
+	}
+	if resumeErr != nil {
 		if cErr := p.classify(ctx, &timedOut, e.TimeoutS); cErr != nil {
 			return Result{}, cErr
 		}
-		return Result{}, p.refuse(RefuseSpawn, "resume %q: %v", key, err)
+		return Result{}, p.refuse(RefuseSpawn, "resume %q: %v", key, resumeErr)
 	}
 
+	t0 = p.clk.Now()
 	res, runErr := vm.Run(runCtx, Command{
 		Command:   e.Command,
 		Stdin:     e.Stdin,
@@ -163,6 +204,9 @@ func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, 
 		Streaming: e.Streaming,
 		CapBytes:  OutputCapBytes,
 	}, out)
+	if ph != nil {
+		ph.Run = p.clk.Now().Sub(t0)
+	}
 
 	if cErr := p.classify(ctx, &timedOut, e.TimeoutS); cErr != nil {
 		return res, cErr
@@ -170,24 +214,28 @@ func (p *pool) Exec(ctx context.Context, key string, e Exec, out Sink) (Result, 
 	return res, runErr
 }
 
-// acquire returns a VM bound to key: warm if one is Ready, cold otherwise.
+// acquire returns a VM bound to key: warm if one is Ready, cold otherwise. The
+// returned ColdCause is the cause of the cold acquire ("" for a warm one), so
+// ExecPhased can carry it into Phases.Cold; every error path returns an empty
+// cause because there is nothing yet to attribute.
 //
 // The cold path blocks on the warming already in flight rather than starting a
 // second one (spec §4.2), then loops. Looping rather than recursing is what keeps
 // the acquire counted exactly once — cold-acquire rate is E11's headline diagnostic,
 // and double-counting it would read as replenishment falling behind.
-func (p *pool) acquire(ctx context.Context, key string) (VM, error) {
+func (p *pool) acquire(ctx context.Context, key string) (VM, ColdCause, error) {
 	counted := false
+	var cause ColdCause
 	for {
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
-			return nil, ErrClosed
+			return nil, "", ErrClosed
 		}
 		rp, fresh, err := p.runLocked(key)
 		if err != nil {
 			p.mu.Unlock()
-			return nil, p.countRefusal(err)
+			return nil, "", p.countRefusal(err)
 		}
 		rp.lastExec = p.clk.Now()
 
@@ -199,11 +247,11 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, error) {
 			if !counted {
 				p.counters.warmAcquire()
 			}
-			return vm, nil
+			return vm, cause, nil
 		}
 
 		if !counted {
-			cause := ColdExhausted
+			cause = ColdExhausted
 			switch {
 			case fresh:
 				cause = ColdFirstExec
@@ -222,13 +270,13 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, error) {
 			case <-settled:
 				continue
 			case <-ctx.Done():
-				return nil, ErrAborted
+				return nil, "", ErrAborted
 			}
 		}
 
 		if err := p.admitLocked(false); err != nil {
 			p.mu.Unlock()
-			return nil, p.countRefusal(err)
+			return nil, "", p.countRefusal(err)
 		}
 		rp.warming++
 		rp.inFlight++
@@ -250,13 +298,13 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, error) {
 				// real spawn failure apart from an ordinary cancellation, and it would
 				// make the worker emit an exec error where the wire contract wants an
 				// abort.
-				return nil, ErrAborted
+				return nil, "", ErrAborted
 			}
-			return nil, p.refuse(RefuseSpawn, "restore for %q: %v", key, err)
+			return nil, "", p.refuse(RefuseSpawn, "restore for %q: %v", key, err)
 		}
 		rp.backoff = 0
 		p.mu.Unlock()
-		return vm, nil
+		return vm, cause, nil
 	}
 }
 
