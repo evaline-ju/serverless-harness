@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -77,15 +76,30 @@ func writeMemoryMax(dir string, bytes int64) error {
 // error), waits briefly for the kernel to empty the cgroup, then rmdirs the directory
 // (D5: rmdir, never rm -rf — cgroup directories are kernel-backed pseudo-files and rm -rf
 // fails on them; rmdir on an emptied cgroup is the supported removal). Returns the number
-// of VM cgroups swept. An absent slice (first boot on a fresh host) returns (0, nil) —
-// spec §6's posture is "fail at start" for things that make the tier unusable, and an
-// empty slice is not one of them.
+// of VM cgroup DIRECTORIES swept — not the number of processes actually killed by this
+// call. A cgroup whose sole occupant already exited (nothing left to signal) counts
+// exactly the same as one whose occupant this call actually SIGKILLed, by design (the
+// brief's own framing: "pids that no longer exist still count as swept") — so this
+// return value cannot be used to infer whether any live process was found or killed.
+// An absent slice (first boot on a fresh host) returns (0, nil) — spec §6's posture is
+// "fail at start" for things that make the tier unusable, and an empty slice is not
+// one of them.
+//
+// Fix round 1 (coordinator review of 36dbcb9), item 2: the parameter name was
+// previously `killed`, which reads as "count of processes killed" — misleading enough
+// that a coordinator mutation test (replacing the kill call with a no-op) still passed
+// the existing directory-removal-based test undetected. Renamed to `swept` to match
+// what it actually counts; TestSweepOrphansActuallyKillsALiveProcess (cgroup_test.go)
+// now separately covers the kill itself with a real, long-lived child process, since
+// this counter cannot.
 //
 // Platform-specific pid signalling (SIGKILL, ESRCH detection) lives in
-// cgroup_linux.go/cgroup_other.go, mirroring Task 14's pin_linux.go/pin_other.go split —
+// cgroup_unix.go/cgroup_windows.go (unix vs. windows — see cgroup_windows.go for why),
+// and RLIMIT_MEMLOCK-raising lives in cgroup_linux.go/cgroup_other.go (linux vs.
+// everything else, since that call has no meaningful non-linux behaviour at all) —
 // this file's directory-walking logic is itself platform-independent and runs
 // identically (and is unit-tested) on darwin.
-func SweepOrphans(slicePath string) (killed int, err error) {
+func SweepOrphans(slicePath string) (swept int, err error) {
 	entries, err := os.ReadDir(slicePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -100,11 +114,11 @@ func SweepOrphans(slicePath string) (killed int, err error) {
 		}
 		dir := filepath.Join(slicePath, entry.Name())
 		if err := sweepOneCgroup(dir); err != nil {
-			return killed, fmt.Errorf("vmpool: SweepOrphans: %s: %w", dir, err)
+			return swept, fmt.Errorf("vmpool: SweepOrphans: %s: %w", dir, err)
 		}
-		killed++
+		swept++
 	}
-	return killed, nil
+	return swept, nil
 }
 
 // sweepOneCgroup kills every pid in dir/cgroup.procs and removes dir once empty.
@@ -176,18 +190,26 @@ func readCgroupProcs(path string) ([]int, error) {
 	return pids, nil
 }
 
-// killPidIgnoringAbsent sends SIGKILL to pid. A pid that has already exited (ESRCH) is
-// treated as already-swept, not an error — the brief's own framing: "pids that no
-// longer exist still count as swept." syscall.Kill and syscall.ESRCH are defined
-// identically (by name) on both linux and darwin, so this needs no build-tag split —
-// unlike RaiseMemlockLimit (cgroup_linux.go/cgroup_other.go), which raises a real kernel
-// limit and has no meaningful darwin behaviour to fall back to.
-func killPidIgnoringAbsent(pid int) error {
-	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
-		return err
-	}
-	return nil
-}
+// killPidIgnoringAbsent sends SIGKILL to pid. Its implementation is behind a build-tag
+// split, cgroup_unix.go ("//go:build unix", covering both linux and darwin — the
+// platform this package's own tests run on) and cgroup_windows.go ("//go:build
+// windows", a stub that returns an error).
+//
+// Fix round 1 (coordinator review of 36dbcb9), item 3: this used to live here with no
+// build tag at all, calling syscall.Kill/syscall.SIGKILL/syscall.ESRCH directly. Those
+// three names happen to exist under both linux and darwin's syscall package, which is
+// why the previous claim ("needs no build-tag split") was true for the two platforms
+// this package is actually tested and deployed on — but it meant GOOS=windows failed
+// to even COMPILE this file, silently, with no build tag marking that as a deliberate
+// choice. This package elsewhere maintains an explicit split for exactly this kind of
+// platform difference (cgroup_linux.go/cgroup_other.go for RaiseMemlockLimit), so the
+// process-killing half of the sweep now gets the same treatment: a real
+// implementation on unix, and an explicit stub on windows that compiles cleanly and
+// fails loudly (a clear error, not a missing symbol) if ever reached. Windows is not a
+// deployment target for this project — nothing here is claiming otherwise — but a
+// package that fails to compile on an unlisted platform is a worse, more surprising
+// failure mode than one that compiles everywhere and only refuses to *run* where it
+// cannot.
 
 // waitForCgroupEmpty polls dir's cgroup.procs briefly so the kernel has a chance to
 // finish tearing down a just-killed process before rmdir is attempted — rmdir on a

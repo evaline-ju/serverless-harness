@@ -2,10 +2,12 @@ package vmpool
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A cgroup v2 tree is just a directory hierarchy with cgroup.procs and memory.max
@@ -34,16 +36,64 @@ func TestSweepOrphansFindsEveryLeftoverVMCgroup(t *testing.T) {
 		"vm-2": {"4243", "4244"},
 		"vm-3": {}, // already exited; the directory just needs removing
 	})
-	killed, err := SweepOrphans(root)
+	swept, err := SweepOrphans(root)
 	if err != nil {
 		t.Fatalf("SweepOrphans: %v", err)
 	}
-	if killed != 3 {
-		t.Fatalf("killed = %d, want 3 (pids that no longer exist still count as swept)", killed)
+	if swept != 3 {
+		t.Fatalf("swept = %d, want 3 (pids that no longer exist still count as swept)", swept)
 	}
 	entries, _ := os.ReadDir(root)
 	if len(entries) != 0 {
 		t.Fatalf("%d cgroup directories left behind: %v", len(entries), entries)
+	}
+}
+
+// TestSweepOrphansActuallyKillsALiveProcess covers what
+// TestSweepOrphansFindsEveryLeftoverVMCgroup above cannot. Fix round 1 (coordinator
+// review of 36dbcb9), item 2: the coordinator mutation-tested that earlier test by
+// replacing the kill call in sweepOneCgroup with a no-op, and the test still passed —
+// because its pids (4242 etc.) never existed in the first place, so syscall.Kill
+// returning ESRCH is indistinguishable from the kill never having been attempted at
+// all. A cgroup v2 tree is just directories and files, so this uses a REAL child
+// process instead of a fake pid: if the kill stops happening, this process keeps
+// running past the test's timeout instead of nothing observably changing.
+func TestSweepOrphansActuallyKillsALiveProcess(t *testing.T) {
+	cmd := exec.Command("sleep", "300")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting real child process: %v", err)
+	}
+	pid := cmd.Process.Pid
+
+	// Reap the child as soon as the kernel finishes tearing it down, so waitDone closes
+	// the instant SIGKILL actually lands rather than only on this goroutine's own polling
+	// cadence, and so the process does not sit around as a zombie either way.
+	waitDone := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(waitDone)
+	}()
+
+	root := fakeSlice(t, map[string][]string{
+		"vm-real": {strconv.Itoa(pid)},
+	})
+
+	swept, err := SweepOrphans(root)
+	if err != nil {
+		t.Fatalf("SweepOrphans: %v", err)
+	}
+	if swept != 1 {
+		t.Fatalf("swept = %d, want 1", swept)
+	}
+
+	select {
+	case <-waitDone:
+		// Good: the kernel actually reaped the process, i.e. SweepOrphans really
+		// signalled it — not merely removed a cgroup directory around it.
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		<-waitDone
+		t.Fatal("real child process was still running well after SweepOrphans returned — the kill was not actually delivered")
 	}
 }
 

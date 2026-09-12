@@ -4,7 +4,8 @@ package vmpool
 
 import (
 	"fmt"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // RaiseMemlockLimit raises RLIMIT_MEMLOCK to its own hard limit and returns both values
@@ -18,14 +19,23 @@ import (
 // reclaim under pressure. Without raising the limit first, mlock starts failing well
 // before the host's actual memory ceiling, in a way that looks identical to genuinely
 // running out of RAM until someone checks `ulimit -l`.
+//
+// Fix round 1 (coordinator review of 36dbcb9): RLIMIT_MEMLOCK is NOT a member of Go's
+// standard "syscall" package on linux/amd64 — only golang.org/x/sys/unix exports it,
+// which is already a dependency of this module and already used the same way in
+// internal/guestagent/listen_linux.go. The previous version referenced
+// syscall.RLIMIT_MEMLOCK, which does not exist, so `GOOS=linux go build ./...` failed
+// outright while `go build ./...` on darwin (this file excluded by its own build tag)
+// stayed silently green. unix.Rlimit's Cur/Max fields are already uint64, so the
+// uint64(...) casts the syscall.Rlimit version needed are gone too.
 func RaiseMemlockLimit() (soft, hard uint64, err error) {
-	var rl syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_MEMLOCK, &rl); err != nil {
+	var rl unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &rl); err != nil {
 		return 0, 0, fmt.Errorf("vmpool: RaiseMemlockLimit: getrlimit: %w", err)
 	}
 	rl.Cur = rl.Max
-	if err := syscall.Setrlimit(syscall.RLIMIT_MEMLOCK, &rl); err != nil {
+	if err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &rl); err != nil {
 		return 0, 0, fmt.Errorf("vmpool: RaiseMemlockLimit: setrlimit(cur=%d,max=%d): %w", rl.Cur, rl.Max, err)
 	}
-	return uint64(rl.Cur), uint64(rl.Max), nil
+	return rl.Cur, rl.Max, nil
 }
