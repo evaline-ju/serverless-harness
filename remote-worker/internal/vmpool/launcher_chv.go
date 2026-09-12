@@ -204,6 +204,19 @@ func chvPrepareVirtiofsdOwnership(runDir, workspaceDir string, uid, gid int) err
 	return nil
 }
 
+// chvPrepareOwnership is chvPrepareVirtiofsdOwnership, indirected so a test can
+// observe the CALL SITE inside Restore — not just the helper in isolation.
+//
+// Review finding (fix round 2): the round-1 tests
+// (TestRestorePreparesVirtiofsdOwnership and its failure-propagation
+// sibling) called chvPrepareVirtiofsdOwnership directly and never exercised
+// Restore at all. That leaves the integration point — whether Restore
+// actually calls the helper, and with which uid/gid — uncovered: a mutation
+// that changed Restore's call site to pass 0:0 (chown to root, undoing the
+// whole fix) or removed the call entirely still passed every test, because
+// nothing was watching that call site. See TestRestoreCallsPrepareOwnership.
+var chvPrepareOwnership = chvPrepareVirtiofsdOwnership
+
 // rewriteSnapshotConfig returns a copy of the golden snapshot's config.json with
 // its embedded vsock and (if present) virtio-fs socket paths replaced by
 // per-VM-unique ones.
@@ -319,7 +332,7 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 	// hits EACCES instead of finding a directory it can already enter. See
 	// chvPrepareVirtiofsdOwnership's doc comment for what this does and does not
 	// cover (workspaceDir's ancestors are out of scope here).
-	if err := chvPrepareVirtiofsdOwnership(runDir, req.WorkspaceDir, l.opts.VirtiofsdUID, l.opts.VirtiofsdGID); err != nil {
+	if err := chvPrepareOwnership(runDir, req.WorkspaceDir, l.opts.VirtiofsdUID, l.opts.VirtiofsdGID); err != nil {
 		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: %w", req.ID, err), cleanup())
 	}
 

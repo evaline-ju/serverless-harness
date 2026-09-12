@@ -3,8 +3,10 @@ package vmpool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -145,6 +147,84 @@ func TestRestorePreparesVirtiofsdOwnershipPropagatesFailure(t *testing.T) {
 	err := chvPrepareVirtiofsdOwnership(t.TempDir(), t.TempDir(), opts.VirtiofsdUID, opts.VirtiofsdGID)
 	if err == nil {
 		t.Fatal("chvPrepareVirtiofsdOwnership swallowed a chown failure")
+	}
+}
+
+// TestRestoreCallsPrepareOwnership covers fix round 2: the two tests above
+// call chvPrepareVirtiofsdOwnership directly and never exercise Restore, so
+// they cannot tell whether Restore actually calls it, or with which uid/gid.
+// A mutation that changed Restore's call site to chown to 0:0 (undoing the
+// whole round-1 fix) or removed the call entirely still passed every
+// existing test — nothing was watching the call site inside Restore itself.
+//
+// This test drives Restore and observes that call site via chvPrepareOwnership
+// (the indirected var), substituting a recorder that returns an error. That
+// error makes Restore abort right there — before any process spawn, so no
+// binaries and no KVM are needed — and lets this test assert against the
+// exact arguments Restore passed, and against Restore's own return-value
+// invariant (non-nil error, nil VM) on that path.
+func TestRestoreCallsPrepareOwnership(t *testing.T) {
+	orig := chvPrepareOwnership
+	defer func() { chvPrepareOwnership = orig }()
+
+	type call struct {
+		runDir, workspaceDir string
+		uid, gid             int
+	}
+	var got []call
+	sentinel := errors.New("sentinel: ownership prep refused")
+	chvPrepareOwnership = func(runDir, workspaceDir string, uid, gid int) error {
+		got = append(got, call{runDir, workspaceDir, uid, gid})
+		return sentinel
+	}
+
+	opts := chvOpts(t)
+	lc, err := NewCloudHypervisorLauncher(opts)
+	if err != nil {
+		t.Fatalf("NewCloudHypervisorLauncher: %v", err)
+	}
+	workspaceDir := t.TempDir()
+	vm, err := lc.Restore(context.Background(), RestoreRequest{
+		ID: "vm-chv-ownership", Key: "run-a", WorkspaceDir: workspaceDir, GuestRAMBytes: 256 << 20,
+	})
+
+	// Restore's own invariant: never a non-nil VM alongside a non-nil error.
+	if err == nil {
+		t.Fatal("Restore returned nil error despite chvPrepareOwnership failing")
+	}
+	if vm != nil {
+		t.Fatalf("Restore returned a non-nil VM alongside an error: %v", vm)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Restore's error does not wrap the sentinel: %v", err)
+	}
+
+	// Kills "removed the call entirely" (mutation 3): if Restore never calls
+	// chvPrepareOwnership, got stays empty and this fails.
+	if len(got) != 1 {
+		t.Fatalf("chvPrepareOwnership called %d times via Restore, want 1: %+v", len(got), got)
+	}
+	c := got[0]
+
+	// Kills "chown to 0:0" (mutation 2): asserting against opts.VirtiofsdUID/GID
+	// alone would be self-referential if Restore hardcoded some OTHER non-zero
+	// value, so also assert directly against zero.
+	if c.uid == 0 || c.gid == 0 {
+		t.Fatalf("Restore called chvPrepareOwnership with uid:gid %d:%d — must never be root", c.uid, c.gid)
+	}
+	if c.uid != opts.VirtiofsdUID || c.gid != opts.VirtiofsdGID {
+		t.Fatalf("Restore called chvPrepareOwnership with %d:%d, want configured %d:%d", c.uid, c.gid, opts.VirtiofsdUID, opts.VirtiofsdGID)
+	}
+
+	// The paths must be the run dir Restore itself created for this VM (a
+	// per-VM child of opts.RunDir keyed by req.ID) and req.WorkspaceDir, not
+	// something else entirely — e.g. opts.RunDir itself, or opts.SnapshotDir.
+	wantRunDir := filepath.Join(opts.RunDir, "vm-chv-ownership")
+	if c.runDir != wantRunDir {
+		t.Fatalf("runDir passed to chvPrepareOwnership = %q, want %q", c.runDir, wantRunDir)
+	}
+	if c.workspaceDir != workspaceDir {
+		t.Fatalf("workspaceDir passed to chvPrepareOwnership = %q, want %q", c.workspaceDir, workspaceDir)
 	}
 }
 
