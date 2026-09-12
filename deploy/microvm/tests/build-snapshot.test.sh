@@ -150,13 +150,19 @@ check "vm.restore API call is present" \
 check "config.json is preserved for cloud-hypervisor restores (item 9 corollary)" \
   "$([ "$(grep -c 'ch-config.json' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 
-echo "== fix-round-2 item A: the /dev bind-mount trap is armed before jail_mount_dev runs"
-# A failure between the mount and the trap upgrade (a failing mkfs.ext4, a
+echo "== fix-round-2 item A: CLEANUP_JAIL is armed before jail_mount_dev runs"
+# A failure between the mount and the arm upgrade (a failing mkfs.ext4, a
 # cross-device ln, anything) used to leave only the original `rm -rf "$STAGE"`
 # trap active, leaking the /dev/kvm and /dev/urandom bind mounts onto the host.
-# This can't exercise a live mount without KVM, but asserting the trap-arm line
-# precedes the jail_mount_dev call line, by source order, in all four jail-setup
-# functions is a legitimate and sufficient check that the leak window is closed.
+# Fix-round-7 item 2 replaced the four per-function dynamic `trap '...' EXIT`
+# strings with one script-scope CLEANUP_JAIL variable read by a single
+# cleanup_on_exit (see that function's own comment for why: an EXIT trap fires
+# at PROCESS exit, not function return, and bash pops function locals before a
+# mid-function failure's already-armed trap runs, so a trap that named a local
+# by reference was never actually safe). The property this test guards --
+# "the thing that lets cleanup unmount /dev is set up before the mount, not
+# after" -- still has to hold; only the mechanism changed, so the assertion is
+# rewritten around CLEANUP_JAIL="$jail" instead of a `trap` line.
 for fn in boot_quiesce_snapshot_firecracker boot_quiesce_snapshot_cloud_hypervisor \
   verify_restore_firecracker verify_restore_cloud_hypervisor; do
   start=$(grep -n "^${fn}() {" "$SCRIPT" | head -n1 | cut -d: -f1)
@@ -164,16 +170,16 @@ for fn in boot_quiesce_snapshot_firecracker boot_quiesce_snapshot_cloud_hypervis
   if [ -n "$start" ]; then
     end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
     if [ -n "$end" ]; then
-      trap_line=$(awk -v s="$start" -v e="$end" \
-        'NR>=s && NR<=e && /trap .*jail_unmount_dev/{print NR; exit}' "$SCRIPT")
+      arm_line=$(awk -v s="$start" -v e="$end" \
+        'NR>=s && NR<=e && /CLEANUP_JAIL="\$jail"/{print NR; exit}' "$SCRIPT")
       mount_line=$(awk -v s="$start" -v e="$end" \
         'NR>=s && NR<=e && /jail_mount_dev "\$jail"/{print NR; exit}' "$SCRIPT")
-      if [ -n "$trap_line" ] && [ -n "$mount_line" ] && [ "$trap_line" -lt "$mount_line" ]; then
+      if [ -n "$arm_line" ] && [ -n "$mount_line" ] && [ "$arm_line" -lt "$mount_line" ]; then
         ok=yes
       fi
     fi
   fi
-  check "$fn arms the unmount trap before jail_mount_dev (source order)" "$ok" "yes"
+  check "$fn sets CLEANUP_JAIL before jail_mount_dev (source order)" "$ok" "yes"
 done
 
 echo "== fix-round-3: guest_client.go is generated inside \$AGENT_SRC's module, not \$STAGE"
@@ -199,25 +205,31 @@ check "go build no longer reads guest_client.go out of \$STAGE" \
 check "the temp package dir under \$AGENT_SRC is dot-prefixed" \
   "$([ "$(grep -cE 'AGENT_SRC/\.[A-Za-z]' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 
-# Same discipline as fix-round-2 item A for the /dev bind mounts: the cleanup trap
-# must be armed BEFORE the directory is created, not after, so a failure between
-# mkdir and go build (or inside the heredoc) still removes it. Source-order check
-# within write_guest_client's own body, the same technique used for item A.
+# Same discipline as fix-round-2 item A for the /dev bind mounts: cleanup must
+# be armed BEFORE the directory is created, not after, so a failure between
+# mkdir and go build (or inside the heredoc) still removes it. Fix-round-7 item
+# 2 replaced this function's own one-off `trap '...' EXIT` (which embedded its
+# local $tmp_pkg literally at arm time -- safe on its own, but one more trap
+# idiom alongside the genuinely unsafe pid-referencing ones elsewhere in the
+# file) with the same script-scope CLEANUP_EXTRA_DIR read by cleanup_on_exit.
+# Source-order check within write_guest_client's own body, the same technique
+# used for item A, rewritten around CLEANUP_EXTRA_DIR="$tmp_pkg" instead of a
+# `trap` line.
 start=$(grep -n "^write_guest_client() {" "$SCRIPT" | head -n1 | cut -d: -f1)
 ok=no
 if [ -n "$start" ]; then
   end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
   if [ -n "$end" ]; then
-    trap_line=$(awk -v s="$start" -v e="$end" \
-      'NR>=s && NR<=e && /trap .*rm_rf_jail.*tmp_pkg/{print NR; exit}' "$SCRIPT")
+    arm_line=$(awk -v s="$start" -v e="$end" \
+      'NR>=s && NR<=e && /CLEANUP_EXTRA_DIR="\$tmp_pkg"/{print NR; exit}' "$SCRIPT")
     mkdir_line=$(awk -v s="$start" -v e="$end" \
       'NR>=s && NR<=e && /mkdir -p "\$tmp_pkg"/{print NR; exit}' "$SCRIPT")
-    if [ -n "$trap_line" ] && [ -n "$mkdir_line" ] && [ "$trap_line" -lt "$mkdir_line" ]; then
+    if [ -n "$arm_line" ] && [ -n "$mkdir_line" ] && [ "$arm_line" -lt "$mkdir_line" ]; then
       ok=yes
     fi
   fi
 fi
-check "write_guest_client arms the temp-dir cleanup trap before mkdir (source order)" "$ok" "yes"
+check "write_guest_client sets CLEANUP_EXTRA_DIR before mkdir (source order)" "$ok" "yes"
 
 echo "== fix-round-4 item 1: init exports a PATH before execing the agent"
 # The kernel hands init an essentially empty environment (no PATH at all). init
@@ -351,55 +363,62 @@ check "api_put is a thin wrapper around api_request" \
 check "api_patch is a thin wrapper around api_request" \
   "$([ "$(grep -cF 'api_request PATCH "$1" "$2" "$3"' "$SCRIPT")" -eq 1 ] && echo yes || echo no)" "yes"
 
-echo "== fix-round-5 item 2: each abnormal-exit jail trap kills, waits, unmounts, then removes -- in that order"
+echo "== fix-round-5 item 2: the EXIT-trap cleanup kills, waits, unmounts, then removes -- in that order"
 # A killed process does not release its held file descriptors (including the
 # /dev/kvm bind mount) synchronously -- `kill` only requests exit, it does not
 # wait for it -- so `wait` must run before jail_unmount_dev can succeed, which
-# must in turn run before the jail directory is removed. Each function's own
-# success path already does this (kill; wait; jail_unmount_dev; trap-reset);
-# this checks that the abnormal-exit TRAP does too. Extends the round-2 item A /
-# round-3 source-order idiom: instead of comparing the line numbers of two
-# separate lines, this compares the COLUMN position of each keyword's first
-# occurrence within the one line the trap lives on, since all four actions live
-# in a single trap string rather than across several lines.
+# must in turn run before the jail directory is removed. Fix-round-5 item 2
+# made this true of each function's own one-off abnormal-exit trap string;
+# fix-round-7 item 2 collapsed all four of those (each unsafe -- see
+# cleanup_on_exit's own comment) into ONE cleanup_on_exit function, so the
+# property now needs to hold just once, of that one function's body, rather
+# than once per VMM function. The round-2/round-3 source-order idiom (comparing
+# line numbers within a function's own span) still applies; cleanup_on_exit's
+# actions are one per line now rather than packed into a single trap string, so
+# this compares LINE order instead of the old same-line COLUMN order.
 check "rm_rf_jail helper exists (guarded rm -rf that refuses over a live mount)" \
   "$([ "$(grep -c '^rm_rf_jail()' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
-for fn in boot_quiesce_snapshot_firecracker boot_quiesce_snapshot_cloud_hypervisor \
-  verify_restore_firecracker verify_restore_cloud_hypervisor; do
-  start=$(grep -n "^${fn}() {" "$SCRIPT" | head -n1 | cut -d: -f1)
-  ok=no
-  if [ -n "$start" ]; then
-    end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
-    if [ -n "$end" ]; then
-      result=$(awk -v s="$start" -v e="$end" '
-        NR>=s && NR<=e && /^  trap .kill/ {
-          kp = index($0, "kill \"")
-          wp = index($0, "wait \"")
-          up = index($0, "jail_unmount_dev")
-          rp = index($0, "rm_rf_jail")
-          if (kp > 0 && wp > kp && up > wp && rp > up) print "yes"; else print "no"
-          exit
-        }
-      ' "$SCRIPT")
-      [ "$result" = "yes" ] && ok=yes
+check "cleanup_on_exit is defined exactly once" \
+  "$([ "$(grep -c '^cleanup_on_exit()' "$SCRIPT")" -eq 1 ] && echo yes || echo no)" "yes"
+coe_start=$(grep -n "^cleanup_on_exit() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+ok=no
+if [ -n "$coe_start" ]; then
+  coe_end=$(awk -v s="$coe_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$coe_end" ]; then
+    kill_line=$(awk -v s="$coe_start" -v e="$coe_end" \
+      'NR>=s && NR<=e && /^  kill /{print NR; exit}' "$SCRIPT")
+    wait_line=$(awk -v s="$coe_start" -v e="$coe_end" \
+      'NR>=s && NR<=e && /^  wait /{print NR; exit}' "$SCRIPT")
+    unmount_line=$(awk -v s="$coe_start" -v e="$coe_end" \
+      'NR>=s && NR<=e && /jail_unmount_dev/{print NR; exit}' "$SCRIPT")
+    rm_line=$(awk -v s="$coe_start" -v e="$coe_end" \
+      'NR>=s && NR<=e && /^  rm_rf_jail/{print NR; exit}' "$SCRIPT")
+    if [ -n "$kill_line" ] && [ -n "$wait_line" ] && [ -n "$unmount_line" ] && [ -n "$rm_line" ] \
+      && [ "$kill_line" -lt "$wait_line" ] && [ "$wait_line" -lt "$unmount_line" ] \
+      && [ "$unmount_line" -lt "$rm_line" ]; then
+      ok=yes
     fi
   fi
-  check "$fn's EXIT trap kills, waits, unmounts, then removes (in that order)" "$ok" "yes"
-done
+fi
+check "cleanup_on_exit kills, waits, unmounts, then removes (in that order)" "$ok" "yes"
 
-echo "== fix-round-5 item 2 (cont'd): rm -rf on \$STAGE is routed through the mount-aware guard"
+echo "== fix-round-5 item 2 (cont'd) / fix-round-7 item 1: rm -rf on \$STAGE (and any extra dir) is routed through the mount-aware guard"
 # rm -rf and rm_rf_jail together, over a live mountpoint, are a hazardous pair
 # (see the rm_rf_jail comment): today the only bind mounts are device nodes, so
 # a failed unmount just makes rm -rf fail loudly, but the shape is one small
 # change away (a future directory bind mount) from rm -rf silently recursing
 # through the mount and deleting whatever is on the other side of it. Every
-# \$STAGE removal in the script -- not just the four VMM-jail traps above --
-# should go through the guard, for the same reason the coordinator gave: the
-# safety net should not depend on nobody ever adding a mount later.
-check "no bare 'rm -rf \"\$STAGE\"' trap remains anywhere in the script" \
+# \$STAGE removal in the script should go through the guard. cleanup_on_exit
+# builds an array (\$STAGE, plus CLEANUP_EXTRA_DIR -- the verify_root sibling
+# of \$OUT introduced by fix-round-7 item 1 -- when one is live) and passes it
+# to rm_rf_jail in one call, so the old literal 'rm_rf_jail "\$STAGE"' text no
+# longer appears; assert the array-based form instead.
+check "no bare 'rm -rf \"\$STAGE\"' remains anywhere in the script" \
   "$(grep -cF 'rm -rf "$STAGE"' "$SCRIPT")" "0"
-check "the top-level EXIT trap (armed before any jail exists) uses the guard" \
-  "$([ "$(grep -cF 'rm_rf_jail "$STAGE"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "cleanup_on_exit builds its rm targets from \$STAGE" \
+  "$([ "$(grep -cF 'rm_targets=("$STAGE")' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "cleanup_on_exit's removal is routed through rm_rf_jail with that array" \
+  "$([ "$(grep -cF 'rm_rf_jail "${rm_targets[@]}"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 
 echo "== fix-round-6 item 1: /snapshot/create sends no resume_vm field"
 # resume_vm belongs to /snapshot/load's SnapshotLoadParams, not /snapshot/create's
@@ -436,6 +455,89 @@ check "the /snapshot/load body's vsock_override is not a bare string" \
   "$(printf '%s' "$snapshot_load_body" | grep -cF '\"vsock_override\":\"')" "0"
 check "the /snapshot/load body still sets resume_vm true (valid here, unlike on create)" \
   "$(printf '%s' "$snapshot_load_body" | grep -cF '\"resume_vm\":true')" "1"
+
+echo "== fix-round-7 item 2: an EXIT trap can never reference a function-local (structural fix)"
+# Real rig failure: "line 1: fc_pid: unbound variable" -- an EXIT trap fires at
+# WHOLE-PROCESS exit, not function return, and bash pops a function's locals
+# off as soon as `set -e` unwinds out of its call frame, which for a
+# mid-function failure happens BEFORE the trap body (already pointing at that
+# now-gone local, by name) gets to run. This bit all four functions that armed
+# their own `trap '...' EXIT` referencing a local pid/jail variable (both
+# boot_quiesce_snapshot_* arms, both verify_restore_* arms) -- the fix is
+# structural: a single trap, once, calling a function that only ever touches
+# script-scope globals (never a popped local). These assertions try to catch
+# the whole class, not just the one site that failed on the rig: no function
+# anywhere in the file may still declare a `local` pid variable of this shape,
+# and the three globals cleanup_on_exit depends on must never be shadowed
+# `local` by anything (a shadow would silently revive the exact bug: a
+# function-local of the same name, invisible to the trap's own copy of the
+# global once that function returns -- no, worse, invisible to the *rest of
+# the script* the moment such a shadow's frame is popped, same failure mode).
+# Excludes comment-only lines throughout this block: the explanatory comments
+# above (and the ones cleanup_on_exit itself carries) deliberately quote both
+# the old buggy shape and the new fixed shape as prose, e.g. "the single
+# `trap cleanup_on_exit EXIT` armed once at the top", which would otherwise
+# double-count the real, live statement below.
+check "exactly one 'trap ... EXIT' statement exists in the whole script" \
+  "$(grep -cE '^[[:space:]]*trap ' "$SCRIPT")" "1"
+check "the one remaining trap is 'trap cleanup_on_exit EXIT'" \
+  "$([ "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -cF 'trap cleanup_on_exit EXIT')" -eq 1 ] && echo yes || echo no)" "yes"
+check "cleanup_on_exit function is defined" \
+  "$([ "$(grep -c '^cleanup_on_exit()' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "no LIVE 'local fc_pid' declaration remains anywhere in the script" \
+  "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -cE '\blocal fc_pid\b')" "0"
+check "no LIVE 'local ch_pid' declaration remains anywhere in the script" \
+  "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -cE '\blocal ch_pid\b')" "0"
+# Excludes comment-only lines: the explanatory comments above deliberately
+# quote the old buggy code shape (e.g. "`trap 'kill "$fc_pid" ...' EXIT`") to
+# document what this fixes, so a plain substring grep over the whole file
+# would false-positive on the documentation, not the code.
+check "no LIVE CODE line references \"\$fc_pid\" (only explanatory comments may)" \
+  "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -cF '$fc_pid')" "0"
+check "no LIVE CODE line references \"\$ch_pid\" (only explanatory comments may)" \
+  "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -cF '$ch_pid')" "0"
+for g in CLEANUP_PID CLEANUP_JAIL CLEANUP_EXTRA_DIR; do
+  check "$g is never declared 'local' anywhere (stays script-scope)" \
+    "$(grep -cE "local ${g}\b" "$SCRIPT")" "0"
+done
+check "CLEANUP_PID is assigned by every VMM-launching function" \
+  "$([ "$(grep -cF 'CLEANUP_PID=$!' "$SCRIPT")" -eq 4 ] && echo yes || echo no)" "yes"
+
+echo "== fix-round-7 item 1: verify_restore hard-links \$OUT's files via a same-device sibling, not \$STAGE"
+# Real rig failure: 'ln: failed to create hard link ... Invalid cross-device
+# link' -- \$STAGE lives on tmpfs (a genuine, deliberate speed win for
+# assembling the rootfs tree and mkfs'ing the ext4 image, per the coordinator's
+# explicit "do not move \$STAGE wholesale" instruction), but \$OUT is normally
+# on persistent disk, and ln(1) across two filesystems is always EXDEV, not a
+# permissions problem. new_verify_dir/link_snapshot_file move ONLY the
+# verify-time jail onto a sibling directory of \$OUT (sharing \$OUT's device),
+# leaving \$STAGE itself untouched and still tmpfs for everything else.
+check "new_verify_dir helper exists" \
+  "$([ "$(grep -c '^new_verify_dir()' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "new_verify_dir allocates its directory under dirname \"\$OUT\" (a sibling of \$OUT)" \
+  "$([ "$(grep -cF 'mktemp -d "$base/.build-snapshot-verify.XXXXXX"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "link_snapshot_file helper exists" \
+  "$([ "$(grep -c '^link_snapshot_file()' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "link_snapshot_file attempts a hard link first" \
+  "$([ "$(grep -cF 'if ln "$src" "$dst" 2>/dev/null; then' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "link_snapshot_file's fallback is a LOUD warning, not a silent copy" \
+  "$([ "$(grep -c 'WARNING: could not hard-link' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "link_snapshot_file's warning names memfile/guest-RAM as the risk, not just \"a file\"" \
+  "$([ "$(grep -cF 'ENTIRE guest RAM image' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "link_snapshot_file's fallback copy is cp -p (preserves mode/mtime), after the warning" \
+  "$([ "$(grep -cF 'cp -p "$src" "$dst"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "no bare 'ln \"\$OUT/...' call site remains anywhere in the script" \
+  "$(grep -cE 'ln "\$OUT/' "$SCRIPT")" "0"
+check "both verify functions route \$OUT's vmstate/memfile/rootfs/ch-config.json through link_snapshot_file" \
+  "$([ "$(grep -cF 'link_snapshot_file "$OUT/' "$SCRIPT")" -eq 7 ] && echo yes || echo no)" "yes"
+check "both verify jails are rooted under new_verify_dir, not \$STAGE" \
+  "$([ "$(grep -cF 'jail="$verify_root/verify-jail"' "$SCRIPT")" -eq 2 ] && echo yes || echo no)" "yes"
+check "no verify jail is still rooted at \$STAGE/verify-jail" \
+  "$(grep -cF 'jail="$STAGE/verify-jail"' "$SCRIPT")" "0"
+check "both verify functions register their verify_root with CLEANUP_EXTRA_DIR" \
+  "$([ "$(grep -cF 'CLEANUP_EXTRA_DIR="$verify_root"' "$SCRIPT")" -eq 2 ] && echo yes || echo no)" "yes"
+check "both verify functions remove verify_root on their own normal-path teardown too" \
+  "$([ "$(grep -cF 'rm_rf_jail "$verify_root"' "$SCRIPT")" -eq 2 ] && echo yes || echo no)" "yes"
 
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"

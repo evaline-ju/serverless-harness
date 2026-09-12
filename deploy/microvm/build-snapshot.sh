@@ -136,7 +136,58 @@ esac
 
 OUT="${OUT:-$REPO_ROOT/.build/microvm-snapshots/$IMAGE}"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/build-snapshot.XXXXXX")"
-trap 'rm_rf_jail "$STAGE"' EXIT
+
+# Fix-round-7 item 2: every phase below runs a VMM in the background and/or holds
+# a device-mounted jail open, and each used to arm ITS OWN `trap '...' EXIT`
+# string referencing that phase's own `local` pid/jail variable by name (e.g.
+# `trap 'kill "$fc_pid" ...' EXIT`, with `local fc_pid=""` declared just above
+# it). That looked safe -- fix-round-2 item A even documents arming it early,
+# before the mount, for exactly this reason -- but it was not: an EXIT trap
+# fires when the WHOLE SCRIPT's process exits, not when the function that armed
+# it returns, and bash pops a function's locals off as soon as `set -e` unwinds
+# out of that function's call frame, which for a mid-function failure happens
+# BEFORE the (already-armed, already pointing at that now-gone local) trap body
+# gets to run. Referencing a popped local under `set -u` is itself instantly
+# fatal ("fc_pid: unbound variable") -- and that failure happens INSIDE the
+# trap, aborting it, so the rest of the trap body (the kill/wait, the unmount,
+# the final rm -rf) never runs either. This bit every one of the four functions
+# that did it (both boot_quiesce_snapshot_* arms, both verify_restore_* arms);
+# the ones that "worked" up to this round only did so by luck of where the real
+# failure happened to land.
+#
+# The fix: nothing this trap touches is ever a function local. These three are
+# script-scope, set (never `local`-shadowed anywhere in this file) by whichever
+# phase is currently live, and reset back to "" by that same phase once its own
+# normal-path teardown has already run -- so cleanup_on_exit only re-does work
+# for a phase that is still mid-flight when the trap fires, never for one that
+# already finished cleanly. The relevant functions run strictly sequentially,
+# never concurrently, so there is exactly one writer of each field at a time and
+# nothing for one phase to stomp on another's behalf.
+CLEANUP_PID=""       # pid of the currently-running VMM subprocess, if any
+CLEANUP_JAIL=""       # jail directory with an active /dev bind-mount, if any
+CLEANUP_EXTRA_DIR=""  # extra directory (beyond $STAGE) to remove, if any
+
+cleanup_on_exit() {
+  # Runs once, however deep whatever phase was mid-flight when the script exited
+  # happened to be. Every name referenced here is either this function's OWN
+  # local (declared and consumed within this one invocation, so it can never be
+  # popped out from under itself the way the old per-function traps were) or one
+  # of the three script-scope globals above. The ${VAR:-} defaults are
+  # belt-and-braces -- set -u never actually needs them for a global that is
+  # always assigned above -- so that a future global added the same way without
+  # the default does not quietly reintroduce this bug's class.
+  kill "${CLEANUP_PID:-}" 2>/dev/null || true
+  wait "${CLEANUP_PID:-}" 2>/dev/null || true
+  if [ -n "${CLEANUP_JAIL:-}" ]; then
+    jail_unmount_dev "$CLEANUP_JAIL"
+  fi
+  local rm_targets=("$STAGE")
+  if [ -n "${CLEANUP_EXTRA_DIR:-}" ]; then
+    rm_targets+=("$CLEANUP_EXTRA_DIR")
+  fi
+  rm_rf_jail "${rm_targets[@]}"
+}
+trap cleanup_on_exit EXIT
 
 log() { echo "build-snapshot.sh: $*" >&2; }
 
@@ -397,7 +448,15 @@ INIT
 # ---------------------------------------------------------------------------
 write_guest_client() {
   local tmp_pkg="$AGENT_SRC/.build-snapshot-tmp-$$"
-  trap 'rm_rf_jail "'"$tmp_pkg"'" "$STAGE"' EXIT
+  # Fix-round-7 item 2: CLEANUP_EXTRA_DIR (script-scope, see cleanup_on_exit at
+  # the top of the script) replaces what used to be a one-off
+  # `trap '...' EXIT` embedding this function's own local $tmp_pkg. That
+  # particular embedding happened to be safe (the value was baked into the trap
+  # string literally, at arm time, not evaluated as a variable at fire time) --
+  # but the pid-referencing traps elsewhere in this file were not safe, and
+  # having two different trap idioms side by side was itself a hazard. One
+  # mechanism for the whole file now.
+  CLEANUP_EXTRA_DIR="$tmp_pkg"
   if ! mkdir -p "$tmp_pkg"; then
     echo "build-snapshot.sh: cannot create $tmp_pkg -- is --agent $AGENT_SRC" \
       "writable? (guest_client.go must be generated inside the module tree so its" \
@@ -532,7 +591,7 @@ func readLine(conn net.Conn) (string, error) {
 GOEOF
   (cd "$AGENT_SRC" && go build -o "$STAGE/guest_client" "$tmp_pkg/guest_client.go")
   rm -rf "$tmp_pkg"
-  trap 'rm_rf_jail "$STAGE"' EXIT
+  CLEANUP_EXTRA_DIR=""
 }
 
 wait_for_agent() {
@@ -737,6 +796,60 @@ rm_rf_jail() {
   rm -rf "$@"
 }
 
+# new_verify_dir creates a fresh directory ON THE SAME DEVICE AS $OUT -- a
+# SIBLING of $OUT, not a subdirectory of it ($OUT is locked read-only by
+# lock_down before verify_restore ever runs, so nothing should write inside it)
+# -- so that link_snapshot_file below can hard-link $OUT's own files into the
+# verify jail instead of copying them.
+#
+# Fix-round-7 item 1: the verify jail used to nest under $STAGE, which lives
+# under ${TMPDIR:-/tmp} -- tmpfs on the rig -- while $OUT is normally on
+# persistent disk. ln(1) between two different filesystems always fails EXDEV
+# ("Invalid cross-device link") no matter what permissions say, and this path
+# had never executed against a real disk-backed $OUT before this round, which
+# is why it surfaced only now, in verify, not in the boot/snapshot phase (whose
+# jail *is* $STAGE, and never links anything in from $OUT). A sibling of $OUT is
+# still a different absolute path than the one the golden snapshot was built
+# under, so this does not weaken the portability guarantee verify_restore
+# exists to check -- only the DEVICE needs to match $OUT's, not the directory.
+new_verify_dir() {
+  local base
+  base="$(dirname "$OUT")"
+  mktemp -d "$base/.build-snapshot-verify.XXXXXX"
+}
+
+# link_snapshot_file hard-links $1 (a file inside $OUT, i.e. a component of the
+# golden snapshot just produced by lock_down) into $2. Deliberately NOT the same
+# shape as hardlink_or_copy_bin: that helper's quiet cp fallback is fine for the
+# firecracker/cloud-hypervisor binaries it places (small, and a cross-device
+# fallback there is the normal, expected case on most hosts), but is NOT fine
+# here. $1 and $2 are arranged (see new_verify_dir) to share a device precisely
+# so this ln always succeeds without copying, because one of these files
+# (memfile) is the guest's ENTIRE RAM image, sized by --guest-ram-mb -- a silent
+# copy fallback would turn "verify a hard link" into "duplicate a whole guest's
+# memory into host RAM" on exactly the resource this design rations (spec's
+# whole premise, and the thing Task 21's density measurements will be counting).
+# If ln still fails -- a host where $OUT's own device genuinely cannot be shared
+# with a sibling directory, e.g. --out pointed at something that does not
+# support hard links at all -- fall back to a copy, but say so LOUDLY: a quiet
+# success here is exactly the kind of thing that gets diagnosed as a mysterious
+# memory ceiling three weeks later, not today, by someone with no reason to
+# suspect this script.
+link_snapshot_file() {
+  local src="$1" dst="$2"
+  if ln "$src" "$dst" 2>/dev/null; then
+    return 0
+  fi
+  echo "build-snapshot.sh: WARNING: could not hard-link $src -> $dst (cross-device," >&2
+  echo "  or a filesystem without hard-link support) -- COPYING instead. This" >&2
+  echo "  duplicates the file's full bytes onto $(dirname "$dst")'s filesystem; for" >&2
+  echo "  memfile that is the ENTIRE guest RAM image (guest_ram_mb=$GUEST_RAM_MB)," >&2
+  echo "  consuming that much additional host disk/RAM on top of the original copy" >&2
+  echo "  in \$OUT. See build-snapshot.sh's fix-round-7 item 1 for why this is a" >&2
+  echo "  last-resort fallback, not the normal path." >&2
+  cp -p "$src" "$dst"
+}
+
 # ensure_workspace_image creates $1 as a sparse ext4 filesystem of
 # WORKSPACE_IMAGE_BYTES -- the exact recipe (truncate, then mkfs.ext4 -F) of
 # launcher_firecracker.go's ensureWorkspaceImage, so the golden snapshot's second
@@ -750,20 +863,31 @@ ensure_workspace_image() {
 boot_quiesce_snapshot_firecracker() {
   local jail="$STAGE"
   local api_sock="$jail/run/firecracker.socket" vsock_uds="$jail/vsock.sock" console_log="$STAGE/console.log"
-  local fc_pid=""
   log "preparing the firecracker build jail at $jail (items 1, 2: jail-relative paths only)"
   mkdir -p "$jail/run"
   hardlink_or_copy_bin firecracker "$jail/firecracker"
-  # Fix-round-2 item A: the trap is armed BEFORE jail_mount_dev runs, not after --
-  # a failure anywhere between the mount and the old trap-arm point (ensure_workspace_image's
+  # Fix-round-2 item A: CLEANUP_JAIL (script-scope, see cleanup_on_exit at the top
+  # of the script) is set BEFORE jail_mount_dev runs, not after -- a failure
+  # anywhere between the mount and the old trap-arm point (ensure_workspace_image's
   # mkfs.ext4, the chroot itself) used to leave only the original bare-removal
-  # trap active, leaking the /dev/kvm and /dev/urandom bind mounts (a live mountpoint
-  # under $STAGE that a plain removal then runs over, rather than clears). jail_unmount_dev is
-  # unconditionally best-effort (umount ... || true), so arming it before the mount
-  # exists is harmless -- it just no-ops if fired early. $fc_pid is looked up when
-  # the trap FIRES, not when it is set, so declaring it empty here and assigning it
-  # below is sufficient even under `set -u`.
-  trap 'kill "$fc_pid" 2>/dev/null || true; wait "$fc_pid" 2>/dev/null || true; jail_unmount_dev "'"$jail"'"; rm_rf_jail "$STAGE"' EXIT
+  # cleanup active, leaking the /dev/kvm and /dev/urandom bind mounts (a live
+  # mountpoint under $STAGE that a plain removal then runs over, rather than
+  # clears). jail_unmount_dev is unconditionally best-effort (umount ... ||
+  # true), so setting this before the mount exists is harmless -- it just no-ops
+  # if the trap fires early.
+  #
+  # Fix-round-7 item 2: this function no longer arms its own `trap '...' EXIT`.
+  # It used to, embedding a reference to a `local fc_pid` -- but an EXIT trap
+  # fires when the WHOLE SCRIPT exits, not when this function returns, and bash
+  # pops a function's locals the moment `set -e` unwinds out of its call frame,
+  # which for a mid-function failure happens BEFORE the (already-armed) trap
+  # body gets to run. The rig failure this round fixes was exactly that: "line
+  # 1: fc_pid: unbound variable" from inside the trap itself, which then also
+  # skipped the rest of that trap's own cleanup. CLEANUP_JAIL/CLEANUP_PID are
+  # set here instead; the single `trap cleanup_on_exit EXIT` armed once at the
+  # top of the script reads them and is safe regardless of which function was
+  # mid-flight when the process exited.
+  CLEANUP_JAIL="$jail"
   jail_mount_dev "$jail"
   # Item 2: a second, non-root, read-write drive so a restored VM has something
   # for the per-run workspace to mount -- launcher_firecracker.go's Restore hard-
@@ -779,7 +903,7 @@ boot_quiesce_snapshot_firecracker() {
   # touches stdin, indistinguishable from a slow boot from the outside.
   chroot "$jail" /firecracker --api-sock /run/firecracker.socket \
     </dev/null >"$console_log" 2>&1 &
-  fc_pid=$!
+  CLEANUP_PID=$!
 
   # Item 1: kernel_image_path and the rootfs drive's path_on_host are now
   # jail-relative ("/kernel", "/rootfs"), exactly like launcher_firecracker.go's
@@ -820,22 +944,26 @@ boot_quiesce_snapshot_firecracker() {
   api_put "$api_sock" /snapshot/create \
     "{\"snapshot_path\":\"/vmstate\",\"mem_file_path\":\"/memfile\",\"snapshot_type\":\"Full\"}"
 
-  kill "$fc_pid" 2>/dev/null || true
-  wait "$fc_pid" 2>/dev/null || true
+  kill "$CLEANUP_PID" 2>/dev/null || true
+  wait "$CLEANUP_PID" 2>/dev/null || true
+  CLEANUP_PID=""
   jail_unmount_dev "$jail"
-  trap 'rm_rf_jail "$STAGE"' EXIT
+  CLEANUP_JAIL=""
 }
 
 boot_quiesce_snapshot_cloud_hypervisor() {
   local jail="$STAGE"
   local api_sock="$jail/run/ch-api.sock" vsock_uds="$jail/vsock.sock" console_log="$STAGE/console.log"
-  local ch_pid=""
   log "preparing the cloud-hypervisor build jail at $jail (item 9: same jail-relative convention as the firecracker arm)"
   mkdir -p "$jail/run"
   hardlink_or_copy_bin cloud-hypervisor "$jail/cloud-hypervisor"
-  # Fix-round-2 item A: trap armed before the mount, not after -- see the matching
-  # comment in boot_quiesce_snapshot_firecracker for why.
-  trap 'kill "$ch_pid" 2>/dev/null || true; wait "$ch_pid" 2>/dev/null || true; jail_unmount_dev "'"$jail"'"; rm_rf_jail "$STAGE"' EXIT
+  # Fix-round-2 item A: CLEANUP_JAIL set before the mount, not after -- see the
+  # matching comment in boot_quiesce_snapshot_firecracker for why.
+  #
+  # Fix-round-7 item 2: script-scope CLEANUP_JAIL/CLEANUP_PID, not a per-function
+  # `trap '...' EXIT` referencing a local -- see the matching comment in
+  # boot_quiesce_snapshot_firecracker for the failure this replaces.
+  CLEANUP_JAIL="$jail"
   jail_mount_dev "$jail"
 
   log "starting cloud-hypervisor chrooted into $jail ($api_sock)"
@@ -872,7 +1000,7 @@ boot_quiesce_snapshot_cloud_hypervisor() {
     --console "file=/console.log" \
     --serial off \
     </dev/null >/dev/null 2>&1 &
-  ch_pid=$!
+  CLEANUP_PID=$!
 
   wait_for_agent "$vsock_uds" "$console_log"
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
@@ -893,10 +1021,11 @@ boot_quiesce_snapshot_cloud_hypervisor() {
   mv "$jail/ch-snapshot/state.json" "$STAGE/vmstate"
   mv "$jail/ch-snapshot/memory-ranges" "$STAGE/memfile"
 
-  kill "$ch_pid" 2>/dev/null || true
-  wait "$ch_pid" 2>/dev/null || true
+  kill "$CLEANUP_PID" 2>/dev/null || true
+  wait "$CLEANUP_PID" 2>/dev/null || true
+  CLEANUP_PID=""
   jail_unmount_dev "$jail"
-  trap 'rm_rf_jail "$STAGE"' EXIT
+  CLEANUP_JAIL=""
 }
 
 boot_quiesce_snapshot() {
@@ -990,25 +1119,47 @@ verify_restore_firecracker() {
   # was built under -- if $OUT still baked in an absolute, build-time path, this
   # jail would never see it and LoadSnapshot would fail exactly like the
   # original bug this round fixes.
-  local jail="$STAGE/verify-jail"
+  # Fix-round-7 item 1: the verify jail can no longer live under $STAGE (tmpfs)
+  # if it is going to hard-link vmstate/memfile/rootfs out of $OUT (ext4, or
+  # whatever device --out points at) -- ln across tmpfs<->ext4 is EXDEV, always,
+  # unconditionally, no matter permissions. new_verify_dir allocates a sibling
+  # directory of $OUT itself, sharing $OUT's device, so link_snapshot_file's
+  # `ln` below is a same-device link and actually succeeds; see new_verify_dir's
+  # own comment for why "sibling of $OUT" (not "inside $OUT" -- lock_down has
+  # already chmod'd $OUT to 0555 by the time verify_restore runs) and why this
+  # doesn't weaken the cross-path portability check the surrounding comment
+  # describes. CLEANUP_EXTRA_DIR ensures this directory is removed on any exit
+  # path, same as $STAGE.
+  local verify_root
+  verify_root="$(new_verify_dir)"
+  CLEANUP_EXTRA_DIR="$verify_root"
+  local jail="$verify_root/verify-jail"
   local api_sock="$jail/run/verify-api.sock" vsock_uds="$jail/vsock.sock"
-  local fc_pid=""
   mkdir -p "$jail/run"
   hardlink_or_copy_bin firecracker "$jail/firecracker"
-  # Fix-round-2 item A: trap armed before the mount, not after -- a failing `ln`
-  # (e.g. cross-device) or ensure_workspace_image's mkfs.ext4 below used to run
-  # inside the leak window; see the matching comment in
+  # Fix-round-2 item A: CLEANUP_JAIL set before the mount, not after -- a
+  # failing `ln` (e.g. cross-device) or ensure_workspace_image's mkfs.ext4
+  # below used to run inside the leak window; see the matching comment in
   # boot_quiesce_snapshot_firecracker for the full rationale.
-  trap 'kill "$fc_pid" 2>/dev/null || true; wait "$fc_pid" 2>/dev/null || true; jail_unmount_dev "'"$jail"'"; rm_rf_jail "$STAGE"' EXIT
+  #
+  # Fix-round-7 item 2: script-scope CLEANUP_JAIL/CLEANUP_PID, not a
+  # per-function `trap '...' EXIT` referencing a local -- this function's own
+  # `local fc_pid` was exactly the variable named in the rig's real failure
+  # ("line 1: fc_pid: unbound variable"); see the top-of-file comment above
+  # cleanup_on_exit for the full explanation.
+  CLEANUP_JAIL="$jail"
   jail_mount_dev "$jail"
-  ln "$OUT/vmstate" "$jail/vmstate"
-  ln "$OUT/memfile" "$jail/memfile"
-  ln "$OUT/rootfs" "$jail/rootfs"
+  # Fix-round-7 item 1: hard-link, not bare `ln` -- see link_snapshot_file's own
+  # comment for why a silent copy fallback (hardlink_or_copy_bin's pattern) is
+  # wrong specifically for these three files, memfile above all.
+  link_snapshot_file "$OUT/vmstate" "$jail/vmstate"
+  link_snapshot_file "$OUT/memfile" "$jail/memfile"
+  link_snapshot_file "$OUT/rootfs" "$jail/rootfs"
   ensure_workspace_image "$jail/workspace.img"
 
   chroot "$jail" /firecracker --api-sock /run/verify-api.sock \
     </dev/null >"$STAGE/verify-console.log" 2>&1 &
-  fc_pid=$!
+  CLEANUP_PID=$!
 
   # Wire format confirmed against fcapi.go's loadSnapshotRequest struct:
   # snapshot_path is top-level, the memory file nests under mem_backend as
@@ -1034,10 +1185,13 @@ verify_restore_firecracker() {
 
   local exit_code=0
   "$STAGE/guest_client" -uds "$vsock_uds" -port 1024 -timeout-s 30 -command true || exit_code=$?
-  kill "$fc_pid" 2>/dev/null || true
-  wait "$fc_pid" 2>/dev/null || true
+  kill "$CLEANUP_PID" 2>/dev/null || true
+  wait "$CLEANUP_PID" 2>/dev/null || true
+  CLEANUP_PID=""
   jail_unmount_dev "$jail"
-  trap 'rm_rf_jail "$STAGE"' EXIT
+  CLEANUP_JAIL=""
+  rm_rf_jail "$verify_root"
+  CLEANUP_EXTRA_DIR=""
   if [ "$exit_code" -ne 0 ]; then
     echo "build-snapshot.sh: the fresh snapshot restored but \`true\` exited $exit_code" >&2
     exit 1
@@ -1055,37 +1209,54 @@ verify_restore_cloud_hypervisor() {
   # against only --api-socket, then issues `PUT /api/v1/vm.restore` with body
   # {"source_url":..., "resume":true}; a web search for a --restore CLI flag
   # found no confirmation either. Rebuilt on the API-call pattern below.
-  local jail="$STAGE/verify-jail"
+  # Fix-round-7 item 1: same EXDEV problem as the firecracker arm -- see that
+  # function's comment and new_verify_dir's own comment for the full
+  # rationale. The verify jail moves off $STAGE (tmpfs) onto a sibling
+  # directory of $OUT so link_snapshot_file's `ln` below is same-device.
+  local verify_root
+  verify_root="$(new_verify_dir)"
+  CLEANUP_EXTRA_DIR="$verify_root"
+  local jail="$verify_root/verify-jail"
   local api_sock="$jail/run/verify-ch-api.sock" vsock_uds="$jail/vsock.sock"
-  local ch_pid=""
   mkdir -p "$jail/run" "$jail/ch-snapshot"
   hardlink_or_copy_bin cloud-hypervisor "$jail/cloud-hypervisor"
-  # Fix-round-2 item A: trap armed before the mount, not after -- see the matching
-  # comment in boot_quiesce_snapshot_firecracker for the full rationale.
-  trap 'kill "$ch_pid" 2>/dev/null || true; wait "$ch_pid" 2>/dev/null || true; jail_unmount_dev "'"$jail"'"; rm_rf_jail "$STAGE"' EXIT
+  # Fix-round-2 item A: CLEANUP_JAIL set before the mount, not after -- see the
+  # matching comment in boot_quiesce_snapshot_firecracker for the full
+  # rationale.
+  #
+  # Fix-round-7 item 2: script-scope CLEANUP_JAIL/CLEANUP_PID, not a
+  # per-function `trap '...' EXIT` referencing a local -- see the top-of-file
+  # comment above cleanup_on_exit for the full explanation.
+  CLEANUP_JAIL="$jail"
   jail_mount_dev "$jail"
-  ln "$OUT/rootfs" "$jail/rootfs"
+  # Fix-round-7 item 1: hard-link via link_snapshot_file, not bare `ln` -- see
+  # that function's comment for why a silent copy fallback is wrong here,
+  # memfile (shipped here as memory-ranges) above all.
+  link_snapshot_file "$OUT/rootfs" "$jail/rootfs"
   # vm.restore replays the whole snapshot directory, not just memory state, so
   # config.json (shipped as ch-config.json, see lock_down/item 9's corollary)
   # has to be put back next to the state files under their original names
   # before the restore call.
-  ln "$OUT/ch-config.json" "$jail/ch-snapshot/config.json"
-  ln "$OUT/vmstate" "$jail/ch-snapshot/state.json"
-  ln "$OUT/memfile" "$jail/ch-snapshot/memory-ranges"
+  link_snapshot_file "$OUT/ch-config.json" "$jail/ch-snapshot/config.json"
+  link_snapshot_file "$OUT/vmstate" "$jail/ch-snapshot/state.json"
+  link_snapshot_file "$OUT/memfile" "$jail/ch-snapshot/memory-ranges"
 
   chroot "$jail" /cloud-hypervisor --api-socket /run/verify-ch-api.sock \
     </dev/null >"$STAGE/verify-console.log" 2>&1 &
-  ch_pid=$!
+  CLEANUP_PID=$!
 
   api_put "$api_sock" /api/v1/vm.restore \
     '{"source_url":"file:///ch-snapshot","resume":true}'
 
   local exit_code=0
   "$STAGE/guest_client" -uds "$vsock_uds" -port 1024 -timeout-s 30 -command true || exit_code=$?
-  kill "$ch_pid" 2>/dev/null || true
-  wait "$ch_pid" 2>/dev/null || true
+  kill "$CLEANUP_PID" 2>/dev/null || true
+  wait "$CLEANUP_PID" 2>/dev/null || true
+  CLEANUP_PID=""
   jail_unmount_dev "$jail"
-  trap 'rm_rf_jail "$STAGE"' EXIT
+  CLEANUP_JAIL=""
+  rm_rf_jail "$verify_root"
+  CLEANUP_EXTRA_DIR=""
   if [ "$exit_code" -ne 0 ]; then
     echo "build-snapshot.sh: the fresh snapshot restored but \`true\` exited $exit_code" >&2
     exit 1
