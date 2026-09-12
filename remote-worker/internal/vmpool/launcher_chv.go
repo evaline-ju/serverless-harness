@@ -682,14 +682,18 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: API socket never appeared: %s: %w", req.ID, chvReadConsole(console.Name()), err), cleanup())
 	}
 
-	// ch-remote restore --source-url file://<per-VM run dir>, per the brief. CH's
-	// vm.restore API (per the reference tutorial) exposes only source_url, resume,
-	// and memory_restore_mode — no field-level override for vsock/fs socket paths
-	// the way Firecracker's LoadSnapshot has vsock_override (fcapi.go) — which is
+	// ch-remote restore <restore_config>, where restore_config is the single
+	// positional comma-separated key=value string chvRestoreConfigArg builds — see
+	// that function's doc comment for why this is a positional string and not
+	// "--source-url" (a shape this file previously, incorrectly, assumed), and for
+	// why resume=false is passed explicitly rather than left to ch-remote's
+	// default. restore_config exposes only source_url, resume, memory_restore_mode,
+	// prefault, and net_fds — no field-level override for vsock/fs socket paths the
+	// way Firecracker's LoadSnapshot has vsock_override (fcapi.go) — which is
 	// exactly why the per-VM directory above exists: there is no other restore-time
 	// knob to redirect those paths.
 	restoreOut, err := exec.CommandContext(ctx, l.opts.ChRemoteBin,
-		"--api-socket", apiSock, "restore", "--source-url", "file://"+runDir,
+		"--api-socket", apiSock, "restore", chvRestoreConfigArg(runDir),
 	).CombinedOutput()
 	if err != nil {
 		combined := string(restoreOut)
@@ -723,6 +727,41 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 		console:   console,
 		fsConsole: fsConsole,
 	}, nil
+}
+
+// chvRestoreConfigArg builds the single argument ch-remote's restore subcommand
+// takes. Confirmed against the real ch-remote CLI source
+// (cloud-hypervisor/src/bin/ch-remote.rs: Command::new("restore").arg(Arg::new(
+// "restore_config").index(1).required(true)...)) and against `ch-remote restore
+// --help` on the installed v53.0: unlike pause and resume (each a bare,
+// argument-less subcommand upstream — confirmed the same way; see chvVM.Resume's
+// call site below, which is already correct and unchanged by this fix), restore
+// takes exactly ONE required POSITIONAL argument — a comma-separated key=value
+// string — not a set of flags. This file previously passed "--source-url
+// file://<dir>" as if source_url were its own flag; ch-remote rejects that with
+// "error: unexpected argument '--source-url' found" (exit status 2). source_url
+// is one field inside the single positional string, nothing more.
+//
+// resume=false is passed explicitly, not left to whatever ch-remote currently
+// defaults it to: standbys are restored PAUSED, not running. A paused VM costs
+// zero CPU, which is what lets many standbys exist without burning cores on timer
+// ticks (spec §3.2); Resume is a deliberately separate step (chvVM.Resume,
+// below) — mirroring fcapi.go's ResumeVM field, which makes the identical
+// argument on the Firecracker arm. Being explicit here is what stops a future
+// upstream default change from silently turning every restored standby into a
+// running VM.
+//
+// v53.0's restore_config syntax, verbatim from `ch-remote restore --help`:
+//
+//	source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand,
+//	net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false
+//
+// Note memory_restore_mode enumerates only copy|ondemand on this version — no
+// CopyOnWrite value exists here. See the task-16 report: this confirms an open
+// question the reference tutorial flagged, and bears on whether spec §7.3's
+// memory arithmetic transfers to this arm at all (a Task 21 question).
+func chvRestoreConfigArg(runDir string) string {
+	return "source_url=file://" + runDir + ",resume=false"
 }
 
 // chvReadConsole best-effort reads back the console log for inclusion in an error
@@ -782,6 +821,14 @@ func (v *chvVM) Key() string { return v.key }
 // config, per this file's package comment), and there is nothing analogous to
 // ext4's "re-read the device's metadata on every acquire" concern a shared host
 // filesystem does not have.
+//
+// Audited against the real ch-remote CLI source alongside the restore-argv fix
+// above (task-16 report, round 6): "resume" is a bare, argument-less subcommand
+// upstream (Command::new("resume").about("Resume the VM"), dispatched with a nil
+// body) — this call site already matches that and needs no change. There is no
+// "pause" call site anywhere in this launcher to audit; restores land the VM
+// already paused via restore_config's resume=false (chvRestoreConfigArg), so this
+// codebase never needs to pause one itself.
 func (v *chvVM) Resume(ctx context.Context) error {
 	if err := v.checkNotDestroyed(); err != nil {
 		return err

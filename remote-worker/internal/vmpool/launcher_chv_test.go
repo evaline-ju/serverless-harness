@@ -101,6 +101,57 @@ func TestVirtiofsdArgvCarriesItsSandbox(t *testing.T) {
 	}
 }
 
+// TestChvRestoreConfigArgIsPositionalNotAFlag is a pure argv-shape assertion for
+// the round-6 fix: ch-remote's restore subcommand takes exactly one required
+// POSITIONAL argument (a comma-separated key=value string), not a "--source-url"
+// flag. Confirmed against the real ch-remote CLI source
+// (cloud-hypervisor/src/bin/ch-remote.rs) and `ch-remote restore --help` on the
+// installed v53.0 — see chvRestoreConfigArg's doc comment. This regressed once
+// already (exit status 2: "unexpected argument '--source-url' found"); this test
+// exists so that regression fails loudly here instead of quietly on the rig.
+func TestChvRestoreConfigArgIsPositionalNotAFlag(t *testing.T) {
+	arg := chvRestoreConfigArg("/run/vm-a")
+	if strings.Contains(arg, "--source-url") {
+		t.Errorf("restore_config %q must not contain a --source-url flag — restore_config is a single positional comma-separated key=value string, not a set of flags", arg)
+	}
+	if !strings.Contains(arg, "source_url=") {
+		t.Errorf("restore_config %q is missing source_url=", arg)
+	}
+	if !strings.Contains(arg, "file:///run/vm-a") {
+		t.Errorf("restore_config %q does not carry the run dir as a file:// URL", arg)
+	}
+	// Standbys are restored PAUSED (spec §3.2: a paused VM costs zero CPU, which is
+	// what lets many standbys exist without burning cores on timer ticks). resume
+	// must be passed explicitly rather than left to ch-remote's default, so a future
+	// upstream default change can't silently turn every restored standby running.
+	if !strings.Contains(arg, "resume=false") {
+		t.Errorf("restore_config %q must explicitly carry resume=false — standbys are restored paused, and this must not rely on ch-remote's default (spec §3.2)", arg)
+	}
+	// The whole config must be ONE comma-separated positional string, not multiple
+	// space-separated tokens masquerading as one (which would silently turn back into
+	// flag-like argv splitting at the exec.Command call site).
+	if strings.Contains(arg, " ") {
+		t.Errorf("restore_config %q contains a space — must be one comma-separated token, not multiple argv entries", arg)
+	}
+
+	// Also assert the actual exec.CommandContext argv this produces, at the call
+	// site's own construction shape: "restore" is followed by exactly ONE arg, and
+	// that arg is the positional config string above — never split across
+	// "--source-url", "<url>" as two separate argv entries the way the pre-round-6
+	// code did.
+	argv := []string{"--api-socket", "/run/api.sock", "restore", chvRestoreConfigArg("/run/vm-a")}
+	for i, a := range argv {
+		if a == "restore" {
+			if i != len(argv)-2 {
+				t.Fatalf("argv %q: \"restore\" must be followed by exactly one argument", argv)
+			}
+			if strings.HasPrefix(argv[i+1], "--") {
+				t.Errorf("argv %q: the argument after \"restore\" must be the positional restore_config string, not a flag", argv)
+			}
+		}
+	}
+}
+
 // TestCloudHypervisorParentCgroupRequiresMemoryMax is validate()'s mirror of
 // launcher_firecracker.go's identical check: a ParentCgroup with no memory bound
 // would leave systemd-run --scope creating a per-VM cgroup with no memory.max at
