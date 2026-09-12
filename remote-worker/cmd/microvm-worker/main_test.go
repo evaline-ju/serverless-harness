@@ -51,6 +51,45 @@ func TestThereIsNoHostFallbackLauncher(t *testing.T) {
 	}
 }
 
+// Fix round 3: launcherFor must actually route vmpool.CloudHypervisor to
+// NewCloudHypervisorLauncher. Before this, the switch case was a hardcoded "not
+// implemented" error, so SH_VMM=cloud-hypervisor failed at worker startup and the
+// CH arm — fully implemented and tested inside the vmpool package — was called
+// from nothing but its own tests. This call passes no SH_VIRTIOFSD_UID/GID
+// override, so a non-nil error here also covers a virtiofsd UID/GID default that
+// regressed to 0 (CHVOptions.validate refuses VirtiofsdUID/GID == 0) — in
+// particular a regression to copying the Firecracker case's os.Getuid()/
+// os.Getgid(), which is 0 on the privileged worker this process actually runs as.
+func TestLauncherForWiresCloudHypervisor(t *testing.T) {
+	get := envFrom(map[string]string{})
+	lc, err := launcherFor(vmpool.CloudHypervisor, get, t.TempDir())
+	if err != nil {
+		t.Fatalf("launcherFor(CloudHypervisor): %v", err)
+	}
+	if lc.Kind() != vmpool.CloudHypervisor {
+		t.Fatalf("Kind() = %v, want %v", lc.Kind(), vmpool.CloudHypervisor)
+	}
+	if lc.SerializesExecsPerRun() {
+		t.Fatal("the Cloud Hypervisor arm must not serialize execs per run (spec §4.3): " +
+			"virtio-fs makes the host filesystem, not a guest-owned block device, the " +
+			"concurrency authority — see TestCloudHypervisorDoesNotSerializeExecsPerRun in " +
+			"the vmpool package for the same invariant enforced at the source")
+	}
+}
+
+// TestLauncherForRefusesAnExplicitZeroVirtiofsdUID guards the SH_VIRTIOFSD_UID
+// override path itself, distinct from the built-in-default path covered by
+// TestLauncherForWiresCloudHypervisor above: it must reach validation, not be
+// silently dropped by some fallback (e.g. a stray os.Getuid()) that would mask an
+// explicit 0 override too.
+func TestLauncherForRefusesAnExplicitZeroVirtiofsdUID(t *testing.T) {
+	get := envFrom(map[string]string{"SH_VIRTIOFSD_UID": "0"})
+	if _, err := launcherFor(vmpool.CloudHypervisor, get, t.TempDir()); err == nil {
+		t.Fatal("launcherFor(CloudHypervisor) accepted SH_VIRTIOFSD_UID=0 — virtiofsd is " +
+			"spec §3.5's confinement boundary and must never run as root")
+	}
+}
+
 func TestPoolConfigRefusesAMissingSnapshotDir(t *testing.T) {
 	_, err := poolConfig(envFrom(map[string]string{
 		"SH_VMM":              "firecracker",
