@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -369,5 +370,67 @@ func TestShouldSetClock(t *testing.T) {
 	}
 	if !shouldSetClock(base, base.Add(90*time.Second)) {
 		t.Error("a 90s skew must be corrected")
+	}
+}
+
+// TestAgentCorrectsClockOnEveryRequestWhileStillWrong is the restore regression test.
+//
+// A prior version of ServeConn gated the clock correction with a clockOK atomic.Bool
+// latch: correct once, then never again for the life of the Agent. That is exactly
+// wrong for THIS Agent, because it is not "the life of the Agent" that matters — it is
+// the life of the PROCESS MEMORY IMAGE deploy/microvm/build-snapshot.sh snapshots.
+// That script sends two requests carrying HostUnixNanos to the agent (probe_capabilities,
+// then quiesce_guest) BEFORE ever taking the snapshot, so the very first one flips the
+// latch true and corrects the clock during the BUILD — and `clockOK == true` is then
+// baked into the golden snapshot's memory image. Every VM restored from it inherits
+// clockOK==true and silently skips the correction forever, so its clock stays frozen at
+// snapshot time on every real Exec. TestGateClock (internal/vmpool/gates_kvm_test.go)
+// caught exactly this against a real Firecracker guest.
+//
+// This test reproduces the same shape without a hypervisor: a *restored* VM, from the
+// agent's own point of view, is indistinguishable from "a second request arrives and
+// the guest clock is STILL far from the host's" — nothing in-guest tells the process it
+// was just resumed from a snapshot, so the correction has to be driven by comparing
+// clocks on every request rather than by remembering a past decision. It drives the
+// SAME Agent through two requests, both carrying a HostUnixNanos far from wall-clock
+// time (a stale guest clock that a stub setWallClock deliberately never actually
+// fixes, so the skew persists exactly as it would across a restore-and-Exec), and
+// asserts setWallClock is invoked on BOTH — a latch would call it on only the first.
+func TestAgentCorrectsClockOnEveryRequestWhileStillWrong(t *testing.T) {
+	var calls int32
+	orig := setWallClock
+	setWallClock = func(time.Time) error {
+		atomic.AddInt32(&calls, 1)
+		// Deliberately a no-op: this stub does NOT change the guest's real clock, so
+		// the skew below stays "far from host" on the next request too, exactly as it
+		// would after an actual restore where the correction from a prior boot of the
+		// snapshot is not present in the resumed image's clock at all.
+		return nil
+	}
+	t.Cleanup(func() { setWallClock = orig })
+
+	a := newTestAgent(t)
+	staleHost := time.Now().Add(-55 * time.Minute).UnixNano() // the reported real-rig skew
+
+	if _, _, end, errMsg := drive(t, a, Request{
+		Command: "echo one", CapBytes: 1 << 20, HostUnixNanos: staleHost,
+	}, nil); errMsg != "" || end.ExitCode != 0 {
+		t.Fatalf("first request: end=%+v err=%s", end, errMsg)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("setWallClock called %d times after the first request, want 1", got)
+	}
+
+	// Second request on the SAME Agent, same stale HostUnixNanos: this is what a
+	// restored VM's first post-restore command looks like to the agent. A clockOK
+	// latch would suppress this call; shouldSetClock alone must not.
+	if _, _, end, errMsg := drive(t, a, Request{
+		Command: "echo two", CapBytes: 1 << 20, HostUnixNanos: staleHost,
+	}, nil); errMsg != "" || end.ExitCode != 0 {
+		t.Fatalf("second request: end=%+v err=%s", end, errMsg)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("setWallClock called %d times after the second request, want 2 — "+
+			"a latch would have suppressed the second, restore-shaped correction", got)
 	}
 }

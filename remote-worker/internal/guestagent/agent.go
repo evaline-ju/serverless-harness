@@ -36,13 +36,18 @@ type AgentOptions struct {
 type Agent struct {
 	opts AgentOptions
 
-	mu      sync.Mutex // one command at a time: one VM, one Exec
-	shell   *exec.Cmd
-	stdin   io.WriteCloser
-	stdout  *bufio.Reader
-	stderr  *bufio.Reader
-	seq     uint64
-	clockOK atomic.Bool
+	mu     sync.Mutex // one command at a time: one VM, one Exec
+	shell  *exec.Cmd
+	stdin  io.WriteCloser
+	stdout *bufio.Reader
+	stderr *bufio.Reader
+	seq    uint64
+
+	// There used to be a clockOK atomic.Bool latch here, set once the clock had been
+	// corrected so later commands would not pay a needless settimeofday. Deleted: see
+	// the comment on the clock-correction block in ServeConn for why any "already
+	// done" flag on this struct is unsound. shouldSetClock's threshold alone gives the
+	// same idempotence without being unsound across a restore.
 
 	// dead is set once a parked-shell command times out and the shell is killed to
 	// stop its orphaned drain goroutines (see runOnParkedShell). A dead Agent refuses
@@ -174,8 +179,32 @@ func (a *Agent) ServeConn(rw io.ReadWriteCloser) error {
 
 	// Correct the wall clock before running anything: the guest resumed from the
 	// snapshot moment, so `date`, file mtimes and git commit timestamps are all wrong
-	// until this happens (spec §2.4, §5.3). Once per VM — the VM serves one command.
-	if req.HostUnixNanos > 0 && !a.clockOK.Swap(true) {
+	// until this happens (spec §2.4, §5.3).
+	//
+	// Deliberately NOT gated by a "have I already done this" latch on the Agent. An
+	// earlier version had one (a clockOK atomic.Bool, set true after the first
+	// correction) and it was wrong: deploy/microvm/build-snapshot.sh sends TWO
+	// requests carrying HostUnixNanos to the agent BEFORE the snapshot is taken
+	// (probe_capabilities, then quiesce_guest), so the latch flipped true and the
+	// clock got corrected during the BUILD, and then `true` was what got baked into
+	// the golden snapshot's memory image. Every VM restored from that snapshot
+	// inherited clockOK==true and silently skipped the correction forever — the
+	// guest's clock stayed frozen at snapshot time on every single Exec, which is
+	// exactly what TestGateClock caught. A one-shot "already done" flag is correct
+	// reasoning for a long-lived process and exactly wrong for a process whose memory
+	// image is snapshotted and restored many times: the flag's truth value does not
+	// survive the restore that resets everything it was tracking. This is spec
+	// §5.2's "nothing secret or unique may exist in the golden snapshot", but for
+	// control state rather than secrets.
+	//
+	// shouldSetClock's threshold is what actually provides the idempotence the latch
+	// was reaching for, and it does so restore-safely: it compares the guest's
+	// CURRENT clock against the host's, not a remembered past decision. After the
+	// first correction in a given VM's life the guest clock is within a second of
+	// the host, so shouldSetClock returns false on its own and no needless
+	// settimeofday happens on later commands in that same VM — without ever trusting
+	// a flag that a restore can silently falsify.
+	if req.HostUnixNanos > 0 {
 		host := time.Unix(0, req.HostUnixNanos)
 		if shouldSetClock(host, time.Now()) {
 			if err := setWallClock(host); err != nil {
@@ -384,6 +413,13 @@ func (a *Agent) runFreshChild(req Request, stdin []byte, w *frameWriter) (End, e
 		return End{}, fmt.Errorf("timeout:%d", req.TimeoutS)
 	}
 }
+
+// setWallClock is osSetWallClock, indirected so a test can verify a SECOND request
+// still attempts the clock correction when the guest clock is still wrong — the
+// restore-safety property this file relies on now that there is no clockOK latch —
+// without needing the real CAP_SYS_TIME syscall a non-root/non-Linux test runner has
+// neither. Same pattern as chvChown in internal/vmpool/launcher_chv.go.
+var setWallClock = osSetWallClock
 
 func newNonce() (string, error) {
 	var b [16]byte
