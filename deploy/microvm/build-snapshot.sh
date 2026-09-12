@@ -726,6 +726,75 @@ api_patch() {
   api_request PATCH "$1" "$2" "$3"
 }
 
+# Fix-round-10: wait_for_socket is the one place that waits for a just-started
+# VMM's API socket to actually be accept()ing connections. Call it right after
+# backgrounding the VMM (right after CLEANUP_PID is set) and before the very first
+# api_put/api_patch/ch-remote call in ALL FOUR functions that start a VMM
+# (boot_quiesce_snapshot_firecracker, boot_quiesce_snapshot_cloud_hypervisor,
+# verify_restore_firecracker, verify_restore_cloud_hypervisor) -- one
+# implementation, four callers, no room to drift, same shape as prepare_jail/
+# teardown_jail above.
+#
+# THE BUG this fixes: nothing sat between "VMM process started" and "first API
+# call" in any of the four call sites. cloud-hypervisor lost that race every
+# time on the rig -- curl: (7) Failed to connect to ... after 0 ms: Could not
+# connect to server -- because verify_restore_cloud_hypervisor's own
+# link_snapshot_file staging all happens BEFORE the chroot, so api_put is the
+# very next statement after CLEANUP_PID is set. verify_restore_firecracker only
+# happened to pass: it has several statements (link_snapshot_file x3,
+# ensure_workspace_image) between backgrounding firecracker and its first
+# api_put, and firecracker itself binds its socket unusually fast (probe: ~4e-4s)
+# -- FC was winning a race by statement order and daemon speed, not by design.
+# Both arms are racy; only one of them had been losing yet.
+#
+# THE SHAPE mirrors remote-worker/internal/vmpool/launcher_firecracker.go's own
+# waitForUnixSocket (see its comment: "File existence alone is not enough:
+# Firecracker creates the socket file before it is actually accept()ing on
+# it"), per this round's own instruction that the launcher wins whenever it and
+# this script disagree. That comment is why this helper does NOT check
+# `[ -e "$sock" ]` -- a bare existence check would still race, for exactly the
+# reason the launcher's comment gives, and cloud-hypervisor's rig failure is
+# independent confirmation: its socket file exists (srwx------ root root)
+# immediately, well before curl can talk to it. This helper instead attempts a
+# REAL connection with curl (the same tool and the same --unix-socket mechanism
+# every other API call in this script already uses, so this is not a second
+# code path for talking to these sockets, just an earlier, throwaway use of the
+# first one) and only returns once curl can complete a round trip. Any HTTP
+# response counts as success (no -f) -- even a 404 proves the daemon is
+# accept()ing, which is the only thing this helper is asked to prove; a
+# connection-refused/no-such-socket curl exit (7) is the failure this loop
+# polls past.
+#
+# No fixed `sleep $N`: a fixed delay is either wasted time on an idle host
+# (this round's probe: firecracker bound in ~0.0004s) or too short on a loaded
+# one (cloud-hypervisor's rig failure), and either way a fixed sleep reports
+# nothing when it guesses wrong -- it just moves the same unguarded race a few
+# hundred milliseconds later and calls it fixed. Poll on a short, bounded
+# interval instead, and fail loudly -- naming the socket path and the elapsed
+# timeout bound, not a bare "curl: (7)" -- if the deadline passes.
+#
+# Noted, not acted on: cloud-hypervisor's socket is mode 0700 versus
+# firecracker's 0755 (both root:root). Harmless here -- require_root already
+# guarantees this whole script, including this curl, runs as root -- but
+# worth recording so a future reader porting this probe to run as a
+# non-root/different-uid caller does not get a silent EACCES and mistake it
+# for the daemon simply not being up yet.
+wait_for_socket() {
+  local sock="$1" timeout_s="${2:-5}"
+  # 100ms poll interval -> timeout_s * 10 attempts.
+  local attempts=$((timeout_s * 10))
+  local i=0
+  while [ "$i" -lt "$attempts" ]; do
+    if curl -s -S --unix-socket "$sock" -o /dev/null "http://localhost/" 2>/dev/null; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 0.1
+  done
+  echo "build-snapshot.sh: timed out after ${timeout_s}s waiting for $sock to accept connections" >&2
+  exit 1
+}
+
 # hardlink_or_copy_bin resolves $1 on PATH and hardlinks (falling back to a copy
 # across filesystems) it into $2, so a chrooted VMM process can execve it from
 # inside its own jail -- chroot resolves the command it execs AFTER changing
@@ -790,12 +859,29 @@ prepare_jail() {
 # write_manifest/lock_down to read from, and verify functions separately call
 # rm_rf_jail on their own verify_root. Clears CLEANUP_PID/CLEANUP_JAIL so the
 # EXIT trap does not redo work this function already did.
+#
+# Fix-round-10: also removes any "$jail/run"/*.sock.lock left behind. Cloud
+# Hypervisor creates a <socket>.lock file right next to its API socket
+# (confirmed on the rig: probe.sock and probe.sock.lock together); Firecracker
+# creates no such file, so this glob is a no-op for that arm rather than
+# something that needs its own VMM-specific branch. A stale .lock blocking a
+# later restart (the project's own cloud-hypervisor tutorial documents that
+# failure shape for a stale UDS on sequential restores) is not actually a live
+# risk FOR THIS SCRIPT: every jail this script ever chroots into lives under a
+# freshly mktemp'd directory (STAGE itself, or new_verify_dir's per-call
+# verify_root), never reused across runs or even across calls within one run,
+# so there is no directory a previous run's .lock could still be sitting in
+# when the next chroot starts. Removing it here is still correct hygiene --
+# nothing should assume a launcher_chv.go-style long-lived VMM host, which DOES
+# reuse jail paths, will get the same freshness for free -- and it is one line
+# to not have to reason about again per VMM arm.
 teardown_jail() {
   local jail="$1"
   kill "$CLEANUP_PID" 2>/dev/null || true
   wait "$CLEANUP_PID" 2>/dev/null || true
   CLEANUP_PID=""
   jail_unmount_dev "$jail"
+  rm -f "$jail"/run/*.sock.lock
   CLEANUP_JAIL=""
 }
 
@@ -928,6 +1014,12 @@ boot_quiesce_snapshot_firecracker() {
     </dev/null >"$console_log" 2>&1 &
   CLEANUP_PID=$!
 
+  # Fix-round-10: wait for the API socket to actually accept connections before
+  # the very first api_put below -- see wait_for_socket's own comment for why
+  # this was missing on both VMM arms and why FC's own speed, not correctness,
+  # is the only reason this call site had not yet been seen to lose the race.
+  wait_for_socket "$api_sock"
+
   # Item 1: kernel_image_path and the rootfs drive's path_on_host are now
   # jail-relative ("/kernel", "/rootfs"), exactly like launcher_firecracker.go's
   # own hardlink set -- not "$STAGE/kernel"/"$STAGE/rootfs", which is this bug in
@@ -1051,6 +1143,17 @@ boot_quiesce_snapshot_cloud_hypervisor() {
     --serial off \
     </dev/null >/dev/null 2>&1 &
   CLEANUP_PID=$!
+
+  # Fix-round-10: wait for the API socket before anything touches it. This
+  # arm's first real API call (ch-remote pause, below) does not run until
+  # after wait_for_agent's own vsock-boot wait, which in practice already
+  # buys plenty of time -- but wait_for_socket is the thing that actually
+  # proves the API is ready, and the whole point of this round's fix is one
+  # implementation at all four start sites, not "skip the ones that seem to
+  # already have enough of a delay by accident" (that reasoning is exactly
+  # how verify_restore_firecracker ended up racy-but-lucky in the first
+  # place).
+  wait_for_socket "$api_sock"
 
   wait_for_agent "$vsock_uds" "$console_log"
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
@@ -1202,6 +1305,15 @@ verify_restore_firecracker() {
     </dev/null >"$STAGE/verify-console.log" 2>&1 &
   CLEANUP_PID=$!
 
+  # Fix-round-10: wait for the API socket before the /snapshot/load call
+  # below -- this is the arm the coordinator's own probe caught NOT racing
+  # only by accident (more statements between start and first call, plus a
+  # fast-binding daemon); see wait_for_socket's comment for the full story.
+  # This also matches launcher_firecracker.go's own Restore, which calls
+  # waitForUnixSocket before setVsockOverride/LoadSnapshot -- see the next
+  # comment block's own reference to that call order.
+  wait_for_socket "$api_sock"
+
   # Fix-round-8: a restoring instance must be FRESH. The real binary enforces
   # this -- the rig's own failure was PUT /snapshot/load returning HTTP 400
   # "Loading a microVM snapshot not allowed after configuring boot-specific
@@ -1296,6 +1408,14 @@ verify_restore_cloud_hypervisor() {
   chroot "$jail" /cloud-hypervisor --api-socket /run/verify-ch-api.sock \
     </dev/null >"$STAGE/verify-console.log" 2>&1 &
   CLEANUP_PID=$!
+
+  # Fix-round-10: THE call site the rig's own failure came from -- all of this
+  # function's link_snapshot_file staging happens BEFORE the chroot above, so
+  # without this wait, api_put /api/v1/vm.restore is the very next statement
+  # after the process is backgrounded, with nothing at all between "started"
+  # and "first call". See wait_for_socket's own comment for the exact curl
+  # error this reproduced ("after 0 ms: Could not connect to server").
+  wait_for_socket "$api_sock"
 
   api_put "$api_sock" /api/v1/vm.restore \
     '{"source_url":"file:///ch-snapshot","resume":true}'

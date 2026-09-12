@@ -676,5 +676,85 @@ check "a comment explains cloud-hypervisor's virtiofsd-served workspace by name"
 check "each build function's fresh-boot-only block and workspace-image asymmetry both carry a deliberate-difference comment (2 sites x 2 VMM arms)" \
   "$([ "$(grep -cF 'Deliberate build-vs-verify asymmetry' "$SCRIPT")" -eq 4 ] && echo yes || echo no)" "yes"
 
+echo "== fix-round-10: wait_for_socket -- nothing calls a VMM's API before its socket actually accepts connections"
+# Real rig failure: 'curl: (7) Failed to connect to localhost over
+# .../verify-ch-api.sock after 0 ms: Could not connect to server' --
+# verify_restore_cloud_hypervisor's api_put ran as the very next statement
+# after cloud-hypervisor was backgrounded, with nothing between "started" and
+# "first call". verify_restore_firecracker only happened to pass: several
+# statements (three link_snapshot_file calls, ensure_workspace_image) sit
+# between its own CLEANUP_PID assignment and its first api_put, and
+# firecracker itself binds its socket unusually fast -- so it was racy too,
+# just not losing yet. wait_for_socket is the one implementation for all four
+# VMM-launching functions, the same shape as fix-round-9's prepare_jail/
+# teardown_jail.
+
+check "wait_for_socket helper exists" \
+  "$(grep -cE '^wait_for_socket\(\) \{' "$SCRIPT")" "1"
+
+# One implementation, four callers, no room to drift: every call site uses the
+# exact same invocation, so a fifth VMM-start site added later without this
+# call is the one thing this count cannot silently tolerate.
+check "wait_for_socket is called by exactly the four VMM-launching functions" \
+  "$(grep -cF 'wait_for_socket "$api_sock"' "$SCRIPT")" "4"
+
+wait_body="$(awk '/^wait_for_socket\(\) \{/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")"
+
+# The helper must not settle for file existence: both real VMMs create the
+# socket file before they are actually accept()ing on it (cloud-hypervisor's
+# own rig failure is the proof -- the file existed, srwx------ root root, and
+# curl still could not connect). It must attempt a real connection instead.
+check "wait_for_socket attempts a real connection via curl --unix-socket, not a bare existence check" \
+  "$(printf '%s\n' "$wait_body" | grep -v '^[[:space:]]*#' | grep -c 'curl.*--unix-socket')" "1"
+check "wait_for_socket's own code contains no bare '[ -e \"\$sock\" ]' existence-only check" \
+  "$(printf '%s\n' "$wait_body" | grep -v '^[[:space:]]*#' | grep -cF '[ -e "$sock"')" "0"
+
+# Bounded polling, not a fixed sleep: a fixed delay either wastes time on an
+# idle host or is too short on a loaded one, and either way it hides the
+# failure instead of reporting it -- the helper must loop, and must not just
+# sleep once for the whole timeout.
+check "wait_for_socket polls in a loop rather than sleeping once" \
+  "$(printf '%s\n' "$wait_body" | grep -v '^[[:space:]]*#' | grep -cE '^[[:space:]]*while ')" "1"
+check "wait_for_socket does not sleep for the full \$timeout_s in one shot" \
+  "$(printf '%s\n' "$wait_body" | grep -v '^[[:space:]]*#' | grep -cE 'sleep[[:space:]]+"?\$timeout_s"?')" "0"
+check "wait_for_socket's failure message names both the socket path and the elapsed timeout bound" \
+  "$(printf '%s\n' "$wait_body" | grep -c 'timed out after.*waiting for.*sock')" "1"
+
+# Source-order regression guard for the fixed bug, per function: wait_for_socket
+# must run strictly between CLEANUP_PID being set and the first call that
+# touches the API socket. That gap is exactly where the bug lived.
+check_wait_before_first_call() {
+  local fn="$1" first_call_substr="$2"
+  local start end body wait_line call_line ok=no
+  start=$(grep -n "^${fn}() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+  if [ -n "$start" ]; then
+    end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+    if [ -n "$end" ]; then
+      body="$(sed -n "${start},${end}p" "$SCRIPT")"
+      wait_line=$(printf '%s\n' "$body" | grep -nF 'wait_for_socket "$api_sock"' | head -n1 | cut -d: -f1)
+      call_line=$(printf '%s\n' "$body" | grep -nF "$first_call_substr" | head -n1 | cut -d: -f1)
+      if [ -n "$wait_line" ] && [ -n "$call_line" ] && [ "$wait_line" -lt "$call_line" ]; then
+        ok=yes
+      fi
+    fi
+  fi
+  echo "$ok"
+}
+
+check "boot_quiesce_snapshot_firecracker waits for the socket before its first api_put" \
+  "$(check_wait_before_first_call boot_quiesce_snapshot_firecracker 'api_put "$api_sock" /boot-source')" "yes"
+check "boot_quiesce_snapshot_cloud_hypervisor waits for the socket before its first ch-remote call" \
+  "$(check_wait_before_first_call boot_quiesce_snapshot_cloud_hypervisor 'ch-remote --api-socket "$api_sock" pause')" "yes"
+check "verify_restore_firecracker waits for the socket before /snapshot/load (THE call site the rig lost -- FC arm)" \
+  "$(check_wait_before_first_call verify_restore_firecracker 'api_put "$api_sock" /snapshot/load')" "yes"
+check "verify_restore_cloud_hypervisor waits for the socket before /api/v1/vm.restore (THE call site the rig lost -- CH arm)" \
+  "$(check_wait_before_first_call verify_restore_cloud_hypervisor 'api_put "$api_sock" /api/v1/vm.restore')" "yes"
+
+# Cloud Hypervisor's <socket>.lock file (Firecracker creates none) must be
+# cleaned up in the one shared teardown, not re-typed per VMM arm.
+teardown_body="$(awk '/^teardown_jail\(\) \{/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")"
+check "teardown_jail removes any stale *.sock.lock left in the jail's run dir" \
+  "$(printf '%s\n' "$teardown_body" | grep -v '^[[:space:]]*#' | grep -cF '.sock.lock')" "1"
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"
