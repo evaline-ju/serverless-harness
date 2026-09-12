@@ -85,6 +85,19 @@ func New(cfg Config, lc Launcher, clk Clock) (Pool, error) {
 		return nil, fmt.Errorf("vmpool: Launcher is %q but Config.VMM is %q — the A/B is an image "+
 			"swap, so a mismatch here would silently measure the wrong arm", lc.Kind(), cfg.VMM)
 	}
+	// spec §6's "fail the unit at start", same reasoning as Probe's KVM-unavailable
+	// check: an operator who puts workspaces, snapshots and the jail/run directory
+	// on three individually-reasonable filesystems gets EXDEV on every Exec, with
+	// an error that reads like a launcher bug, unless this is caught here instead.
+	// This is the one place a Config and a constructed Launcher are always both in
+	// scope (see deviceRequirer's doc comment) — every real deployment path
+	// (cmd/microvm-worker/main.go) and every gate (poolFor, TestGateLeakFreeTeardown)
+	// calls New, so nothing that skips this check exists.
+	if dr, ok := lc.(deviceRequirer); ok {
+		if err := dr.checkDeviceSharing(cfg); err != nil {
+			return nil, err
+		}
+	}
 	if clk == nil {
 		clk = RealClock()
 	}

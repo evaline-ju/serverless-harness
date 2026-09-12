@@ -171,6 +171,25 @@ func NewFirecrackerLauncher(opts FirecrackerOptions) (Launcher, error) {
 
 func (l *firecrackerLauncher) Kind() VMMKind { return Firecracker }
 
+// checkDeviceSharing implements deviceRequirer. Restore hardlinks (os.Link, never
+// a copy) every golden-snapshot component from l.opts.SnapshotDir, AND the
+// per-run workspace image from cfg.WorkspaceRoot, into the jail under
+// l.opts.ChrootBase — so all three must share one filesystem device or every
+// Restore fails with EXDEV. The workspace image is hardlinked rather than copied
+// deliberately: the run's workspace image must be the SAME INODE across that
+// run's Execs, because that is how a file written in Exec N is still there in
+// Exec N+1 (TestGateWriteDurability pins exactly this); a copy would silently
+// break that durability guarantee instead of failing loudly, which is worse.
+func (l *firecrackerLauncher) checkDeviceSharing(cfg Config) error {
+	return checkPathsShareDevice(
+		"Restore hardlinks the golden snapshot's components and the per-run "+
+			"workspace image into the jail, and hardlink(2) cannot cross devices",
+		namedPath{"FirecrackerOptions.SnapshotDir", l.opts.SnapshotDir},
+		namedPath{"Config.WorkspaceRoot", cfg.WorkspaceRoot},
+		namedPath{"FirecrackerOptions.ChrootBase", l.opts.ChrootBase},
+	)
+}
+
 // SerializesExecsPerRun is true: the workspace is an ext4 image, not a shared-disk
 // filesystem, and only one guest may hold its rw mount at a time (spec §4.3) — two
 // concurrent Execs for the same run would mount it twice and corrupt it.

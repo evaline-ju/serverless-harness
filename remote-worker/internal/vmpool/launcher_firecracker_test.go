@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 )
 
@@ -78,20 +77,21 @@ func sameDeviceSiblingDir(t *testing.T, snapshotDir string) string {
 }
 
 // deviceOf returns the device number of the filesystem holding path, for asserting two
-// directories share a device (the condition a cross-device hardlink needs). Any *nix
-// exposes this via syscall.Stat_t.Dev; the int32-on-darwin vs. uint64-on-linux width
-// difference is irrelevant to an equality comparison, so it is widened unconditionally.
+// directories share a device (the condition a cross-device hardlink needs). Delegates to
+// the production deviceNumber (device_unix.go / device_other.go) rather than keeping a
+// second, test-only *syscall.Stat_t lookup: this package already has to carry that
+// build-tag split for pool.New's own startup check (checkPathsShareDevice), and a
+// duplicate here broke `GOOS=windows go vet ./...` -- Stat_t does not exist on that
+// platform, and vet, unlike build, compiles _test.go files too. On a platform where
+// deviceNumber cannot answer (device_other.go's stub), this skips rather than fails: that
+// stub is a documented "unsupported here", not a bug this test should report.
 func deviceOf(t *testing.T, path string) uint64 {
 	t.Helper()
-	info, err := os.Stat(path)
+	dev, err := deviceNumber(path)
 	if err != nil {
-		t.Fatalf("stat %s: %v", path, err)
+		t.Skipf("deviceNumber(%s): %v (this platform cannot verify device-sharing; see device_other.go)", path, err)
 	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		t.Skip("this platform's os.FileInfo.Sys() is not *syscall.Stat_t; the device-sharing check needs a *nix Stat_t.Dev")
-	}
-	return uint64(st.Dev)
+	return dev
 }
 
 // TestSameDeviceSiblingDirSharesDeviceWithTarget is the assertion that would have caught

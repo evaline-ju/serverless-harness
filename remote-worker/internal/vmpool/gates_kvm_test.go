@@ -57,10 +57,19 @@ func chvLauncherForGate(t *testing.T) Launcher {
 // exactly the ones spec §8 requires against real KVM, not the fake.
 func poolFor(t *testing.T, lc Launcher) Pool {
 	t.Helper()
+	// WorkspaceRoot must share a device with the Firecracker arm's SnapshotDir and
+	// ChrootBase (see firecrackerLauncher.checkDeviceSharing): Restore() hardlinks
+	// workspace.img from here into the jail root, and hardlink(2) is EXDEV across
+	// devices. Routed through sameDeviceSiblingDir keyed to the SAME snapshotDir
+	// value fcLauncher uses, exactly like ChrootBase and chvOpts's RunDir are,
+	// rather than a bare t.TempDir(). Harmless for the Cloud Hypervisor arm, whose
+	// checkDeviceSharing does not constrain WorkspaceRoot at all -- virtiofsd shares
+	// it with the guest live and it is never hardlinked.
+	snapshotDir := envOr("SH_SNAPSHOT_IMAGE_DIR", "/srv/snapshots/swebench-py311")
 	cfg := Config{
 		VMM:               lc.Kind(),
 		SnapshotDir:       t.TempDir(),
-		WorkspaceRoot:     t.TempDir(),
+		WorkspaceRoot:     sameDeviceSiblingDir(t, snapshotDir),
 		MaxRuns:           4,
 		MaxCommittedBytes: 32 << 30,
 	}
@@ -307,7 +316,12 @@ func TestGateLeakFreeTeardown(t *testing.T) {
 	const standbyIdle = 2 * time.Second
 	const workspaceIdle = 4 * time.Second
 	const reclaimScan = 500 * time.Millisecond
-	workspaceRoot := t.TempDir()
+	// See poolFor's identical comment: WorkspaceRoot must share a device with the
+	// Firecracker arm's SnapshotDir/ChrootBase, so it is routed through
+	// sameDeviceSiblingDir rather than a bare t.TempDir(), keyed to the same
+	// snapshotDir value fcLauncher used to build lc above.
+	snapshotDir := envOr("SH_SNAPSHOT_IMAGE_DIR", "/srv/snapshots/swebench-py311")
+	workspaceRoot := sameDeviceSiblingDir(t, snapshotDir)
 	cfg := Config{
 		VMM:                 lc.Kind(),
 		SnapshotDir:         t.TempDir(),

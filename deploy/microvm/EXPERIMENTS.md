@@ -203,6 +203,174 @@ hardware (the reported rig run covered the Firecracker arm only — see above); 
 recorded here as resolved based on the commit itself and the coordinator's account,
 not a fresh gate run against CHV.
 
+### Fix round 2: WorkspaceRoot's own device coupling, a startup check for the constraint, and a `go vet` gap
+
+Fix round 1 fixed one device coupling per arm (Firecracker's `ChrootBase`, CHV's
+`RunDir`) against the golden snapshot's `SnapshotDir`. It missed that Firecracker
+has a **second, independent** coupling: `Restore()` hardlinks the per-run
+`workspace.img` from `Config.WorkspaceRoot` into the jail root alongside the
+golden snapshot's own files, so `WorkspaceRoot` must ALSO share a device with
+`SnapshotDir`/`ChrootBase` — a three-way constraint, not two separate two-way
+ones. Cloud Hypervisor has no such second coupling: its `Restore()` never
+hardlinks the workspace at all — virtiofsd shares `WorkspaceRoot` with the guest
+live over virtio-fs — so CHV's constraint stays two-way (`SnapshotDir` ↔
+`RunDir`) and must NOT be tightened to include `WorkspaceRoot`.
+
+**Item 1 — `poolFor`'s `WorkspaceRoot: t.TempDir()`.** Same bug shape as fix
+round 1, on the third leg: `gates_kvm_test.go`'s `poolFor` and
+`TestGateLeakFreeTeardown` built their `Config` with a bare `t.TempDir()` for
+`WorkspaceRoot`, which — like `ChrootBase` before it — only worked by accident on
+a single-device host. Fixed by routing it through the same
+`sameDeviceSiblingDir(t, snapshotDir)` helper fix round 1 introduced, keyed to
+the identical `snapshotDir` value the arm's own launcher (`fcLauncher`) uses, so
+all three paths land on one device together rather than being fixed pairwise.
+Harmless for the Cloud Hypervisor arm: its `checkDeviceSharing` (below) never
+inspects `WorkspaceRoot`, so sharing a device with the snapshot costs that arm
+nothing and constrains nothing extra.
+
+**Mutation test — honest non-reproduction, same shape as fix round 1's.**
+Reverted `poolFor`'s fix back to a bare `t.TempDir()` (keeping the file
+compiling by discarding the now-unused `snapshotDir` local) and re-ran the full
+suite. Result: 0 FAIL. Every gate that exercises `poolFor` (`TestGateWriteDurability`,
+`TestGateNoCrossRunBleed`, `TestGateLeakFreeTeardown`, etc.) reported `SKIP`, not
+PASS or FAIL — `requireKVM(t)` skips before the mutated code path is ever
+reached, because this machine has no `/dev/kvm` and `SH_KVM` is unset. This is
+the expected, anticipated outcome for a gate-level mutation on this machine, not
+a gap in the fix: the same mutation on the rig (real KVM, real two-device
+layout) would be expected to fail every gate above with the same
+`invalid cross-device link` signature fix round 1's bug report showed for
+`ChrootBase`, because the underlying hardlink call is unconditional in
+`Restore()`. Reverted immediately after observing this; the file is back to its
+fixed state and the full suite is green again (see Verification below).
+
+**Item 2 — validate the constraint at startup, not just in test helpers.** The
+workspace hardlink is deliberate and load-bearing — it is what makes
+`TestGateWriteDurability` a meaningful property rather than a coincidence — so
+an operator who puts `WorkspaceRoot`, `SnapshotDir`, and the jail/run directory
+on three individually-reasonable filesystems is hitting a real deployment
+constraint, not a test-fixture bug, and deserves a startup failure that names
+exactly what to move, not an EXDEV three Execs deep that reads like a launcher
+defect.
+
+Added:
+
+- `remote-worker/internal/vmpool/devicecheck.go` — `checkPathsShareDevice(why
+  string, paths ...namedPath) error`, the shared comparison-plus-formatting
+  logic; `namedPath{name, path}` pairs a host path with the Config/Options field
+  it should be reported under, so the error names something an operator can
+  actually go edit, not just a bare directory string. `deviceRequirer` is a
+  package-internal interface (`checkDeviceSharing(cfg Config) error`) that only
+  `firecrackerLauncher` and `chvLauncher` implement — `FakeLauncher` hardlinks
+  nothing and deliberately does not implement it.
+- `firecrackerLauncher.checkDeviceSharing` (`launcher_firecracker.go`) — the
+  three-way check: `FirecrackerOptions.SnapshotDir`, `Config.WorkspaceRoot`,
+  `FirecrackerOptions.ChrootBase`.
+- `chvLauncher.checkDeviceSharing` (`launcher_chv.go`) — the two-way check:
+  `CHVOptions.SnapshotDir`, `CHVOptions.RunDir`. Deliberately excludes
+  `Config.WorkspaceRoot` — see the scope distinction above.
+- `pool.New` (`pool.go`) type-asserts `lc` against `deviceRequirer` right after
+  the existing `lc.Kind() != cfg.VMM` cross-check, and fails construction if
+  `checkDeviceSharing` errors. Placed there, not in each launcher's constructor
+  or in `Restore()` itself, because `New` is the one place a `Config` (which
+  owns `WorkspaceRoot`) and a constructed `Launcher` (which owns
+  `SnapshotDir`/`ChrootBase`/`RunDir`) are always both in scope at once — the
+  same "fail the unit at start" reasoning spec §6 already applies to the
+  KVM-unavailable check in `Probe`. Every real deployment path
+  (`cmd/microvm-worker/main.go`) and every gate (`poolFor`,
+  `TestGateLeakFreeTeardown`) constructs its pool via `New`, so nothing that
+  skips this check exists.
+
+The failure message names every path, the Config/Options field it came from,
+its device number, and a one-sentence why, e.g.:
+
+```
+vmpool: FirecrackerOptions.SnapshotDir, Config.WorkspaceRoot, FirecrackerOptions.ChrootBase
+must all be on the same filesystem device, but are not:
+FirecrackerOptions.SnapshotDir=/snap (device 1); Config.WorkspaceRoot=/work (device 1);
+FirecrackerOptions.ChrootBase=/jail (device 2). Restore hardlinks the golden snapshot's
+components and the per-run workspace image into the jail, and hardlink(2) cannot cross devices
+```
+
+**Testing a real device mismatch on a single-device machine.** This darwin
+development machine has exactly one filesystem device across `/`, `/tmp`,
+`$TMPDIR`, `/var/tmp`, and the repo's own working directory (confirmed by both
+this round and fix round 1's identical finding), so no pair of real directories
+on it can ever exercise the mismatch branch. Rather than leave this untested
+locally, `devicecheck.go` added a package-level seam,
+`var deviceNumberFunc = deviceNumber` (mirroring the existing `Clock`/
+`RealClock()` seam this package already uses for exactly the same reason: real
+production code always calls through the real function, but a test can swap it
+for a fake one). `devicecheck_test.go` (new) uses this seam to fake two or three
+distinct device numbers and drive both `checkPathsShareDevice` directly and both
+launchers' `checkDeviceSharing` through it, including the coordinator's literal
+ask — construct a config whose paths differ by device and assert the failure
+message names all of them (`TestFirecrackerCheckDeviceSharingNamesAllThreePaths`).
+8 new tests, all passing:
+
+- `TestCheckPathsShareDeviceAllowsMatch` / `...DetectsMismatch`
+- `TestFirecrackerCheckDeviceSharingNamesAllThreePaths` /
+  `...AllowsOneSharedDevice`
+- `TestCHVCheckDeviceSharingIgnoresWorkspaceRoot` (pins the scope distinction:
+  `WorkspaceRoot` on a third fake device must NOT fail CHV's check) /
+  `...DetectsMismatch`
+- `TestNewPropagatesDeviceSharingFailure` / `...SucceedsWhenDeviceSharingPasses`
+  (pool.New's wiring itself, via a small `deviceCheckLauncher` test double with
+  a controllable `checkDeviceSharing`, since `FakeLauncher` deliberately does
+  not implement `deviceRequirer`)
+
+**Mutation-test evidence for Item 2 (fully reproducible locally, via the seam):**
+
+- Changed `checkPathsShareDevice`'s `mismatch = true` to `mismatch = false`
+  (simulating "the comparison loop stops detecting a mismatch"). Observed
+  failure: exactly `TestCheckPathsShareDeviceDetectsMismatch`,
+  `TestFirecrackerCheckDeviceSharingNamesAllThreePaths`, and
+  `TestCHVCheckDeviceSharingDetectsMismatch` FAILed — the three tests that
+  construct a genuine mismatch — with every other test (including the
+  allow-match tests) still passing. Reverted; suite green again.
+- Changed `pool.New`'s `if dr, ok := lc.(deviceRequirer); ok { ... }` block to
+  discard `dr` without calling `checkDeviceSharing` (simulating "the check is
+  wired up but never invoked"). Observed failure: exactly
+  `TestNewPropagatesDeviceSharingFailure` FAILed (a launcher whose
+  `checkDeviceSharing` always errors no longer blocked `New`); every other test,
+  including `TestNewSucceedsWhenDeviceSharingPasses`, stayed green. Reverted;
+  suite green again.
+
+Both cycles: mutate, run the full `internal/vmpool` suite, confirm the expected
+and only the expected tests fail, revert from a saved copy, rebuild and re-test
+to confirm clean.
+
+**Item 3 — `GOOS=windows go vet` failure, and the verification gap it exposed.**
+`launcher_firecracker_test.go`'s own `deviceOf` test helper kept a second,
+test-only `syscall.Stat_t.Dev` lookup, duplicating what `device_unix.go` (added
+this round) already does for production code. `syscall.Stat_t` does not exist on
+`GOOS=windows`, so `GOOS=windows go vet ./...` failed:
+`launcher_firecracker_test.go:90:33: undefined: syscall.Stat_t`. `go build
+./...` never caught this — **build does not compile `_test.go` files at all**,
+only `vet` (and `test`) do, so a `GOOS=windows go build ./...`-only check is
+structurally blind to this entire class of bug regardless of how carefully it
+is run.
+
+Fix: `deviceOf` now delegates to the production `deviceNumber` function
+(`device_unix.go` under `//go:build unix`, `device_other.go` under
+`//go:build !unix`, following the `cgroup_windows.go` precedent from Task 17)
+instead of keeping its own `Stat_t` lookup, and skips (does not fail) on a
+platform where `deviceNumber` cannot answer — `device_other.go`'s stub is a
+documented "unsupported here," not a bug this test should report.
+
+**This is fixed in the standard, not just patched once.** Verification for this
+task, and every future round on this package, is now: `go build ./...` AND
+`go vet ./...` for **all three** of `GOOS=linux`, `GOOS=darwin`, `GOOS=windows`
+(six checks total), plus `go test ./... -count=1` for the whole `remote-worker`
+module — not `go build` alone on one or two platforms, precisely because `vet`
+catches compile errors in test files that `build` structurally cannot.
+
+**Verification after fix round 2:** all six `go build`/`go vet` combinations
+(`linux`/`darwin`/`windows` × `build`/`vet`) exit 0; `go test ./...` for the
+whole `remote-worker` module exits 0 (all packages PASS or `[no test files]`,
+0 FAIL); `internal/vmpool` alone shows the 8 new device-check tests plus every
+pre-existing gate/unit test passing, KVM-gated gates SKIPping as expected on
+this machine.
+
 ## Performance rungs
 
 Not yet run. E10/E11 depend on the rig and a built golden snapshot, same as the

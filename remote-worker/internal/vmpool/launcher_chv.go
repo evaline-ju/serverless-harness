@@ -226,6 +226,23 @@ func NewCloudHypervisorLauncher(opts CHVOptions) (Launcher, error) {
 
 func (l *chvLauncher) Kind() VMMKind { return CloudHypervisor }
 
+// checkDeviceSharing implements deviceRequirer. Restore hardlinks (via
+// chvStageSnapshotFiles's os.Link) the golden vmstate/memory-ranges files from
+// l.opts.SnapshotDir into l.opts.RunDir, so those two must share one filesystem
+// device or every Restore fails with EXDEV. Unlike Firecracker's jail, this
+// arm's per-run workspace is never hardlinked anywhere: virtiofsd shares
+// cfg.WorkspaceRoot with the guest directly over virtio-fs, so cfg.WorkspaceRoot
+// is deliberately absent from this check — including it would over-constrain a
+// real Cloud Hypervisor deployment for a hardlink that arm never performs.
+func (l *chvLauncher) checkDeviceSharing(cfg Config) error {
+	return checkPathsShareDevice(
+		"Restore hardlinks the golden snapshot's vmstate and memory-ranges files "+
+			"into the run directory, and hardlink(2) cannot cross devices",
+		namedPath{"CHVOptions.SnapshotDir", l.opts.SnapshotDir},
+		namedPath{"CHVOptions.RunDir", l.opts.RunDir},
+	)
+}
+
 // SerializesExecsPerRun is false: virtio-fs means the HOST filesystem, not a
 // guest-owned block device, arbitrates concurrent access to the workspace. This is
 // spec §4.3's decisive row and the whole reason the VMM is a seam rather than a
