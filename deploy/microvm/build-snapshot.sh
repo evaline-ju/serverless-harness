@@ -136,7 +136,7 @@ esac
 
 OUT="${OUT:-$REPO_ROOT/.build/microvm-snapshots/$IMAGE}"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/build-snapshot.XXXXXX")"
-trap 'rm -rf "$STAGE"' EXIT
+trap 'rm_rf_jail "$STAGE"' EXIT
 
 log() { echo "build-snapshot.sh: $*" >&2; }
 
@@ -397,7 +397,7 @@ INIT
 # ---------------------------------------------------------------------------
 write_guest_client() {
   local tmp_pkg="$AGENT_SRC/.build-snapshot-tmp-$$"
-  trap 'rm -rf "'"$tmp_pkg"'" "$STAGE"' EXIT
+  trap 'rm_rf_jail "'"$tmp_pkg"'" "$STAGE"' EXIT
   if ! mkdir -p "$tmp_pkg"; then
     echo "build-snapshot.sh: cannot create $tmp_pkg -- is --agent $AGENT_SRC" \
       "writable? (guest_client.go must be generated inside the module tree so its" \
@@ -532,7 +532,7 @@ func readLine(conn net.Conn) (string, error) {
 GOEOF
   (cd "$AGENT_SRC" && go build -o "$STAGE/guest_client" "$tmp_pkg/guest_client.go")
   rm -rf "$tmp_pkg"
-  trap 'rm -rf "$STAGE"' EXIT
+  trap 'rm_rf_jail "$STAGE"' EXIT
 }
 
 wait_for_agent() {
@@ -624,24 +624,47 @@ require_root() {
   fi
 }
 
-# api_put issues a PUT with JSON body $3 to path $2 on the VMM's Unix-socket API
-# $1, and treats a transport failure OR a non-2xx response as fatal (item 4). The
-# previous form (`curl -s ... >/dev/null`) swallowed both kinds of failure and let
-# the build limp on to a snapshot silently missing whatever the call configured.
-api_put() {
-  local sock="$1" path="$2" body="$3" resp status
-  resp="$(curl -s -S --unix-socket "$sock" -w '\n%{http_code}' -X PUT "http://localhost${path}" -d "$body")" || {
-    echo "build-snapshot.sh: PUT $path: curl could not reach $sock" >&2
+# api_request issues an HTTP request with method $1 and JSON body $4 to path $3
+# on the VMM's Unix-socket API $2, and treats a transport failure OR a non-2xx
+# response as fatal (item 4). The previous form (`curl -s ... >/dev/null`)
+# swallowed both kinds of failure and let the build limp on to a snapshot
+# silently missing whatever the call configured. api_put and api_patch below are
+# both thin wrappers around this single copy of that status-checking logic --
+# duplicating it per-verb would let the two copies drift.
+api_request() {
+  local method="$1" sock="$2" path="$3" body="$4" resp status
+  resp="$(curl -s -S --unix-socket "$sock" -w '\n%{http_code}' -X "$method" "http://localhost${path}" -d "$body")" || {
+    echo "build-snapshot.sh: $method $path: curl could not reach $sock" >&2
     exit 1
   }
   status="${resp##*$'\n'}"
   case "$status" in
     2??) ;;
     *)
-      echo "build-snapshot.sh: PUT $path returned HTTP $status: ${resp%$'\n'*}" >&2
+      echo "build-snapshot.sh: $method $path returned HTTP $status: ${resp%$'\n'*}" >&2
       exit 1
       ;;
   esac
+}
+
+# api_put creates/sets a resource -- Firecracker's convention for everything
+# configured before or during boot (/boot-source, /drives/{id} pre-boot, /vsock,
+# /machine-config pre-boot, /actions, /snapshot/create, /snapshot/load), and
+# cloud-hypervisor's convention uniformly (its RPC-style API has no PATCH verb
+# at all, e.g. /api/v1/vm.restore).
+api_put() {
+  api_request PUT "$1" "$2" "$3"
+}
+
+# api_patch updates an EXISTING resource's state -- Firecracker's convention for
+# everything that acts on an already-running VM. /vm is PATCH-only: Firecracker
+# defines no PUT method for it at all. Confirmed against the real v1.17.0 binary:
+# `PUT /vm` returns HTTP 400 "Invalid request method and/or path: PUT vm.", while
+# `PATCH /vm` (even pre-boot, so it fails for an unrelated reason) returns "The
+# requested operation is not supported before starting the microVM." -- a state
+# complaint, proving PATCH is the method the route actually accepts.
+api_patch() {
+  api_request PATCH "$1" "$2" "$3"
 }
 
 # hardlink_or_copy_bin resolves $1 on PATH and hardlinks (falling back to a copy
@@ -684,6 +707,36 @@ jail_unmount_dev() {
   umount "$jail/dev/kvm" 2>/dev/null || true
 }
 
+# rm_rf_jail is a GUARDED rm -rf: before removing any of $@, it checks the host's
+# live mount table (/proc/mounts -- no `mountpoint`/`findmnt` binary required,
+# and this whole script is already Linux/KVM-only) and refuses, loudly, if
+# anything is still mounted at or under one of them, rather than silently
+# recursing rm -rf through a live mountpoint.
+#
+# Fix-round-5 item 2: today the only bind mounts under a jail are the two device
+# nodes jail_mount_dev creates, so a leftover mount here means jail_unmount_dev
+# ran too early (or failed) and the blast radius is a failed rm printing "Device
+# or resource busy" -- annoying, but not destructive. The shape of the bug is one
+# small change away from being destructive, though: if a directory (rather than
+# a bare device node) were ever bind-mounted into a jail and its unmount call
+# silently failed (jail_unmount_dev's umounts are deliberately best-effort, `||
+# true`), `rm -rf` would recurse straight through the mount and delete whatever
+# is on the other side of it -- the operator's own files, not the jail's. This
+# check is written generically (against the live mount table, not against the
+# two device-node paths by name) precisely so it keeps covering that case too.
+rm_rf_jail() {
+  local dir leftover
+  for dir in "$@"; do
+    leftover="$(awk -v d="$dir" '$2 == d || index($2, d "/") == 1 {print $2}' /proc/mounts)"
+    if [ -n "$leftover" ]; then
+      echo "build-snapshot.sh: refusing to rm -rf $dir: still mounted under it:" >&2
+      echo "$leftover" >&2
+      return 1
+    fi
+  done
+  rm -rf "$@"
+}
+
 # ensure_workspace_image creates $1 as a sparse ext4 filesystem of
 # WORKSPACE_IMAGE_BYTES -- the exact recipe (truncate, then mkfs.ext4 -F) of
 # launcher_firecracker.go's ensureWorkspaceImage, so the golden snapshot's second
@@ -703,14 +756,14 @@ boot_quiesce_snapshot_firecracker() {
   hardlink_or_copy_bin firecracker "$jail/firecracker"
   # Fix-round-2 item A: the trap is armed BEFORE jail_mount_dev runs, not after --
   # a failure anywhere between the mount and the old trap-arm point (ensure_workspace_image's
-  # mkfs.ext4, the chroot itself) used to leave only the original `rm -rf "$STAGE"`
+  # mkfs.ext4, the chroot itself) used to leave only the original bare-removal
   # trap active, leaking the /dev/kvm and /dev/urandom bind mounts (a live mountpoint
-  # under $STAGE that rm -rf then runs over, rather than clears). jail_unmount_dev is
+  # under $STAGE that a plain removal then runs over, rather than clears). jail_unmount_dev is
   # unconditionally best-effort (umount ... || true), so arming it before the mount
   # exists is harmless -- it just no-ops if fired early. $fc_pid is looked up when
   # the trap FIRES, not when it is set, so declaring it empty here and assigning it
   # below is sufficient even under `set -u`.
-  trap 'jail_unmount_dev "'"$jail"'"; kill "$fc_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+  trap 'kill "$fc_pid" 2>/dev/null || true; wait "$fc_pid" 2>/dev/null || true; jail_unmount_dev "'"$jail"'"; rm_rf_jail "$STAGE"' EXIT
   jail_mount_dev "$jail"
   # Item 2: a second, non-root, read-write drive so a restored VM has something
   # for the per-run workspace to mount -- launcher_firecracker.go's Restore hard-
@@ -749,15 +802,17 @@ boot_quiesce_snapshot_firecracker() {
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
   quiesce_guest "$vsock_uds"
 
-  log "snapshotting (PUT /snapshot/create, resuming nothing afterwards)"
-  api_put "$api_sock" /vm '{"state":"Paused"}'
+  log "snapshotting (PATCH /vm to pause, then PUT /snapshot/create, resuming nothing afterwards)"
+  # Fix-round-5 item 1: /vm has no PUT method in Firecracker's own spec -- see the
+  # api_patch comment above for the real-binary evidence that settled this.
+  api_patch "$api_sock" /vm '{"state":"Paused"}'
   api_put "$api_sock" /snapshot/create \
     "{\"snapshot_path\":\"/vmstate\",\"mem_file_path\":\"/memfile\",\"snapshot_type\":\"Full\",\"resume_vm\":false}"
 
   kill "$fc_pid" 2>/dev/null || true
   wait "$fc_pid" 2>/dev/null || true
   jail_unmount_dev "$jail"
-  trap 'rm -rf "$STAGE"' EXIT
+  trap 'rm_rf_jail "$STAGE"' EXIT
 }
 
 boot_quiesce_snapshot_cloud_hypervisor() {
@@ -769,7 +824,7 @@ boot_quiesce_snapshot_cloud_hypervisor() {
   hardlink_or_copy_bin cloud-hypervisor "$jail/cloud-hypervisor"
   # Fix-round-2 item A: trap armed before the mount, not after -- see the matching
   # comment in boot_quiesce_snapshot_firecracker for why.
-  trap 'jail_unmount_dev "'"$jail"'"; kill "$ch_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+  trap 'kill "$ch_pid" 2>/dev/null || true; wait "$ch_pid" 2>/dev/null || true; jail_unmount_dev "'"$jail"'"; rm_rf_jail "$STAGE"' EXIT
   jail_mount_dev "$jail"
 
   log "starting cloud-hypervisor chrooted into $jail ($api_sock)"
@@ -830,7 +885,7 @@ boot_quiesce_snapshot_cloud_hypervisor() {
   kill "$ch_pid" 2>/dev/null || true
   wait "$ch_pid" 2>/dev/null || true
   jail_unmount_dev "$jail"
-  trap 'rm -rf "$STAGE"' EXIT
+  trap 'rm_rf_jail "$STAGE"' EXIT
 }
 
 boot_quiesce_snapshot() {
@@ -933,7 +988,7 @@ verify_restore_firecracker() {
   # (e.g. cross-device) or ensure_workspace_image's mkfs.ext4 below used to run
   # inside the leak window; see the matching comment in
   # boot_quiesce_snapshot_firecracker for the full rationale.
-  trap 'jail_unmount_dev "'"$jail"'"; kill "$fc_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+  trap 'kill "$fc_pid" 2>/dev/null || true; wait "$fc_pid" 2>/dev/null || true; jail_unmount_dev "'"$jail"'"; rm_rf_jail "$STAGE"' EXIT
   jail_mount_dev "$jail"
   ln "$OUT/vmstate" "$jail/vmstate"
   ln "$OUT/memfile" "$jail/memfile"
@@ -961,7 +1016,7 @@ verify_restore_firecracker() {
   kill "$fc_pid" 2>/dev/null || true
   wait "$fc_pid" 2>/dev/null || true
   jail_unmount_dev "$jail"
-  trap 'rm -rf "$STAGE"' EXIT
+  trap 'rm_rf_jail "$STAGE"' EXIT
   if [ "$exit_code" -ne 0 ]; then
     echo "build-snapshot.sh: the fresh snapshot restored but \`true\` exited $exit_code" >&2
     exit 1
@@ -986,7 +1041,7 @@ verify_restore_cloud_hypervisor() {
   hardlink_or_copy_bin cloud-hypervisor "$jail/cloud-hypervisor"
   # Fix-round-2 item A: trap armed before the mount, not after -- see the matching
   # comment in boot_quiesce_snapshot_firecracker for the full rationale.
-  trap 'jail_unmount_dev "'"$jail"'"; kill "$ch_pid" 2>/dev/null || true; rm -rf "$STAGE"' EXIT
+  trap 'kill "$ch_pid" 2>/dev/null || true; wait "$ch_pid" 2>/dev/null || true; jail_unmount_dev "'"$jail"'"; rm_rf_jail "$STAGE"' EXIT
   jail_mount_dev "$jail"
   ln "$OUT/rootfs" "$jail/rootfs"
   # vm.restore replays the whole snapshot directory, not just memory state, so
@@ -1009,7 +1064,7 @@ verify_restore_cloud_hypervisor() {
   kill "$ch_pid" 2>/dev/null || true
   wait "$ch_pid" 2>/dev/null || true
   jail_unmount_dev "$jail"
-  trap 'rm -rf "$STAGE"' EXIT
+  trap 'rm_rf_jail "$STAGE"' EXIT
   if [ "$exit_code" -ne 0 ]; then
     echo "build-snapshot.sh: the fresh snapshot restored but \`true\` exited $exit_code" >&2
     exit 1

@@ -165,7 +165,7 @@ for fn in boot_quiesce_snapshot_firecracker boot_quiesce_snapshot_cloud_hypervis
     end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
     if [ -n "$end" ]; then
       trap_line=$(awk -v s="$start" -v e="$end" \
-        'NR>=s && NR<=e && /trap .jail_unmount_dev/{print NR; exit}' "$SCRIPT")
+        'NR>=s && NR<=e && /trap .*jail_unmount_dev/{print NR; exit}' "$SCRIPT")
       mount_line=$(awk -v s="$start" -v e="$end" \
         'NR>=s && NR<=e && /jail_mount_dev "\$jail"/{print NR; exit}' "$SCRIPT")
       if [ -n "$trap_line" ] && [ -n "$mount_line" ] && [ "$trap_line" -lt "$mount_line" ]; then
@@ -209,7 +209,7 @@ if [ -n "$start" ]; then
   end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
   if [ -n "$end" ]; then
     trap_line=$(awk -v s="$start" -v e="$end" \
-      'NR>=s && NR<=e && /trap .rm -rf.*tmp_pkg/{print NR; exit}' "$SCRIPT")
+      'NR>=s && NR<=e && /trap .*rm_rf_jail.*tmp_pkg/{print NR; exit}' "$SCRIPT")
     mkdir_line=$(awk -v s="$start" -v e="$end" \
       'NR>=s && NR<=e && /mkdir -p "\$tmp_pkg"/{print NR; exit}' "$SCRIPT")
     if [ -n "$trap_line" ] && [ -n "$mkdir_line" ] && [ "$trap_line" -lt "$mkdir_line" ]; then
@@ -318,6 +318,88 @@ if [ -n "$wfa_start" ]; then
   fi
 fi
 check "the saved console-log path is outside \$STAGE (survives the EXIT trap)" "$ok" "yes"
+
+echo "== fix-round-5 item 1: /vm is paused with PATCH, not PUT (Firecracker has no PUT /vm)"
+# Confirmed against the real firecracker v1.17.0 binary: PUT /vm returns HTTP 400
+# "Invalid request method and/or path: PUT vm.", while PATCH /vm (even before
+# the VM is started, so it still fails, but for an unrelated reason) returns "The
+# requested operation is not supported before starting the microVM." -- a state
+# complaint, not a method/path complaint, proving PATCH is the method the route
+# actually accepts. Firecracker's own swagger spec confirms /vm defines no PUT
+# method at all; every other api_put call site in the script (/boot-source,
+# /drives/{id} pre-boot, /vsock, /machine-config pre-boot, /actions,
+# /snapshot/create, /snapshot/load, and cloud-hypervisor's uniformly-PUT
+# /api/v1/vm.restore) was individually checked against the spec/docs and is
+# already correct, so only the /vm pause call needed to change.
+check "api_patch helper exists" \
+  "$([ "$(grep -c '^api_patch()' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "the pause call uses api_patch, not api_put" \
+  "$([ "$(grep -cE 'api_patch "\$api_sock" /vm ' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "no PUT call against /vm remains anywhere in the script" \
+  "$(grep -cE 'api_put "\$api_sock" /vm ' "$SCRIPT")" "0"
+
+echo "== fix-round-5 item 1 (cont'd): api_put and api_patch share one copy of the status-checking logic"
+# Generalising api_put to take a method is fine; two independent copies of the
+# non-2xx-is-fatal check would let them drift, so both wrappers must funnel
+# through a single api_request.
+check "api_request is the single shared implementation" \
+  "$([ "$(grep -c '^api_request()' "$SCRIPT")" -eq 1 ] && echo yes || echo no)" "yes"
+check "the non-2xx-is-fatal status check exists exactly once (not duplicated per verb)" \
+  "$([ "$(grep -cF 'returned HTTP $status' "$SCRIPT")" -eq 1 ] && echo yes || echo no)" "yes"
+check "api_put is a thin wrapper around api_request" \
+  "$([ "$(grep -cF 'api_request PUT "$1" "$2" "$3"' "$SCRIPT")" -eq 1 ] && echo yes || echo no)" "yes"
+check "api_patch is a thin wrapper around api_request" \
+  "$([ "$(grep -cF 'api_request PATCH "$1" "$2" "$3"' "$SCRIPT")" -eq 1 ] && echo yes || echo no)" "yes"
+
+echo "== fix-round-5 item 2: each abnormal-exit jail trap kills, waits, unmounts, then removes -- in that order"
+# A killed process does not release its held file descriptors (including the
+# /dev/kvm bind mount) synchronously -- `kill` only requests exit, it does not
+# wait for it -- so `wait` must run before jail_unmount_dev can succeed, which
+# must in turn run before the jail directory is removed. Each function's own
+# success path already does this (kill; wait; jail_unmount_dev; trap-reset);
+# this checks that the abnormal-exit TRAP does too. Extends the round-2 item A /
+# round-3 source-order idiom: instead of comparing the line numbers of two
+# separate lines, this compares the COLUMN position of each keyword's first
+# occurrence within the one line the trap lives on, since all four actions live
+# in a single trap string rather than across several lines.
+check "rm_rf_jail helper exists (guarded rm -rf that refuses over a live mount)" \
+  "$([ "$(grep -c '^rm_rf_jail()' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+for fn in boot_quiesce_snapshot_firecracker boot_quiesce_snapshot_cloud_hypervisor \
+  verify_restore_firecracker verify_restore_cloud_hypervisor; do
+  start=$(grep -n "^${fn}() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+  ok=no
+  if [ -n "$start" ]; then
+    end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+    if [ -n "$end" ]; then
+      result=$(awk -v s="$start" -v e="$end" '
+        NR>=s && NR<=e && /^  trap .kill/ {
+          kp = index($0, "kill \"")
+          wp = index($0, "wait \"")
+          up = index($0, "jail_unmount_dev")
+          rp = index($0, "rm_rf_jail")
+          if (kp > 0 && wp > kp && up > wp && rp > up) print "yes"; else print "no"
+          exit
+        }
+      ' "$SCRIPT")
+      [ "$result" = "yes" ] && ok=yes
+    fi
+  fi
+  check "$fn's EXIT trap kills, waits, unmounts, then removes (in that order)" "$ok" "yes"
+done
+
+echo "== fix-round-5 item 2 (cont'd): rm -rf on \$STAGE is routed through the mount-aware guard"
+# rm -rf and rm_rf_jail together, over a live mountpoint, are a hazardous pair
+# (see the rm_rf_jail comment): today the only bind mounts are device nodes, so
+# a failed unmount just makes rm -rf fail loudly, but the shape is one small
+# change away (a future directory bind mount) from rm -rf silently recursing
+# through the mount and deleting whatever is on the other side of it. Every
+# \$STAGE removal in the script -- not just the four VMM-jail traps above --
+# should go through the guard, for the same reason the coordinator gave: the
+# safety net should not depend on nobody ever adding a mount later.
+check "no bare 'rm -rf \"\$STAGE\"' trap remains anywhere in the script" \
+  "$(grep -cF 'rm -rf "$STAGE"' "$SCRIPT")" "0"
+check "the top-level EXIT trap (armed before any jail exists) uses the guard" \
+  "$([ "$(grep -cF 'rm_rf_jail "$STAGE"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"
