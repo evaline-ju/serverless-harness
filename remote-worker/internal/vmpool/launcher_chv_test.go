@@ -83,6 +83,22 @@ func TestVirtiofsdArgvCarriesItsSandbox(t *testing.T) {
 	if strings.Contains(joined, "--cache=auto") {
 		t.Error("--cache=auto is a known dead end (disconnects immediately) — must not appear in argv")
 	}
+	// Round 5: the inverse of the guard above — the brief DEMANDED
+	// --inode-file-handles=mandatory, and this asserts it is ABSENT. That inversion is
+	// deliberate, not a mistake: mandatory file handles require CAP_DAC_READ_SEARCH to
+	// open a file handle for the shared directory's root node, which the unprivileged
+	// VirtiofsdUID/GID this design requires (enforced by TestVirtiofsdIsNeverRunAsRoot
+	// above, per spec §3.5) does not have. Confirmed on real hardware: at uid 65534
+	// with --inode-file-handles=mandatory, virtiofsd logs "Failed to open file handle
+	// for the root node: Operation not permitted (os error 1)" and exits before its
+	// vhost-user socket ever appears; without the flag (or at root, which this design
+	// forbids), it starts fine. If a future reader restores this flag "per the
+	// brief", they will silently break the CH arm again in exactly this way — this
+	// assertion exists so that regression fails loudly in CI instead of quietly on
+	// the rig.
+	if strings.Contains(joined, "--inode-file-handles=mandatory") {
+		t.Error("--inode-file-handles=mandatory requires CAP_DAC_READ_SEARCH, which the unprivileged VirtiofsdUID this design requires (spec §3.5) does not have — confirmed on real hardware (\"Operation not permitted\" opening a file handle for the root node); must not reappear in argv")
+	}
 }
 
 // TestCloudHypervisorParentCgroupRequiresMemoryMax is validate()'s mirror of

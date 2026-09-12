@@ -259,6 +259,7 @@ func (l *chvLauncher) SerializesExecsPerRun() bool { return false }
 //     sudo, and the binary's own --help flags unprivileged --sandbox=namespace as
 //     documented but untested — kept anyway, unweakened, because the alternative
 //     (--sandbox=none) is the one thing this design cannot tolerate.
+//
 //   - --cache=never, NOT --cache=auto. hardware-corrections C1: --cache=auto
 //     disconnected the virtio-fs session immediately on the reference host;
 //     --cache=never "stayed up through every subsequent test", and CH's own
@@ -266,14 +267,56 @@ func (l *chvLauncher) SerializesExecsPerRun() bool { return false }
 //     --cache=auto disconnect ("plausibly a feature-negotiation mismatch") — this
 //     comment does not invent one either; a confident wrong explanation would be
 //     worse than none.
-//   - --inode-file-handles=mandatory where available, per the brief.
+//
+//   - NO --inode-file-handles=mandatory, even though the brief asked for it. Round-5
+//     hardware probing (three runs, one variable at a time) found it INCOMPATIBLE with
+//     the non-root requirement immediately above: opening a file handle for the shared
+//     directory's root node requires CAP_DAC_READ_SEARCH, which a process that has
+//     dropped to VirtiofsdUID/GID (an unprivileged uid, e.g. 65534) does not have —
+//     confirmed by virtiofsd's own README ("and CAP_DAC_READ_SEARCH if
+//     --inode-file-handles is used" / "virtiofsd can't use file handles ... requires
+//     CAP_DAC_READ_SEARCH"). At uid 65534 with --inode-file-handles=mandatory,
+//     virtiofsd logs "Failed to open file handle for the root node: Operation not
+//     permitted (os error 1)", refuses to start ("Refusing to use (mandatory) file
+//     handles, as they do not appear safe to use"), and exits — which is why Restore's
+//     "virtiofsd socket never appeared" error was the shape this failed in on the rig.
+//     At uid 65534 WITHOUT the flag, or at root WITH it, virtiofsd starts fine: the
+//     flag and the unprivileged uid are what conflict, not --sandbox=namespace (C2,
+//     confirmed separately and unchanged) and not the directory traversal fix from
+//     Task 18 (also confirmed separately).
+//
+//     Spec §3.5 decides which requirement yields, and it is not close: with virtio-fs,
+//     guest path resolution happens in virtiofsd ON THE HOST, so virtiofsd IS the
+//     confinement boundary for the whole design — a root virtiofsd compromise is host
+//     root and would render the microVM boundary decorative. That is a boundary
+//     collapse. What mandatory file handles buy is narrower: they let virtiofsd
+//     reference inodes by handle rather than by path, closing certain rename/symlink
+//     TOCTOU race classes inside the shared directory. Losing them is a real but
+//     bounded reduction in hardening against a guest racing paths in its own
+//     workspace — trading that for avoiding a boundary collapse is the right
+//     direction. This is a deliberate, evidenced downgrade, not an oversight: if you
+//     are reading --sandbox=namespace here with no file-handle flag and wondering
+//     whether the hardening was simply forgotten, it was not — see above.
+//
+//     Chose --inode-file-handles=prefer, explicit rather than omitted, over virtiofsd's
+//     own bare "never". virtiofsd's README documents three values (never, prefer,
+//     mandatory) and states prefer as its own default — "attempt to generate file
+//     handles, but fall back to O_PATH file descriptors where ... CAP_DAC_READ_SEARCH
+//     is not available" — which matches the coordinator's observed degrade-and-continue
+//     log line ("File handles do not appear safe to use, disabling file handles
+//     altogether") when the flag is left off entirely. Passing it explicitly, rather
+//     than leaning on virtiofsd's unstated default, keeps the actual policy visible in
+//     this argv rather than one version bump away from silently changing; "prefer"
+//     rather than "never" costs nothing at VirtiofsdUID/GID and still gets file
+//     handles for free on any deployment that ever runs this unprivileged uid with
+//     CAP_DAC_READ_SEARCH available via a capability grant instead of root.
 func virtiofsdArgv(opts CHVOptions, sock, dir string) []string {
 	return []string{
 		"--socket-path=" + sock,
 		"--shared-dir=" + dir,
 		"--sandbox=namespace",
 		"--cache=never",
-		"--inode-file-handles=mandatory",
+		"--inode-file-handles=prefer",
 	}
 }
 
