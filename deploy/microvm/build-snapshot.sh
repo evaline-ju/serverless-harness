@@ -352,9 +352,32 @@ INIT
 # wire format has exactly one implementation in this repo rather than a second,
 # hand-rolled one in shell. It never becomes a repo file: cmd/guest-agent and
 # internal/guestagent stay untouched, and this script is the only caller.
+#
+# Fix-round-3: the generated file is written under $AGENT_SRC (inside the module),
+# not $STAGE. Go's internal-package rule keys off the IMPORTING FILE's own
+# directory, not the process's working directory, so building from $STAGE via
+# `cd "$AGENT_SRC" && go build .../$STAGE/guest_client.go` stayed illegal
+# regardless of the cd -- $STAGE sits outside the module tree, so importing
+# internal/guestagent from a file there is never allowed. The temp package
+# directory is dot-prefixed so `go build ./...`, `go vet ./...`, and `gofmt -l .`
+# (which this repo's own checks run) skip it even if cleanup below is somehow
+# skipped, and its cleanup is armed (folded into the same EXIT trap $STAGE
+# already uses) BEFORE the directory is created -- same discipline as
+# fix-round-2 item A for the /dev bind mounts, because this directory lives
+# inside the user's SOURCE TREE, not /tmp, so leaking it is worse than an
+# ordinary $STAGE leak, and the script runs as root, so anything left behind
+# would be root-owned in what is normally a non-root user's checkout.
 # ---------------------------------------------------------------------------
 write_guest_client() {
-  cat >"$STAGE/guest_client.go" <<'GOEOF'
+  local tmp_pkg="$AGENT_SRC/.build-snapshot-tmp-$$"
+  trap 'rm -rf "'"$tmp_pkg"'" "$STAGE"' EXIT
+  if ! mkdir -p "$tmp_pkg"; then
+    echo "build-snapshot.sh: cannot create $tmp_pkg -- is --agent $AGENT_SRC" \
+      "writable? (guest_client.go must be generated inside the module tree so its" \
+      "internal/guestagent import is legal; see the comment above write_guest_client)" >&2
+    exit 1
+  fi
+  cat >"$tmp_pkg/guest_client.go" <<'GOEOF'
 // Command guest_client is a build-time-only helper: it speaks the same framed
 // protocol internal/vmpool/guestconn.go speaks at serve time, but from a
 // throwaway process instead of the pool, because build-snapshot.sh has no pool.
@@ -480,7 +503,9 @@ func readLine(conn net.Conn) (string, error) {
 	}
 }
 GOEOF
-  (cd "$AGENT_SRC" && go build -o "$STAGE/guest_client" "$STAGE/guest_client.go")
+  (cd "$AGENT_SRC" && go build -o "$STAGE/guest_client" "$tmp_pkg/guest_client.go")
+  rm -rf "$tmp_pkg"
+  trap 'rm -rf "$STAGE"' EXIT
 }
 
 wait_for_agent() {

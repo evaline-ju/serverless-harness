@@ -176,5 +176,48 @@ for fn in boot_quiesce_snapshot_firecracker boot_quiesce_snapshot_cloud_hypervis
   check "$fn arms the unmount trap before jail_mount_dev (source order)" "$ok" "yes"
 done
 
+echo "== fix-round-3: guest_client.go is generated inside \$AGENT_SRC's module, not \$STAGE"
+# Go's internal-package rule keys off the IMPORTING FILE's own directory, not the
+# working directory: `cd "$AGENT_SRC" && go build .../$STAGE/guest_client.go` was
+# illegal regardless of the cd, because $STAGE sits outside the module tree and
+# guest_client.go imports remote-worker/internal/guestagent. A source-level
+# assertion is legitimate and sufficient here (no live `go build` needed): the
+# generated file's path must be under $AGENT_SRC, and never under $STAGE.
+check "guest_client.go is written to a tmp_pkg variable, not directly under \$STAGE" \
+  "$([ "$(grep -cF 'cat >"$tmp_pkg/guest_client.go"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "tmp_pkg is rooted under \$AGENT_SRC (module root), not under \$STAGE" \
+  "$([ "$(grep -cE 'tmp_pkg="\$AGENT_SRC/' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "guest_client.go is no longer written under \$STAGE" \
+  "$(grep -cF 'cat >"$STAGE/guest_client.go"' "$SCRIPT")" "0"
+check "go build no longer reads guest_client.go out of \$STAGE" \
+  "$(grep -cF '"$STAGE/guest_client.go"' "$SCRIPT")" "0"
+
+# The temp package directory must be dot-prefixed, or `go build ./...`, `go vet
+# ./...` and `gofmt -l .` (which this repo's own checks run against remote-worker)
+# would pick up a lingering one and fail in a way that looks unrelated to this
+# script.
+check "the temp package dir under \$AGENT_SRC is dot-prefixed" \
+  "$([ "$(grep -cE 'AGENT_SRC/\.[A-Za-z]' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# Same discipline as fix-round-2 item A for the /dev bind mounts: the cleanup trap
+# must be armed BEFORE the directory is created, not after, so a failure between
+# mkdir and go build (or inside the heredoc) still removes it. Source-order check
+# within write_guest_client's own body, the same technique used for item A.
+start=$(grep -n "^write_guest_client() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+ok=no
+if [ -n "$start" ]; then
+  end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$end" ]; then
+    trap_line=$(awk -v s="$start" -v e="$end" \
+      'NR>=s && NR<=e && /trap .rm -rf.*tmp_pkg/{print NR; exit}' "$SCRIPT")
+    mkdir_line=$(awk -v s="$start" -v e="$end" \
+      'NR>=s && NR<=e && /mkdir -p "\$tmp_pkg"/{print NR; exit}' "$SCRIPT")
+    if [ -n "$trap_line" ] && [ -n "$mkdir_line" ] && [ "$trap_line" -lt "$mkdir_line" ]; then
+      ok=yes
+    fi
+  fi
+fi
+check "write_guest_client arms the temp-dir cleanup trap before mkdir (source order)" "$ok" "yes"
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"
