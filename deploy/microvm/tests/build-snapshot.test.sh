@@ -973,6 +973,48 @@ fi
 check "verify_restore_cloud_hypervisor never passes its own --fs flag (replays the golden config.json's tag verbatim)" \
   "$(printf '%s\n' "$ch_verify_body" | grep -v '^[[:space:]]*#' | grep -cF -- '--fs ')" "0"
 
+echo "== fix-round-13: cloud-hypervisor's --memory carries shared=on (vhost-user's --fs device requires MAP_SHARED guest RAM)"
+# Real gap: cloud-hypervisor refused to start at all -- "Fatal error:
+# ParsingConfig(Validation(VhostUserRequiresSharedMemory))" -- a config-
+# validation failure at 0.001s, before any boot, identical whether or not
+# virtiofsd's socket exists. Causal chain pinned by this assertion: --fs
+# (round 12) is a vhost-user device; vhost-user devices are driven by an
+# external daemon (virtiofsd) that needs direct access to guest RAM; cloud-
+# hypervisor only allows that when the guest's memory is MAP_SHARED, which its
+# own --memory flag controls via shared=on (default off/MAP_PRIVATE, per
+# cloud-hypervisor's own docs/memory.md -- example there is literally
+# `--memory size=1G,shared=on`). None of "virtio-fs", "vhost-user" or "shared
+# memory" appears near a bare `--memory "size=...M"`, which is exactly why
+# round 12 shipped this defect: pin the spelling here so it cannot silently
+# regress the same way.
+check "cloud-hypervisor build invocation's --memory carries shared=on" \
+  "$([ "$(printf '%s\n' "$live_lines" | grep -cE -- '--memory "size=[^"]*shared=on[^"]*"')" -ge 1 ] && echo yes || echo no)" "yes"
+
+# verify_restore_cloud_hypervisor must NOT set --memory itself -- same reason
+# as the --fs assertion above: it replays the golden config.json (memory
+# settings included) verbatim via vm.restore, so an independent --memory flag
+# here would be drift waiting to happen, not a fix.
+check "verify_restore_cloud_hypervisor never passes its own --memory flag (replays the golden config.json's memory settings verbatim)" \
+  "$(printf '%s\n' "$ch_verify_body" | grep -v '^[[:space:]]*#' | grep -cF -- '--memory ')" "0"
+
+# The firecracker arm has no vhost-user device (its workspace is a plain disk
+# image, not virtio-fs) and must not acquire a shared-memory requirement it
+# does not need -- configured instead via PUT /machine-config's mem_size_mib,
+# a wholly different mechanism with no shared/private memory concept at all.
+fc_build_start=$(grep -n "^boot_quiesce_snapshot_firecracker() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+fc_build_end=""
+fc_build_body=""
+if [ -n "$fc_build_start" ]; then
+  fc_build_end=$(awk -v s="$fc_build_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$fc_build_end" ]; then
+    fc_build_body="$(sed -n "${fc_build_start},${fc_build_end}p" "$SCRIPT")"
+  fi
+fi
+check "boot_quiesce_snapshot_firecracker never passes a --memory flag or shared=on (no vhost-user device, no shared-memory requirement)" \
+  "$(printf '%s\n' "$fc_build_body" | grep -v '^[[:space:]]*#' | grep -cE -- '--memory |shared=on')" "0"
+check "boot_quiesce_snapshot_firecracker configures guest RAM via /machine-config's mem_size_mib instead" \
+  "$([ "$(printf '%s\n' "$fc_build_body" | grep -v '^[[:space:]]*#' | grep -cF -- 'mem_size_mib')" -ge 1 ] && echo yes || echo no)" "yes"
+
 echo "== fix-round-12: start_workspace_virtiofsd / teardown_virtiofsd -- one implementation, shared by build and verify"
 check "start_workspace_virtiofsd helper exists" \
   "$([ "$(grep -c '^start_workspace_virtiofsd() {' "$SCRIPT")" -eq 1 ] && echo yes || echo no)" "yes"
@@ -1288,9 +1330,18 @@ if [ "$vfs_host_has_strings" = "yes" ]; then
 fi
 check "virtio-fs preflight check, actually run: 'strings' missing from PATH fails naming binutils" "$vfs_ok_no_strings" "yes"
 
-echo "== fix-round-12: the A/B is a VMM-plus-kernel swap, not a pure VMM swap (recorded for the Task 20/21 write-up)"
+echo "== fix-round-12/13: the A/B is not a clean VMM swap -- three differences, none chosen, recorded together for the Task 20/21 write-up"
 check "the manifest or a header comment records that the two VMM arms use different kernels (caveat for any A/B comparison)" \
   "$([ "$(grep -ciF 'VMM-plus-kernel' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+# Fix-round-13 added two more differences chasing the shared=on defect down --
+# both must land in the SAME comment block as the round-12 kernel caveat, not
+# scattered, so a reader of the write-up finds all three together.
+check "...and records that cloud-hypervisor v53.0 has no copy-on-write restore mode (second caveat item, same place)" \
+  "$([ "$(grep -ciF 'No copy-on-write restore mode' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "...and records that the two arms now use different guest memory backing -- shared vs. private (third caveat item, same place)" \
+  "$([ "$(grep -ciF 'Different guest memory backing' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "...and ties that third item explicitly to spec section 7.3's memory arithmetic / standby-density basis" \
+  "$([ "$(grep -cF 'section 7.3' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"

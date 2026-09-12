@@ -48,7 +48,43 @@
 #                      fix-round-12's report section), so any A/B measurement
 #                      between the two arms is a VMM-PLUS-KERNEL swap, not a pure
 #                      VMM swap -- a caveat for the experiment write-up (Tasks
-#                      20/21), not a defect in this script.
+#                      20/21), not a defect in this script. Two more differences
+#                      were found chasing that one down, none of them chosen, all
+#                      three consequences of the SAME decision (using virtio-fs at
+#                      all, which is what makes SerializesExecsPerRun() false and
+#                      D>1 standbys viable -- spec section referenced in fix-round-
+#                      12's report). Recorded together here so a reader finds all
+#                      three in one place instead of one at a time:
+#                        1. Different guest kernels (above): Firecracker's CI kernel
+#                           has no CONFIG_VIRTIO_FS.
+#                        2. No copy-on-write restore mode on the installed cloud-
+#                           hypervisor v53.0: `ch-remote restore --help` and a live
+#                           API call both show memory_restore_mode enumerates only
+#                           copy|ondemand, not CopyOnWrite (see docs/notes/cloud-
+#                           hypervisor-snapshot-facts.md row 4, hardware-tested: an
+#                           OnDemand restore of one snapshot into three processes
+#                           showed NO RSS/PSS gap at all -- each process's Pss was
+#                           ~99% of its own VmRSS -- the opposite of Firecracker's
+#                           measured ~3x gap).
+#                        3. Different guest memory backing (fix-round-13): --fs is a
+#                           vhost-user device, and vhost-user devices are driven by
+#                           an external daemon (virtiofsd) that needs direct access
+#                           to guest RAM, which cloud-hypervisor's config validator
+#                           only allows when the guest's memory is MAP_SHARED --
+#                           hence this file's --memory ...,shared=on (see fix-round-
+#                           13's comment on that flag for the exact failure this
+#                           fixes). Firecracker's workspace is a plain disk image,
+#                           not virtio-fs, so it has no vhost-user device and keeps
+#                           private (MAP_PRIVATE) guest memory throughout.
+#                      Item 3 lands squarely on spec section 7.3's memory
+#                      arithmetic -- the basis for the standby-density claim and the
+#                      cost argument built on it. A footprint comparison is now
+#                      private-memory Firecracker against shared-memory Cloud
+#                      Hypervisor, and "sum PSS, not RSS" may not mean the same
+#                      thing on both sides of that comparison. Not resolved here --
+#                      a Task 21 measurement question -- but written down now, next
+#                      to items 1 and 2, while all three are fresh from the same
+#                      investigation.
 #   6. lock_down    -- root-owned, read-only. Only a 64-bit CRC guards vmstate and the
 #                      VMM trusts these files (spec §2.4); the filesystem permissions
 #                      are the next line of defence after that.
@@ -1399,6 +1435,32 @@ boot_quiesce_snapshot_cloud_hypervisor() {
   # either: launcher_chv.go's rewriteSnapshotConfig rewrites fs[].socket but
   # never fs[].tag, so this literal is also what a real restore's rewritten
   # config.json still carries.
+  # Fix-round-13: shared=on on the very --memory flag the --fs device above
+  # depends on. THE DEFECT this round started from: cloud-hypervisor refused
+  # to start at all -- "Fatal error: ParsingConfig(Validation(
+  # VhostUserRequiresSharedMemory))" -- a config-validation failure at 0.001s,
+  # before any boot, identical whether or not virtiofsd's socket exists. The
+  # causal chain: --fs above is a vhost-user device (virtiofsd is a standalone
+  # daemon, not code linked into cloud-hypervisor); vhost-user devices are
+  # driven by that external daemon reading/writing guest RAM directly, which
+  # only works if the guest's memory is mapped MAP_SHARED; cloud-hypervisor's
+  # own default for --memory is MAP_PRIVATE (shared=off), which is exactly
+  # what the validator now refuses to pair with a vhost-user device. None of
+  # "virtio-fs", "vhost-user", or "shared memory" appears near a bare
+  # `--memory "size=...M"`, which is why round 12 shipped this defect: adding
+  # --fs has a side effect on --memory that is invisible at the --fs call site.
+  # Spelling confirmed against cloud-hypervisor's own docs/memory.md (fetched
+  # from the project's GitHub at fix time, not guessed): the documented
+  # example is literally `--memory size=1G,shared=on`; the doc's own words for
+  # what `shared` is for are "when running vhost-user devices as part of the
+  # VM device model, as they will be driven by standalone daemons" needing
+  # "access to the guest RAM content" -- i.e. this exact situation.
+  # CH-ARM ONLY: the firecracker arm (boot_quiesce_snapshot_firecracker, this
+  # file) has no vhost-user device -- its workspace is a plain disk image, not
+  # a virtio-fs mount -- and configures memory via PUT /machine-config's
+  # mem_size_mib, a wholly different mechanism with no shared-memory concept
+  # at all. Do not add shared=on (or anything like it) over there: it has
+  # nothing to do with this defect and nothing needing it.
   chroot "$jail" /cloud-hypervisor \
     --api-socket /run/ch-api.sock \
     --kernel /kernel \
@@ -1406,7 +1468,7 @@ boot_quiesce_snapshot_cloud_hypervisor() {
     --disk "path=/rootfs,readonly=on" \
     --vsock "cid=3,socket=/vsock.sock" \
     --fs "tag=workspace,socket=/fs.sock" \
-    --memory "size=${GUEST_RAM_MB}M" \
+    --memory "size=${GUEST_RAM_MB}M,shared=on" \
     --cpus boot=1 \
     --console "file=/console.log" \
     --serial off \
