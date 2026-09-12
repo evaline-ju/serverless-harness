@@ -163,24 +163,30 @@ echo "== fix-round-2 item A: CLEANUP_JAIL is armed before jail_mount_dev runs"
 # "the thing that lets cleanup unmount /dev is set up before the mount, not
 # after" -- still has to hold; only the mechanism changed, so the assertion is
 # rewritten around CLEANUP_JAIL="$jail" instead of a `trap` line.
-for fn in boot_quiesce_snapshot_firecracker boot_quiesce_snapshot_cloud_hypervisor \
-  verify_restore_firecracker verify_restore_cloud_hypervisor; do
-  start=$(grep -n "^${fn}() {" "$SCRIPT" | head -n1 | cut -d: -f1)
-  ok=no
-  if [ -n "$start" ]; then
-    end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
-    if [ -n "$end" ]; then
-      arm_line=$(awk -v s="$start" -v e="$end" \
-        'NR>=s && NR<=e && /CLEANUP_JAIL="\$jail"/{print NR; exit}' "$SCRIPT")
-      mount_line=$(awk -v s="$start" -v e="$end" \
-        'NR>=s && NR<=e && /jail_mount_dev "\$jail"/{print NR; exit}' "$SCRIPT")
-      if [ -n "$arm_line" ] && [ -n "$mount_line" ] && [ "$arm_line" -lt "$mount_line" ]; then
-        ok=yes
-      fi
+#
+# Fix-round-9: this arming sequence (CLEANUP_JAIL="$jail" then jail_mount_dev)
+# no longer lives in each of the four functions -- it was retyped four times,
+# which is exactly the shape of drift that produced fix-rounds 8 and 9's rig
+# failures, so it was extracted into the single shared prepare_jail helper (see
+# that function's own definition, next to jail_mount_dev). The property now
+# needs to hold just once, of prepare_jail's own body, rather than once per
+# VMM function; each function's OWN obligation is reduced to "call prepare_jail
+# at all", asserted separately below (fix-round-9 section).
+start=$(grep -n "^prepare_jail() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+ok=no
+if [ -n "$start" ]; then
+  end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$end" ]; then
+    arm_line=$(awk -v s="$start" -v e="$end" \
+      'NR>=s && NR<=e && /CLEANUP_JAIL="\$jail"/{print NR; exit}' "$SCRIPT")
+    mount_line=$(awk -v s="$start" -v e="$end" \
+      'NR>=s && NR<=e && /jail_mount_dev "\$jail"/{print NR; exit}' "$SCRIPT")
+    if [ -n "$arm_line" ] && [ -n "$mount_line" ] && [ "$arm_line" -lt "$mount_line" ]; then
+      ok=yes
     fi
   fi
-  check "$fn sets CLEANUP_JAIL before jail_mount_dev (source order)" "$ok" "yes"
-done
+fi
+check "prepare_jail sets CLEANUP_JAIL before jail_mount_dev (source order)" "$ok" "yes"
 
 echo "== fix-round-3: guest_client.go is generated inside \$AGENT_SRC's module, not \$STAGE"
 # Go's internal-package rule keys off the IMPORTING FILE's own directory, not the
@@ -575,6 +581,100 @@ check "no PUT /machine-config between starting the VMM and /snapshot/load" \
 # (Firecracker's device-configuration endpoint) should.
 check "no PUT /vsock (device config) between starting the VMM and /snapshot/load" \
   "$(printf '%s\n' "$restore_segment" | grep -cE '/vsock([[:space:]]|"|$)')" "0"
+
+echo "== fix-round-9: build-vs-verify jail setup/teardown is shared, not retyped (BUG: CH build never created \$jail/ch-snapshot)"
+# Real rig failure: Cloud Hypervisor's own ch-remote refused to snapshot with
+# "Destination is not a directory: \"/ch-snapshot\"" -- boot_quiesce_snapshot_
+# cloud_hypervisor never created \$jail/ch-snapshot before calling `ch-remote
+# ... snapshot "file:///ch-snapshot"`, while verify_restore_cloud_hypervisor
+# (which needs the same directory to stage files into before restore) did, via
+# its own `mkdir -p "$jail/run" "$jail/ch-snapshot"`. This is the THIRD round
+# of build-vs-verify drift the coordinator caught by execution (round 7: EXIT
+# traps; round 8: a stray boot-resource PUT copied into verify) -- so instead
+# of a fourth point-fix, the jail-prep/teardown sequence common to all four
+# functions was extracted into two shared helpers, prepare_jail and
+# teardown_jail, so the two cloud-hypervisor functions share ONE call pattern
+# for this directory rather than each retyping mkdir independently.
+check "prepare_jail helper exists" \
+  "$([ "$(grep -c '^prepare_jail()' "$SCRIPT")" -eq 1 ] && echo yes || echo no)" "yes"
+check "teardown_jail helper exists" \
+  "$([ "$(grep -c '^teardown_jail()' "$SCRIPT")" -eq 1 ] && echo yes || echo no)" "yes"
+
+# prepare_jail's own body: mkdir (the fixed step) must run before the binary is
+# staged, which must run before the device mount -- same source-order idiom
+# used throughout this file.
+pj_start=$(grep -n "^prepare_jail() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+ok=no
+if [ -n "$pj_start" ]; then
+  pj_end=$(awk -v s="$pj_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$pj_end" ]; then
+    mkdir_line=$(awk -v s="$pj_start" -v e="$pj_end" \
+      'NR>=s && NR<=e && /mkdir -p "\$jail\/run" "\$@"/{print NR; exit}' "$SCRIPT")
+    bin_line=$(awk -v s="$pj_start" -v e="$pj_end" \
+      'NR>=s && NR<=e && /hardlink_or_copy_bin "\$bin"/{print NR; exit}' "$SCRIPT")
+    mount_line=$(awk -v s="$pj_start" -v e="$pj_end" \
+      'NR>=s && NR<=e && /jail_mount_dev "\$jail"/{print NR; exit}' "$SCRIPT")
+    if [ -n "$mkdir_line" ] && [ -n "$bin_line" ] && [ -n "$mount_line" ] \
+      && [ "$mkdir_line" -lt "$bin_line" ] && [ "$bin_line" -lt "$mount_line" ]; then
+      ok=yes
+    fi
+  fi
+fi
+check "prepare_jail creates directories (incl. any extra dirs) before staging the binary, before mounting /dev" "$ok" "yes"
+
+# The bug fix itself, as a direct regression test: both cloud-hypervisor
+# functions' prepare_jail calls must pass "$jail/ch-snapshot" as an extra
+# directory. Comment-collision trap: strip comment lines first -- this file's
+# and build-snapshot.sh's own explanatory comments now discuss "ch-snapshot"
+# and "prepare_jail" extensively in prose.
+live_lines="$(grep -v '^[[:space:]]*#' "$SCRIPT")"
+check "both cloud-hypervisor functions' prepare_jail calls create \$jail/ch-snapshot" \
+  "$([ "$(printf '%s\n' "$live_lines" | grep -cF 'prepare_jail cloud-hypervisor "$jail" "$jail/ch-snapshot"')" -eq 2 ] && echo yes || echo no)" "yes"
+check "both firecracker functions' prepare_jail calls take no extra directory" \
+  "$([ "$(printf '%s\n' "$live_lines" | grep -cE 'prepare_jail firecracker "\$jail"[[:space:]]*$')" -eq 2 ] && echo yes || echo no)" "yes"
+check "prepare_jail is called by exactly the four build/verify functions" \
+  "$([ "$(printf '%s\n' "$live_lines" | grep -cE '^[[:space:]]*prepare_jail (firecracker|cloud-hypervisor) ')" -eq 4 ] && echo yes || echo no)" "yes"
+check "teardown_jail is called by exactly the four build/verify functions" \
+  "$([ "$(printf '%s\n' "$live_lines" | grep -cF 'teardown_jail "$jail"')" -eq 4 ] && echo yes || echo no)" "yes"
+
+# No function should still retype the inline kill/wait/unmount teardown
+# sequence -- if one did, it and teardown_jail could drift apart exactly like
+# the two build/verify mkdir calls did. Exclude teardown_jail's own definition
+# (the one legitimate site) by cutting it out of the search text first.
+non_teardown_body="$(awk '/^teardown_jail\(\) \{/{skip=1} skip{if(/^}$/){skip=0}; next} {print}' "$SCRIPT")"
+check "no function outside teardown_jail still kills/waits on \$CLEANUP_PID inline" \
+  "$(printf '%s\n' "$non_teardown_body" | grep -v '^[[:space:]]*#' | grep -cF 'kill "$CLEANUP_PID"')" "0"
+check "no function outside teardown_jail still calls jail_unmount_dev directly" \
+  "$(printf '%s\n' "$non_teardown_body" | grep -v '^[[:space:]]*#' | grep -cF 'jail_unmount_dev "$jail"')" "0"
+
+# Source-order regression guard for the fixed bug: within
+# boot_quiesce_snapshot_cloud_hypervisor, the prepare_jail call (which now
+# creates $jail/ch-snapshot) must precede the `ch-remote ... snapshot` call
+# that requires the directory to already exist.
+ch_start=$(grep -n "^boot_quiesce_snapshot_cloud_hypervisor() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+ok=no
+if [ -n "$ch_start" ]; then
+  ch_end=$(awk -v s="$ch_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$ch_end" ]; then
+    prep_line=$(awk -v s="$ch_start" -v e="$ch_end" \
+      'NR>=s && NR<=e && /^  prepare_jail cloud-hypervisor/{print NR; exit}' "$SCRIPT")
+    snap_line=$(awk -v s="$ch_start" -v e="$ch_end" \
+      'NR>=s && NR<=e && /ch-remote --api-socket "\$api_sock" snapshot/{print NR; exit}' "$SCRIPT")
+    if [ -n "$prep_line" ] && [ -n "$snap_line" ] && [ "$prep_line" -lt "$snap_line" ]; then
+      ok=yes
+    fi
+  fi
+fi
+check "boot_quiesce_snapshot_cloud_hypervisor creates \$jail/ch-snapshot before ch-remote snapshot needs it" "$ok" "yes"
+
+# Deliberate-difference comments the audit called for must actually be present
+# at their sites, not just in the fix-round report.
+check "a comment explains cloud-hypervisor's lack of ensure_workspace_image (virtio-fs)" \
+  "$([ "$(grep -cF 'virtio-fs' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "a comment explains cloud-hypervisor's virtiofsd-served workspace by name" \
+  "$([ "$(grep -cF 'virtiofsd' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "each build function's fresh-boot-only block and workspace-image asymmetry both carry a deliberate-difference comment (2 sites x 2 VMM arms)" \
+  "$([ "$(grep -cF 'Deliberate build-vs-verify asymmetry' "$SCRIPT")" -eq 4 ] && echo yes || echo no)" "yes"
 
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"
