@@ -94,6 +94,63 @@ func TestFirecrackerClientLoadsAndResumes(t *testing.T) {
 	}
 }
 
+// TestLoadSnapshotSerializesVsockOverrideAsObject asserts on the ACTUAL SERIALIZED
+// JSON of the /snapshot/load request body, not on the Go struct: Firecracker
+// v1.17.0 rejects a bare-string vsock_override ("invalid type: string ..., expected
+// struct VsockOverride") and only accepts an object with a uds_path member. A test
+// that decoded into a Go struct with a `string` field would pass whether the wire
+// value were a string or an object, and would not have caught this bug.
+func TestLoadSnapshotSerializesVsockOverrideAsObject(t *testing.T) {
+	sock, _, bodies := fakeFirecrackerAPI(t)
+	c := newFCClient(sock)
+	c.setVsockOverride("/vsock.sock")
+	if err := c.LoadSnapshot(context.Background(), "/snapshot/vmstate", "/snapshot/memfile"); err != nil {
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal([]byte((*bodies)[0]), &raw); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	got, ok := raw["vsock_override"]
+	if !ok {
+		t.Fatal("vsock_override is absent from the request body, but an override was set")
+	}
+	obj, ok := got.(map[string]any)
+	if !ok {
+		t.Fatalf("vsock_override = %#v (a %T), want a JSON object — Firecracker v1.17.0 "+
+			"rejects a bare string with \"invalid type: string ..., expected struct VsockOverride\"",
+			got, got)
+	}
+	if len(obj) != 1 {
+		t.Fatalf("vsock_override object = %v, want exactly one member (uds_path)", obj)
+	}
+	if udsPath, _ := obj["uds_path"].(string); udsPath != "/vsock.sock" {
+		t.Fatalf("vsock_override.uds_path = %v, want \"/vsock.sock\"", obj["uds_path"])
+	}
+}
+
+// TestLoadSnapshotOmitsVsockOverrideWhenUnset asserts the vsock_override key is
+// entirely absent from the request body when no override was set. Firecracker
+// accepts an absent field but rejects an empty object ({}) with "missing field
+// `uds_path`", so {} would be just as wrong as a bare string here.
+func TestLoadSnapshotOmitsVsockOverrideWhenUnset(t *testing.T) {
+	sock, _, bodies := fakeFirecrackerAPI(t)
+	c := newFCClient(sock) // vsockOverride deliberately left unset
+
+	if err := c.LoadSnapshot(context.Background(), "/snapshot/vmstate", "/snapshot/memfile"); err != nil {
+		t.Fatalf("LoadSnapshot: %v", err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal([]byte((*bodies)[0]), &raw); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	if v, present := raw["vsock_override"]; present {
+		t.Fatalf("vsock_override = %v, want the key entirely absent when no override is set", v)
+	}
+}
+
 func TestFirecrackerClientSurfacesAnAPIError(t *testing.T) {
 	sock := filepath.Join(shortUnixSocketDir(t), "fc.sock")
 	ln, err := net.Listen("unix", sock)

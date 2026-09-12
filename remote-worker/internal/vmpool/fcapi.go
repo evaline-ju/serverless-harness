@@ -25,7 +25,8 @@ type fcClient struct {
 	// snapshot/load API exists to solve exactly this: it lets the restorer redirect the
 	// vsock backend to a path of ITS choosing without touching the snapshot file
 	// (docs/vsock.md, "Unix Domain Socket Renaming"). Restore sets this to a fixed
-	// relative name inside the VM's own jail before calling LoadSnapshot.
+	// relative name inside the VM's own jail before calling LoadSnapshot. On the wire
+	// this is an object, not a bare string — see loadSnapshotRequest.VsockOverride.
 	vsockOverride string
 }
 
@@ -45,8 +46,9 @@ func newFCClient(sock string) *fcClient {
 }
 
 // setVsockOverride records the path Restore wants LoadSnapshot to redirect the vsock
-// backend to. Package-internal only: the API-client tests never set it, so the
-// vsock_override field is simply absent from the requests they observe.
+// backend to. Package-internal only: production callers reach it through
+// firecrackerVM.Resume (launcher_firecracker.go); the API-client tests in
+// fcapi_test.go set it directly to assert on the serialized wire shape.
 func (c *fcClient) setVsockOverride(path string) { c.vsockOverride = path }
 
 type loadSnapshotRequest struct {
@@ -64,17 +66,35 @@ type loadSnapshotRequest struct {
 	// timer ticks (spec §3.2) — resuming here would make every standby a running VM.
 	ResumeVM bool `json:"resume_vm"`
 	// VsockOverride, when set, redirects the vsock device's host-side Unix socket to a
-	// path of the restorer's choosing. See fcClient.vsockOverride's comment.
-	VsockOverride string `json:"vsock_override,omitempty"`
+	// path of the restorer's choosing. See fcClient.vsockOverride's comment for why.
+	//
+	// Wire shape: an OBJECT with a single "uds_path" member — e.g.
+	// {"vsock_override":{"uds_path":"/vsock.sock"}} — NOT a bare string. Firecracker
+	// v1.17.0 rejects "vsock_override":"<path>" with "invalid type: string ..., expected
+	// struct VsockOverride"; do not "simplify" this back to a plain string. This must
+	// agree with the shape deploy/microvm/build-snapshot.sh sends to /snapshot/load.
+	//
+	// The field is a pointer so that omitempty actually omits it when no override is
+	// set: Firecracker accepts an absent vsock_override but rejects an empty object
+	// ({}) with "missing field `uds_path`", so absence — not {} — is the only valid
+	// "no override" wire form, and a nil *struct is what omitempty treats as empty.
+	VsockOverride *struct {
+		UDSPath string `json:"uds_path"`
+	} `json:"vsock_override,omitempty"`
 }
 
 // LoadSnapshot restores a VM from vmstate/memfile. vmstate and memfile are paths AS
 // SEEN BY FIRECRACKER — i.e. inside its jail, not host paths — since the process is
 // chrooted by the jailer by the time this is called.
 func (c *fcClient) LoadSnapshot(ctx context.Context, vmstate, memfile string) error {
-	req := loadSnapshotRequest{SnapshotPath: vmstate, VsockOverride: c.vsockOverride}
+	req := loadSnapshotRequest{SnapshotPath: vmstate}
 	req.MemBackend.BackendPath = memfile
 	req.MemBackend.BackendType = "File"
+	if c.vsockOverride != "" {
+		req.VsockOverride = &struct {
+			UDSPath string `json:"uds_path"`
+		}{UDSPath: c.vsockOverride}
+	}
 	return c.do(ctx, http.MethodPut, "/snapshot/load", req)
 }
 
