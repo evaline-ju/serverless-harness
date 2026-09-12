@@ -15,6 +15,17 @@
 #                      swap, kernel new enough for what the VMM needs. Restore
 #                      requires identical hardware and software (spec §2.4), so the
 #                      snapshot is built on the target instance type, not cross-built.
+#                      For --vmm cloud-hypervisor specifically, also confirms the
+#                      supplied --kernel was actually built with virtio-fs support
+#                      (CONFIG_VIRTIO_FS): Firecracker's own CI kernels do not carry
+#                      it (Firecracker has no virtio-fs, so its kernel config has no
+#                      reason to enable the driver), and a snapshot built against
+#                      such a kernel would boot and quiesce fine, then fail much
+#                      later as a lost write once a real Exec tries to use the
+#                      workspace share -- exactly the empty-workspace symptom this
+#                      check exists to catch at build time instead. See fix-round-
+#                      12's virtio-fs preflight block, below, for the detection
+#                      method and why the Firecracker arm has no inverse check.
 #   2. build_agent  -- the guest agent, static (CGO_ENABLED=0), because the rootfs
 #                      is minimal and a dynamically-linked agent would need a libc
 #                      the image may not carry.
@@ -30,7 +41,14 @@
 #                      the capabilities probed INSIDE the guest before snapshotting,
 #                      and the three component digests + their combined hash, in the
 #                      exact kernel/rootfs/agent order vmpool.Manifest.ComputeHash
-#                      hashes them in.
+#                      hashes them in. kernel_sha256 is expected to legitimately
+#                      DIFFER between a firecracker-arm and a cloud-hypervisor-arm
+#                      manifest for the same --image: the two arms need different
+#                      kernels (see preflight's virtio-fs check, item 1 above, and
+#                      fix-round-12's report section), so any A/B measurement
+#                      between the two arms is a VMM-PLUS-KERNEL swap, not a pure
+#                      VMM swap -- a caveat for the experiment write-up (Tasks
+#                      20/21), not a defect in this script.
 #   6. lock_down    -- root-owned, read-only. Only a 64-bit CRC guards vmstate and the
 #                      VMM trusts these files (spec §2.4); the filesystem permissions
 #                      are the next line of defence after that.
@@ -155,7 +173,7 @@ STAGE="$(mktemp -d "${TMPDIR:-/tmp}/build-snapshot.XXXXXX")"
 # the ones that "worked" up to this round only did so by luck of where the real
 # failure happened to land.
 #
-# The fix: nothing this trap touches is ever a function local. These three are
+# The fix: nothing this trap touches is ever a function local. These four are
 # script-scope, set (never `local`-shadowed anywhere in this file) by whichever
 # phase is currently live, and reset back to "" by that same phase once its own
 # normal-path teardown has already run -- so cleanup_on_exit only re-does work
@@ -166,18 +184,31 @@ STAGE="$(mktemp -d "${TMPDIR:-/tmp}/build-snapshot.XXXXXX")"
 CLEANUP_PID=""       # pid of the currently-running VMM subprocess, if any
 CLEANUP_JAIL=""       # jail directory with an active /dev bind-mount, if any
 CLEANUP_EXTRA_DIR=""  # extra directory (beyond $STAGE) to remove, if any
+# Fix-round-12: pid of the currently-running build-time virtiofsd, if any -- a
+# SECOND backgrounded process a cloud-hypervisor jail can now have, alongside
+# CLEANUP_PID's VMM. Kept as its own named global rather than folded into
+# CLEANUP_PID/teardown_jail because the two processes have a required teardown
+# ORDER (VMM before virtiofsd, never the reverse -- see teardown_virtiofsd's own
+# comment), which a single shared pid variable cannot express.
+CLEANUP_FS_PID=""
 
 cleanup_on_exit() {
   # Runs once, however deep whatever phase was mid-flight when the script exited
   # happened to be. Every name referenced here is either this function's OWN
   # local (declared and consumed within this one invocation, so it can never be
   # popped out from under itself the way the old per-function traps were) or one
-  # of the three script-scope globals above. The ${VAR:-} defaults are
+  # of the four script-scope globals above. The ${VAR:-} defaults are
   # belt-and-braces -- set -u never actually needs them for a global that is
   # always assigned above -- so that a future global added the same way without
   # the default does not quietly reintroduce this bug's class.
   kill "${CLEANUP_PID:-}" 2>/dev/null || true
   wait "${CLEANUP_PID:-}" 2>/dev/null || true
+  # Fix-round-12: reap the build-time virtiofsd, if any, AFTER the VMM above --
+  # same order teardown_virtiofsd documents and launcher_chv.go's Destroy already
+  # uses ("VMM first, then virtiofsd"), kept here too since this trap can fire
+  # mid-flight, before either phase's own normal-path teardown call has run.
+  kill "${CLEANUP_FS_PID:-}" 2>/dev/null || true
+  wait "${CLEANUP_FS_PID:-}" 2>/dev/null || true
   if [ -n "${CLEANUP_JAIL:-}" ]; then
     jail_unmount_dev "$CLEANUP_JAIL"
   fi
@@ -333,6 +364,58 @@ preflight() {
   if ! kernel_at_least "$release" "5.18"; then
     echo "build-snapshot.sh: kernel $release is older than the minimum 5.18" >&2
     exit 1
+  fi
+
+  # Fix-round-12: cloud-hypervisor only, no inverse check on the firecracker arm.
+  # Firecracker has no virtio-fs support at all, so absence of CONFIG_VIRTIO_FS
+  # in a firecracker-arm --kernel is simply irrelevant there. The cloud-hypervisor
+  # arm's whole reason to exist (spec §4.3, workspace shared over virtio-fs
+  # instead of serialized per-run) depends on the GUEST kernel actually having the
+  # driver; --fs on the cloud-hypervisor command line only creates the DEVICE, it
+  # does not make the guest able to mount it. Firecracker's own CI kernels (the
+  # ones every build so far has pointed --kernel at) are built without the driver
+  # -- there is no reason for a Firecracker-oriented kernel config to carry it --
+  # so pointing the cloud-hypervisor arm at one of those kernels would boot and
+  # quiesce fine, then fail much later and confusingly, as a lost write, the
+  # first time a real Exec tries to use the workspace share. Catch it here
+  # instead, at build time, naming the kernel and what is missing.
+  #
+  # Detection: `strings | grep -c virtio_fs`, hardware-validated against two real
+  # kernel images -- 0 hits on a Firecracker CI kernel, 68 on cloud-hypervisor's
+  # own recommended kernel -- which discriminates cleanly with no build tooling
+  # (no need for the kernel's own .config, which a prebuilt image often lacks)
+  # and no guest boot required. It is a string-presence heuristic, not a proof:
+  # false positives (a string mentioning virtio_fs without the driver built in)
+  # are possible in principle but were not seen on either rig kernel this was
+  # validated against.
+  if [ "$VMM" = "cloud-hypervisor" ]; then
+    if [ ! -r "$KERNEL" ]; then
+      echo "build-snapshot.sh: --kernel $KERNEL is missing or unreadable" >&2
+      exit 1
+    fi
+    if ! command -v strings >/dev/null 2>&1; then
+      echo "build-snapshot.sh: 'strings' is required to preflight a --vmm" >&2
+      echo "  cloud-hypervisor --kernel for virtio-fs support (binutils package)" >&2
+      exit 1
+    fi
+    local virtiofs_hits
+    virtiofs_hits="$(strings "$KERNEL" 2>/dev/null | grep -c 'virtio_fs' || true)"
+    if [ "${virtiofs_hits:-0}" -eq 0 ]; then
+      echo "build-snapshot.sh: --kernel $KERNEL has no virtio-fs support" >&2
+      echo "  (CONFIG_VIRTIO_FS): 'strings $KERNEL | grep -c virtio_fs' returned 0." >&2
+      echo "  --vmm cloud-hypervisor's whole point is a workspace shared over" >&2
+      echo "  virtio-fs (spec §4.3); a kernel without the driver will boot and" >&2
+      echo "  quiesce fine and only fail later, as a lost write, when a real Exec" >&2
+      echo "  tries to use /workspace." >&2
+      echo "  Firecracker's CI kernels (the ones the firecracker arm's --kernel" >&2
+      echo "  has been pointed at) do not carry this driver -- Firecracker has no" >&2
+      echo "  virtio-fs, so there is no reason for that kernel's config to enable" >&2
+      echo "  it. Use cloud-hypervisor's own recommended kernel instead (e.g. the" >&2
+      echo "  vmlinux built from https://github.com/cloud-hypervisor/cloud-hypervisor" >&2
+      echo "  docs' recommended config, which does enable CONFIG_VIRTIO_FS)." >&2
+      exit 1
+    fi
+    log "preflight: --kernel $KERNEL has virtio-fs support ($virtiofs_hits strings hits)"
   fi
 
   log "preflight: ok (kernel $release)"
@@ -802,14 +885,33 @@ api_patch() {
 # non-root/different-uid caller does not get a silent EACCES and mistake it
 # for the daemon simply not being up yet.
 wait_for_socket() {
-  local sock="$1" console_log="$2" timeout_s="${3:-5}"
+  local sock="$1" console_log="$2" timeout_s="${3:-5}" proto="${4:-http}"
   # 100ms poll interval -> timeout_s * 10 attempts.
   local attempts=$((timeout_s * 10))
   local i=0
+  # Fix-round-12: added the "raw" proto for virtiofsd's vhost-user socket, which
+  # does not speak HTTP the way the firecracker/cloud-hypervisor API sockets do
+  # (all 3 pre-existing call sites are unaffected -- they omit $4 and keep
+  # getting "http", unchanged). "raw" only checks that the socket file exists
+  # and is a socket (`[ -S ]`), the same protocol-agnostic check
+  # launcher_firecracker.go's own waitForUnixSocket does with a raw
+  # net.DialTimeout -- a plain existence check is weaker than an actual connect,
+  # but this host has no guaranteed nc/socat/python3 to dial a vhost-user socket
+  # with, and virtiofsd creates the socket file only once it is ready to accept
+  # the vhost-user handshake, so existence is already the meaningful signal.
   while [ "$i" -lt "$attempts" ]; do
-    if curl -s -S --unix-socket "$sock" -o /dev/null "http://localhost/" 2>/dev/null; then
-      return 0
-    fi
+    case "$proto" in
+      raw)
+        if [ -S "$sock" ]; then
+          return 0
+        fi
+        ;;
+      *)
+        if curl -s -S --unix-socket "$sock" -o /dev/null "http://localhost/" 2>/dev/null; then
+          return 0
+        fi
+        ;;
+    esac
     i=$((i + 1))
     sleep 0.1
   done
@@ -938,6 +1040,81 @@ teardown_jail() {
   jail_unmount_dev "$jail"
   rm -f "$jail"/run/*.sock.lock
   CLEANUP_JAIL=""
+}
+
+# Fix-round-12: shared by boot_quiesce_snapshot_cloud_hypervisor and
+# verify_restore_cloud_hypervisor (one implementation, N callers -- same
+# principle as prepare_jail/teardown_jail, wait_for_socket, and
+# save_and_print_console_log before it), rather than duplicating this
+# start/wait dance inline in both places.
+#
+# This is a BUILD-TIME virtiofsd, not the runtime one launcher_chv.go starts
+# per-run: it exists only so the golden snapshot's config.json (baked by
+# --fs, at the cloud-hypervisor invocation right after this call returns) has
+# a real virtio-fs device attached when cloud-hypervisor snapshots it. It
+# does NOT need to be the SAME virtiofsd process a real restore later talks
+# to -- launcher_chv.go's rewriteSnapshotConfig rewrites fs[].socket (never
+# fs[].tag) to point at whatever fresh virtiofsd IT starts at actual restore
+# time. Only the device and its tag need to survive into the snapshot; the
+# socket path baked in here is jail-relative and gone with this jail.
+#
+# Unlike the cloud-hypervisor/firecracker binaries, virtiofsd is never
+# hardlinked into the jail via hardlink_or_copy_bin: it is not chrooted at
+# all. It runs as an ordinary host process serving $jail/workspace over a
+# UDS that the chrooted cloud-hypervisor (started by the caller, right after
+# this function returns) connects to as a vhost-user CLIENT -- so it only
+# needs to resolve on PATH, the same bare-name-via-command-v convention this
+# script already uses for firecracker/cloud-hypervisor, not the fixed
+# /usr/libexec/virtiofsd default main.go's runtime flags fall back to.
+#
+# Runs as whatever this whole (already require_root'd) script runs as,
+# deliberately NOT privilege-dropped the way launcher_chv.go's runtime
+# virtiofsd is required to be (CHVOptions.validate() rejects UID/GID 0
+# there): that requirement exists to confine a MULTI-TENANT restore path
+# against a real per-run workspace directory. This build has exactly one
+# tenant -- itself -- so there is no second party here to confine against.
+# --sandbox=namespace (never --sandbox=none, which the plan doc rules out
+# outright) and --cache=never (not --cache=auto, which the installed
+# virtiofsd build disconnects the virtio-fs session under almost immediately
+# -- see launcher_chv_test.go's own TestVirtiofsdArgvCarriesItsSandbox and its
+# fix-round comment) match the runtime virtiofsd's own argv choices exactly;
+# only the privilege and jail/chroot treatment differ, and both differences
+# are explained above.
+start_workspace_virtiofsd() {
+  local jail="$1" console_log="$2"
+  local workspace_dir="$jail/workspace" sock="$jail/fs.sock"
+  command -v virtiofsd >/dev/null 2>&1 || {
+    echo "build-snapshot.sh: virtiofsd not found on PATH (required to bake a" >&2
+    echo "  virtio-fs device into a --vmm cloud-hypervisor golden snapshot)" >&2
+    exit 1
+  }
+  mkdir -p "$workspace_dir"
+  rm -f "$sock"
+  virtiofsd \
+    --socket-path="$sock" \
+    --shared-dir="$workspace_dir" \
+    --sandbox=namespace \
+    --cache=never \
+    </dev/null >/dev/null 2>&1 &
+  CLEANUP_FS_PID=$!
+  # "raw" proto: virtiofsd's vhost-user socket does not speak HTTP the way the
+  # firecracker/cloud-hypervisor API sockets wait_for_socket's other three
+  # call sites wait on do. See wait_for_socket's own fix-round-12 comment.
+  wait_for_socket "$sock" "$console_log" 5 raw
+}
+
+# Paired with start_workspace_virtiofsd above. Ordering is the caller's
+# responsibility, not this function's: cloud-hypervisor (the vhost-user
+# MASTER, connecting to virtiofsd's socket at its own startup) must be torn
+# down FIRST, virtiofsd (the vhost-user server) second -- the exact reverse of
+# start order, and the same "VMM first, then virtiofsd" order
+# launcher_chv.go's own Destroy already uses at real restore time. Both call
+# sites below call teardown_jail (which reaps CLEANUP_PID, the VMM) before
+# calling this function, never the other way around.
+teardown_virtiofsd() {
+  kill "${CLEANUP_FS_PID:-}" 2>/dev/null || true
+  wait "${CLEANUP_FS_PID:-}" 2>/dev/null || true
+  CLEANUP_FS_PID=""
 }
 
 # rm_rf_jail is a GUARDED rm -rf: before removing any of $@, it checks the host's
@@ -1148,9 +1325,28 @@ boot_quiesce_snapshot_cloud_hypervisor() {
   # serves it over virtio-fs via a separate virtiofsd daemon pointed at the
   # run's WorkspaceDir, so there is no workspace.img file for this script to
   # create or for the golden snapshot to embed. Neither the build nor the
-  # verify function for cloud-hypervisor stages a workspace image; that
-  # symmetry is correct.
-  prepare_jail cloud-hypervisor "$jail" "$jail/ch-snapshot"
+  # verify function for cloud-hypervisor stages a workspace image; that part
+  # of the original symmetry claim still holds.
+  #
+  # Fix-round-12: what is NOT symmetric with the firecracker arm any more is
+  # whether a workspace-serving device exists in the golden snapshot at all.
+  # Before this round, boot_quiesce_snapshot_cloud_hypervisor never passed
+  # --fs to cloud-hypervisor, so the snapshot's config.json had no virtio-fs
+  # device, and a restored guest's /workspace was empty -- the two §8 gates
+  # this fix-round exists to close (TestGateWriteDurability,
+  # TestGateNoCrossRunBleed). "$jail/workspace" is now an extra prepare_jail
+  # directory (parallel to "$jail/ch-snapshot") for start_workspace_virtiofsd,
+  # below, to serve.
+  prepare_jail cloud-hypervisor "$jail" "$jail/ch-snapshot" "$jail/workspace"
+
+  # Fix-round-12: virtiofsd must be up and its socket confirmed live BEFORE
+  # cloud-hypervisor starts -- cloud-hypervisor is virtio-fs's vhost-user
+  # MASTER and connects to virtiofsd's socket at its OWN startup (confirmed
+  # against launcher_chv.go's own restore-path ordering: fsCmd.Start(), then
+  # waitForUnixSocket on the fs socket, THEN vmmCmd.Start()). See
+  # start_workspace_virtiofsd's own comment for what this build-time daemon
+  # is for and is not for.
+  start_workspace_virtiofsd "$jail" "$console_log"
 
   log "starting cloud-hypervisor chrooted into $jail ($api_sock)"
   # Item 7: Cloud Hypervisor has no is_root_device-style flag the way Firecracker
@@ -1186,12 +1382,30 @@ boot_quiesce_snapshot_cloud_hypervisor() {
   # via a single PUT /api/v1/vm.restore call against the snapshotted
   # ch-config.json (see verify_restore_cloud_hypervisor's own comment on that
   # bare start for the source).
+  # Fix-round-12: --fs tag=workspace,socket=/fs.sock bakes a real virtio-fs
+  # device into this snapshot's config.json (schema confirmed against
+  # launcher_chv_test.go's own fixtures: tag/socket/num_queues/queue_size,
+  # num_queues and queue_size left to cloud-hypervisor's own defaults here).
+  # /fs.sock is jail-relative, same convention as --vsock's socket=/vsock.sock
+  # above (resolves on the host to "$jail/fs.sock", which
+  # start_workspace_virtiofsd, called just above, already listens on).
+  #
+  # The tag is "workspace" -- matching the in-guest mount point (/workspace),
+  # matching the firecracker arm's own workspace.img naming, and what a reader
+  # of `mount -t virtiofs workspace /workspace` would expect. This is the one
+  # and only place the tag is set on the build side; verify_restore_cloud_
+  # hypervisor never sets it directly because it restores the golden
+  # config.json verbatim, tag and all. NOT rewritten at real restore time
+  # either: launcher_chv.go's rewriteSnapshotConfig rewrites fs[].socket but
+  # never fs[].tag, so this literal is also what a real restore's rewritten
+  # config.json still carries.
   chroot "$jail" /cloud-hypervisor \
     --api-socket /run/ch-api.sock \
     --kernel /kernel \
     --cmdline "console=ttyS0 root=/dev/vda rw reboot=k panic=1" \
     --disk "path=/rootfs,readonly=on" \
     --vsock "cid=3,socket=/vsock.sock" \
+    --fs "tag=workspace,socket=/fs.sock" \
     --memory "size=${GUEST_RAM_MB}M" \
     --cpus boot=1 \
     --console "file=/console.log" \
@@ -1230,6 +1444,10 @@ boot_quiesce_snapshot_cloud_hypervisor() {
   mv "$jail/ch-snapshot/memory-ranges" "$STAGE/memfile"
 
   teardown_jail "$jail"
+  # Fix-round-12: VMM first (teardown_jail above reaps CLEANUP_PID), then
+  # virtiofsd -- see teardown_virtiofsd's own comment for why this order is
+  # not optional.
+  teardown_virtiofsd
 }
 
 boot_quiesce_snapshot() {
@@ -1457,7 +1675,13 @@ verify_restore_cloud_hypervisor() {
   # same argument, through the same helper, so the two can no longer
   # independently drift on whether ch-snapshot exists before ch-remote needs
   # it.
-  prepare_jail cloud-hypervisor "$jail" "$jail/ch-snapshot"
+  # Fix-round-12: "$jail/workspace" is a new extra prepare_jail directory,
+  # parallel to boot_quiesce_snapshot_cloud_hypervisor's own build-side call --
+  # the restored guest's config.json (replayed verbatim below, tag "workspace"
+  # included) declares a virtio-fs device, so this verify jail needs a
+  # virtiofsd of its own for cloud-hypervisor to connect to, the same as the
+  # build side did. See start_workspace_virtiofsd's own comment.
+  prepare_jail cloud-hypervisor "$jail" "$jail/ch-snapshot" "$jail/workspace"
   # Fix-round-7 item 1: hard-link via link_snapshot_file, not bare `ln` -- see
   # that function's comment for why a silent copy fallback is wrong here,
   # memfile (shipped here as memory-ranges) above all.
@@ -1469,6 +1693,14 @@ verify_restore_cloud_hypervisor() {
   link_snapshot_file "$OUT/ch-config.json" "$jail/ch-snapshot/config.json"
   link_snapshot_file "$OUT/vmstate" "$jail/ch-snapshot/state.json"
   link_snapshot_file "$OUT/memfile" "$jail/ch-snapshot/memory-ranges"
+
+  # Fix-round-12: same ordering requirement as the build side -- virtiofsd up
+  # and its socket confirmed live BEFORE cloud-hypervisor starts, since the
+  # restored config.json's fs[] device makes cloud-hypervisor try to connect
+  # to /fs.sock as soon as it starts. No --fs CLI flag needed here: the golden
+  # config.json (linked in above, replayed verbatim by vm.restore below)
+  # already carries the device, tag "workspace" included.
+  start_workspace_virtiofsd "$jail" "$console_log"
 
   chroot "$jail" /cloud-hypervisor --api-socket /run/verify-ch-api.sock \
     </dev/null >"$console_log" 2>&1 &
@@ -1496,6 +1728,10 @@ verify_restore_cloud_hypervisor() {
   local exit_code=0
   "$STAGE/guest_client" -uds "$vsock_uds" -port 1024 -timeout-s 30 -command true || exit_code=$?
   teardown_jail "$jail"
+  # Fix-round-12: VMM first (teardown_jail above), then virtiofsd -- see
+  # teardown_virtiofsd's own comment. Must run before rm_rf_jail: virtiofsd
+  # still has $jail/workspace open until it is killed.
+  teardown_virtiofsd
   rm_rf_jail "$verify_root"
   CLEANUP_EXTRA_DIR=""
   if [ "$exit_code" -ne 0 ]; then

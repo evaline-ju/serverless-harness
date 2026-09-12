@@ -938,5 +938,359 @@ check "hardlink_or_copy_bin, actually run against a symlinked PATH entry, produc
 check "...and that regular file's content matches the real binary the symlink pointed to" \
   "$hocb_ok_resolved_content" "yes"
 
+echo "== fix-round-12: cloud-hypervisor snapshot bakes a virtio-fs device (workspace shared, not empty)"
+# Real gap: TestGateWriteDurability and TestGateNoCrossRunBleed both failed on
+# the cloud-hypervisor arm because boot_quiesce_snapshot_cloud_hypervisor never
+# passed --fs to cloud-hypervisor -- the restored guest's config.json had no
+# virtio-fs device at all, so /workspace was empty on every restore. The tag is
+# fixed by the coordinator (not a choice made here) to "workspace": it matches
+# the in-guest mount point, the firecracker arm's own workspace.img naming, and
+# what a reader of `mount -t virtiofs workspace /workspace` would expect.
+live_lines="$(grep -v '^[[:space:]]*#' "$SCRIPT")"
+
+check "cloud-hypervisor build invocation passes --fs with a tag and a socket" \
+  "$([ "$(printf '%s\n' "$live_lines" | grep -cE -- '--fs "tag=[^,]+,socket=[^"]+"')" -ge 1 ] && echo yes || echo no)" "yes"
+
+# The literal tag, pinned as its own assertion (the contract made executable):
+# a rename on one side (this script's --fs vs. the guest-side mount the
+# coordinator is dispatching separately) must fail THIS test, not reproduce
+# the silent empty-workspace symptom the two §8 gates already caught once.
+check "the virtio-fs tag is the literal 'workspace' (coordinator-fixed, not a free choice)" \
+  "$([ "$(printf '%s\n' "$live_lines" | grep -cF -- '--fs "tag=workspace,socket=/fs.sock"')" -eq 1 ] && echo yes || echo no)" "yes"
+
+# verify_restore_cloud_hypervisor must NOT set the tag itself -- it replays the
+# golden config.json verbatim (already carrying "workspace"), so a second,
+# independent --fs flag there would be drift waiting to happen, not a fix.
+ch_verify_start=$(grep -n "^verify_restore_cloud_hypervisor() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+ch_verify_end=""
+ch_verify_body=""
+if [ -n "$ch_verify_start" ]; then
+  ch_verify_end=$(awk -v s="$ch_verify_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$ch_verify_end" ]; then
+    ch_verify_body="$(sed -n "${ch_verify_start},${ch_verify_end}p" "$SCRIPT")"
+  fi
+fi
+check "verify_restore_cloud_hypervisor never passes its own --fs flag (replays the golden config.json's tag verbatim)" \
+  "$(printf '%s\n' "$ch_verify_body" | grep -v '^[[:space:]]*#' | grep -cF -- '--fs ')" "0"
+
+echo "== fix-round-12: start_workspace_virtiofsd / teardown_virtiofsd -- one implementation, shared by build and verify"
+check "start_workspace_virtiofsd helper exists" \
+  "$([ "$(grep -c '^start_workspace_virtiofsd() {' "$SCRIPT")" -eq 1 ] && echo yes || echo no)" "yes"
+check "teardown_virtiofsd helper exists" \
+  "$([ "$(grep -c '^teardown_virtiofsd() {' "$SCRIPT")" -eq 1 ] && echo yes || echo no)" "yes"
+
+swf_start=$(grep -n "^start_workspace_virtiofsd() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+swf_body=""
+if [ -n "$swf_start" ]; then
+  swf_end=$(awk -v s="$swf_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$swf_end" ]; then
+    swf_body="$(sed -n "${swf_start},${swf_end}p" "$SCRIPT")"
+  fi
+fi
+
+check "start_workspace_virtiofsd guards on virtiofsd being present on PATH (command -v)" \
+  "$([ "$(printf '%s\n' "$swf_body" | grep -cF 'command -v virtiofsd')" -ge 1 ] && echo yes || echo no)" "yes"
+check "start_workspace_virtiofsd passes --cache=never" \
+  "$([ "$(printf '%s\n' "$swf_body" | grep -cF -- '--cache=never')" -ge 1 ] && echo yes || echo no)" "yes"
+check "start_workspace_virtiofsd never passes --cache=auto (disconnects the session almost immediately on this host)" \
+  "$(printf '%s\n' "$swf_body" | grep -cF -- '--cache=auto')" "0"
+check "start_workspace_virtiofsd passes --sandbox=namespace" \
+  "$([ "$(printf '%s\n' "$swf_body" | grep -cF -- '--sandbox=namespace')" -ge 1 ] && echo yes || echo no)" "yes"
+check "start_workspace_virtiofsd never passes --sandbox=none" \
+  "$(printf '%s\n' "$swf_body" | grep -cF -- '--sandbox=none')" "0"
+
+# Source-order guard within start_workspace_virtiofsd itself: virtiofsd must be
+# backgrounded (CLEANUP_FS_PID=\$!) before wait_for_socket is asked to block on
+# its socket, and the wait call must use the "raw" proto -- virtiofsd's
+# vhost-user socket does not speak HTTP the way the API sockets do.
+ok=no
+if [ -n "$swf_body" ]; then
+  bg_line=$(printf '%s\n' "$swf_body" | grep -nF 'CLEANUP_FS_PID=$!' | head -n1 | cut -d: -f1)
+  wait_line=$(printf '%s\n' "$swf_body" | grep -nF 'wait_for_socket "$sock" "$console_log" 5 raw' | head -n1 | cut -d: -f1)
+  if [ -n "$bg_line" ] && [ -n "$wait_line" ] && [ "$bg_line" -lt "$wait_line" ]; then
+    ok=yes
+  fi
+fi
+check "start_workspace_virtiofsd backgrounds virtiofsd, then waits for its socket in raw mode" "$ok" "yes"
+
+twf_start=$(grep -n "^teardown_virtiofsd() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+twf_body=""
+if [ -n "$twf_start" ]; then
+  twf_end=$(awk -v s="$twf_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$twf_end" ]; then
+    twf_body="$(sed -n "${twf_start},${twf_end}p" "$SCRIPT")"
+  fi
+fi
+check "teardown_virtiofsd kills and waits on \$CLEANUP_FS_PID" \
+  "$([ "$(printf '%s\n' "$twf_body" | grep -cF 'CLEANUP_FS_PID')" -ge 2 ] && echo yes || echo no)" "yes"
+check "teardown_virtiofsd clears CLEANUP_FS_PID afterwards" \
+  "$([ "$(printf '%s\n' "$twf_body" | grep -cF 'CLEANUP_FS_PID=""')" -eq 1 ] && echo yes || echo no)" "yes"
+
+echo "== fix-round-12: ordering -- virtiofsd up before the VMM starts, VMM torn down before virtiofsd"
+# Both cloud-hypervisor functions must start virtiofsd before backgrounding
+# cloud-hypervisor (CLEANUP_PID=\$!), and must call teardown_jail (which reaps
+# the VMM) before teardown_virtiofsd -- the exact reverse of start order, and
+# the order launcher_chv.go's own Destroy already uses.
+for fn in boot_quiesce_snapshot_cloud_hypervisor verify_restore_cloud_hypervisor; do
+  fn_start=$(grep -n "^${fn}() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+  ok_start_order=no
+  ok_teardown_order=no
+  if [ -n "$fn_start" ]; then
+    fn_end=$(awk -v s="$fn_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+    if [ -n "$fn_end" ]; then
+      swf_call_line=$(awk -v s="$fn_start" -v e="$fn_end" \
+        'NR>=s && NR<=e && /start_workspace_virtiofsd "\$jail" "\$console_log"/{print NR; exit}' "$SCRIPT")
+      cleanup_pid_line=$(awk -v s="$fn_start" -v e="$fn_end" \
+        'NR>=s && NR<=e && /CLEANUP_PID=\$!/{print NR; exit}' "$SCRIPT")
+      if [ -n "$swf_call_line" ] && [ -n "$cleanup_pid_line" ] && [ "$swf_call_line" -lt "$cleanup_pid_line" ]; then
+        ok_start_order=yes
+      fi
+      teardown_jail_line=$(awk -v s="$fn_start" -v e="$fn_end" \
+        'NR>=s && NR<=e && /^  teardown_jail "\$jail"$/{print NR; exit}' "$SCRIPT")
+      teardown_fs_line=$(awk -v s="$fn_start" -v e="$fn_end" \
+        'NR>=s && NR<=e && /^  teardown_virtiofsd$/{print NR; exit}' "$SCRIPT")
+      if [ -n "$teardown_jail_line" ] && [ -n "$teardown_fs_line" ] && [ "$teardown_jail_line" -lt "$teardown_fs_line" ]; then
+        ok_teardown_order=yes
+      fi
+    fi
+  fi
+  check "$fn starts virtiofsd before backgrounding the VMM" "$ok_start_order" "yes"
+  check "$fn tears down the VMM (teardown_jail) before virtiofsd (teardown_virtiofsd)" "$ok_teardown_order" "yes"
+done
+
+echo "== fix-round-12: cleanup_on_exit also reaps the build-time virtiofsd on an abnormal exit"
+coe_start=$(grep -n "^cleanup_on_exit() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+coe_body=""
+if [ -n "$coe_start" ]; then
+  coe_end=$(awk -v s="$coe_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$coe_end" ]; then
+    coe_body="$(sed -n "${coe_start},${coe_end}p" "$SCRIPT")"
+  fi
+fi
+ok=no
+if [ -n "$coe_body" ]; then
+  vmm_kill_line=$(printf '%s\n' "$coe_body" | grep -nF 'kill "${CLEANUP_PID:-}"' | head -n1 | cut -d: -f1)
+  fs_kill_line=$(printf '%s\n' "$coe_body" | grep -nF 'kill "${CLEANUP_FS_PID:-}"' | head -n1 | cut -d: -f1)
+  if [ -n "$vmm_kill_line" ] && [ -n "$fs_kill_line" ] && [ "$vmm_kill_line" -lt "$fs_kill_line" ]; then
+    ok=yes
+  fi
+fi
+check "cleanup_on_exit's trap reaps CLEANUP_FS_PID too, VMM first" "$ok" "yes"
+
+echo "== fix-round-12: --vmm cloud-hypervisor preflight requires a --kernel with virtio-fs support"
+# Coordinator's own rig-validated detection: strings | grep -c virtio_fs
+# discriminated cleanly (0 on a Firecracker CI kernel, 68 on cloud-hypervisor's
+# own recommended kernel) with no build tooling and no guest boot required.
+# Gated on --vmm cloud-hypervisor only -- Firecracker has no virtio-fs support
+# at all, so there is deliberately no inverse/informational check on that arm.
+pf_start=$(grep -n "^preflight() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+check "preflight helper still exists" "$([ -n "$pf_start" ] && echo yes || echo no)" "yes"
+
+pf_end=""
+pf_body=""
+if [ -n "$pf_start" ]; then
+  pf_end=$(awk -v s="$pf_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$pf_end" ]; then
+    pf_body="$(sed -n "${pf_start},${pf_end}p" "$SCRIPT")"
+  fi
+fi
+
+# Scoped to preflight()'s own body, not the whole script: lock_down() has its
+# own, unrelated "if [ \"\$VMM\" = \"cloud-hypervisor\" ]; then" (it decides
+# whether to ship ch-config.json), which is a false-positive match for a
+# whole-script grep and would make this check fail even when preflight's own
+# gating is exactly right.
+check "preflight's virtio-fs check is gated on cloud-hypervisor, and appears exactly once" \
+  "$([ "$(printf '%s\n' "$pf_body" | grep -cE '^  if \[ "\$VMM" = "cloud-hypervisor" \]; then$')" -eq 1 ] && echo yes || echo no)" "yes"
+
+check "no unconditional or firecracker-gated virtio-fs kernel check exists within preflight (no inverse check on that arm)" \
+  "$([ "$(printf '%s\n' "$pf_body" | grep -cE '^  if \[ "\$VMM" = "firecracker" \]; then$')" -eq 0 ] && echo yes || echo no)" "yes"
+
+check "preflight's kernel-version check runs before the virtio-fs check (both apply regardless of order, but keep the general gate first)" \
+  "$([ "$(printf '%s\n' "$pf_body" | grep -nF 'kernel_at_least' | head -n1 | cut -d: -f1)" -lt "$(printf '%s\n' "$pf_body" | grep -nE '\[ "\$VMM" = "cloud-hypervisor" \]; then' | head -n1 | cut -d: -f1)" ] && echo yes || echo no)" "yes"
+
+check "the virtio-fs preflight message names CONFIG_VIRTIO_FS, the --kernel path, and the strings/grep command it ran" \
+  "$([ "$(printf '%s\n' "$pf_body" | grep -cF 'CONFIG_VIRTIO_FS')" -ge 1 ] && [ "$(printf '%s\n' "$pf_body" | grep -cF 'strings $KERNEL | grep -c virtio_fs')" -ge 1 ] && echo yes || echo no)" "yes"
+check "the virtio-fs preflight message tells the operator Firecracker CI kernels do not carry the driver" \
+  "$([ "$(printf '%s\n' "$pf_body" | grep -cF "Firecracker's CI kernels")" -ge 1 ] && echo yes || echo no)" "yes"
+check "the virtio-fs preflight message directs the operator to cloud-hypervisor's own recommended kernel" \
+  "$([ "$(printf '%s\n' "$pf_body" | grep -cF 'recommended kernel')" -ge 1 ] && echo yes || echo no)" "yes"
+
+check "the virtio-fs preflight distinguishes a missing/unreadable --kernel from a kernel merely lacking the driver" \
+  "$([ "$(printf '%s\n' "$pf_body" | grep -cF 'is missing or unreadable')" -eq 1 ] && echo yes || echo no)" "yes"
+check "the virtio-fs preflight requires the 'strings' tool and names the binutils package if absent" \
+  "$([ "$(printf '%s\n' "$pf_body" | grep -cF "'strings' is required")" -eq 1 ] && [ "$(printf '%s\n' "$pf_body" | grep -cF 'binutils')" -eq 1 ] && echo yes || echo no)" "yes"
+
+# Behavioral assertion, not just source inspection: extract the virtio-fs
+# if-block's own source (same extraction-and-sourcing pattern already used for
+# hardlink_or_copy_bin) and actually RUN it, inside a stub function, against
+# three synthetic --kernel files and one PATH-stripped environment, asserting
+# real exit codes and real stderr content -- not merely that the right grep
+# strings appear somewhere in the script.
+# Anchored on the unique fix-round-12 comment that immediately precedes the
+# block, then takes the first "if [" line after it -- NOT a grep for the
+# literal `if [ "$VMM" = "cloud-hypervisor" ]; then` text itself. A literal-
+# text match is fragile in exactly the way this behavioral extraction is
+# meant to guard against: if a future edit renamed/restructured that one
+# arm's gate condition, a bare-text grep would find zero matches at this
+# (now-changed) block and silently fall through to whatever OTHER line in
+# the script happens to read `if [ "$VMM" = "cloud-hypervisor" ]; then`
+# verbatim (there is at least one, unrelated, elsewhere in the manifest-file
+# list logic) -- extracting and running the WRONG block while still
+# reporting "ok" on assertions that merely check "did $vfs_rc come back 0",
+# because the wrong block also happens to no-op harmlessly for a firecracker
+# scenario. Confirmed via mutation testing: inverting the real gate's
+# condition text reproduced exactly this silent wrong-block fallthrough
+# before this anchor fix.
+vfs_anchor_line=$(grep -n '^  # Fix-round-12: cloud-hypervisor only, no inverse check on the firecracker arm\.$' "$SCRIPT" | head -n1 | cut -d: -f1)
+vfs_block_start=""
+if [ -n "$vfs_anchor_line" ]; then
+  vfs_block_start=$(awk -v s="$vfs_anchor_line" 'NR>s && /^  if \[/{print NR; exit}' "$SCRIPT")
+fi
+vfs_block_body=""
+if [ -n "$vfs_block_start" ]; then
+  vfs_block_end=$(awk -v s="$vfs_block_start" 'NR>s && /^  fi$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$vfs_block_end" ]; then
+    vfs_block_body="$(sed -n "${vfs_block_start},${vfs_block_end}p" "$SCRIPT")"
+  fi
+fi
+
+vfs_ok_no_driver=no
+vfs_ok_no_driver_stderr_1=no
+vfs_ok_no_driver_stderr_2=no
+vfs_ok_has_driver=no
+vfs_ok_missing_kernel=no
+vfs_ok_no_strings=no
+vfs_ok_firecracker_skips=no
+# Scenarios 3 and 4 below exercise the virtio_fs *content* check, which needs
+# a real `strings` binary on THIS test-runner's own PATH (not the deliberately
+# PATH-stripped subshell scenario 5 uses) -- a plain minimal container image
+# (e.g. ubuntu:22.04 with no binutils installed) commonly lacks it. Skip those
+# two scenarios' assertions rather than reporting a false FAIL that is really
+# "this harness has no strings/binutils", same treatment this file already
+# gives shellcheck above when it is not installed.
+vfs_host_has_strings=no
+command -v strings >/dev/null 2>&1 && vfs_host_has_strings=yes
+if [ "$vfs_host_has_strings" = "no" ]; then
+  echo "  (skipping the two virtio_fs-content scenarios: 'strings' is not on this test runner's own PATH; install binutils to exercise them)"
+fi
+if [ -n "$vfs_block_body" ]; then
+  vfs_tmpdir="$(mktemp -d)"
+  vfs_no_driver_kernel="$vfs_tmpdir/fc-kernel.bin"
+  printf 'not a real kernel, no matching strings here\n' >"$vfs_no_driver_kernel"
+  vfs_has_driver_kernel="$vfs_tmpdir/ch-kernel.bin"
+  { for _ in $(seq 1 68); do printf 'virtio_fs\n'; done; } >"$vfs_has_driver_kernel"
+  vfs_missing_kernel="$vfs_tmpdir/does-not-exist.bin"
+
+  vfs_snippet="$vfs_tmpdir/vfs_check.sh"
+  {
+    echo 'log() { :; }'
+    echo 'run_vfs_check() {'
+    printf '%s\n' "$vfs_block_body"
+    echo '}'
+  } >"$vfs_snippet"
+
+  # 1) firecracker arm: the block must not even engage.
+  (
+    VMM="firecracker"; KERNEL="$vfs_missing_kernel"
+    # VMM/KERNEL are read by the dynamically sourced snippet below, invisible
+    # to shellcheck's static analysis -- : "marks" them read so SC2034
+    # ("appears unused") does not fire; a plain disable comment is not
+    # reliable here (it only suppresses the FIRST same-line/-code warning,
+    # and its effect on a later statement can depend on what else is in the
+    # subshell -- see scenario 5, which needed this same fix).
+    : "$VMM" "$KERNEL"
+    # shellcheck disable=SC1090
+    . "$vfs_snippet"
+    run_vfs_check
+  ) >/dev/null 2>&1
+  vfs_rc=$?
+  [ "$vfs_rc" -eq 0 ] && vfs_ok_firecracker_skips=yes
+
+  # 2) cloud-hypervisor arm, kernel path does not exist: distinct "missing or
+  #    unreadable" message, not "no virtio-fs support".
+  vfs_out="$(
+    (
+      VMM="cloud-hypervisor"; KERNEL="$vfs_missing_kernel"
+      : "$VMM" "$KERNEL"  # see scenario 1's comment above
+      # shellcheck disable=SC1090
+      . "$vfs_snippet"
+      run_vfs_check
+    ) 2>&1
+  )"
+  vfs_rc=$?
+  if [ "$vfs_rc" -ne 0 ] && printf '%s' "$vfs_out" | grep -qF 'missing or unreadable'; then
+    vfs_ok_missing_kernel=yes
+  fi
+
+  # 3) cloud-hypervisor arm, kernel with no virtio_fs strings: fails, names
+  #    CONFIG_VIRTIO_FS and Firecracker's CI kernels. Needs a real `strings`
+  #    on this test runner's PATH -- see vfs_host_has_strings above.
+  if [ "$vfs_host_has_strings" = "yes" ]; then
+    vfs_out="$(
+      (
+        VMM="cloud-hypervisor"; KERNEL="$vfs_no_driver_kernel"
+        : "$VMM" "$KERNEL"  # see scenario 1's comment above
+        # shellcheck disable=SC1090
+        . "$vfs_snippet"
+        run_vfs_check
+      ) 2>&1
+    )"
+    vfs_rc=$?
+    if [ "$vfs_rc" -ne 0 ]; then
+      vfs_ok_no_driver=yes
+    fi
+    printf '%s' "$vfs_out" | grep -qF 'CONFIG_VIRTIO_FS' && vfs_ok_no_driver_stderr_1=yes
+    printf '%s' "$vfs_out" | grep -qF 'Firecracker' && vfs_ok_no_driver_stderr_2=yes
+
+    # 4) cloud-hypervisor arm, kernel WITH virtio_fs strings: passes (exit 0).
+    (
+      VMM="cloud-hypervisor"; KERNEL="$vfs_has_driver_kernel"
+      : "$VMM" "$KERNEL"  # see scenario 1's comment above
+      # shellcheck disable=SC1090
+      . "$vfs_snippet"
+      run_vfs_check
+    ) >/dev/null 2>&1
+    vfs_rc=$?
+    [ "$vfs_rc" -eq 0 ] && vfs_ok_has_driver=yes
+  fi
+
+  # 5) cloud-hypervisor arm, 'strings' unavailable on PATH: distinct failure
+  #    naming the binutils package, not misreported as "no virtio-fs support".
+  vfs_out="$(
+    (
+      # PATH is deliberately overridden here (not appended to) so
+      # command -v strings fails inside the sourced snippet, exercising the
+      # preflight's own "'strings' is required" guard.
+      # shellcheck disable=SC2123
+      PATH="/nonexistent-vfs-test-path"
+      VMM="cloud-hypervisor"; KERNEL="$vfs_has_driver_kernel"
+      : "$VMM" "$KERNEL"  # see scenario 1's comment above
+      # shellcheck disable=SC1090
+      . "$vfs_snippet"
+      run_vfs_check
+    ) 2>&1
+  )"
+  vfs_rc=$?
+  if [ "$vfs_rc" -ne 0 ] && printf '%s' "$vfs_out" | grep -qF 'binutils'; then
+    vfs_ok_no_strings=yes
+  fi
+
+  rm -rf "$vfs_tmpdir"
+fi
+check "virtio-fs preflight check, actually run: firecracker arm never engages it (exits 0 even with a bogus --kernel)" "$vfs_ok_firecracker_skips" "yes"
+check "virtio-fs preflight check, actually run: a missing --kernel file fails with 'missing or unreadable'" "$vfs_ok_missing_kernel" "yes"
+if [ "$vfs_host_has_strings" = "yes" ]; then
+  check "virtio-fs preflight check, actually run: a kernel with no virtio_fs strings fails (exit != 0)" "$vfs_ok_no_driver" "yes"
+  check "...and that failure names CONFIG_VIRTIO_FS" "$vfs_ok_no_driver_stderr_1" "yes"
+  check "...and that failure names Firecracker's CI kernels as the likely cause" "$vfs_ok_no_driver_stderr_2" "yes"
+  check "virtio-fs preflight check, actually run: a kernel with virtio_fs strings passes (exit 0)" "$vfs_ok_has_driver" "yes"
+fi
+check "virtio-fs preflight check, actually run: 'strings' missing from PATH fails naming binutils" "$vfs_ok_no_strings" "yes"
+
+echo "== fix-round-12: the A/B is a VMM-plus-kernel swap, not a pure VMM swap (recorded for the Task 20/21 write-up)"
+check "the manifest or a header comment records that the two VMM arms use different kernels (caveat for any A/B comparison)" \
+  "$([ "$(grep -ciF 'VMM-plus-kernel' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"
