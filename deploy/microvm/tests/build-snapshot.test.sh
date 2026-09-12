@@ -401,5 +401,41 @@ check "no bare 'rm -rf \"\$STAGE\"' trap remains anywhere in the script" \
 check "the top-level EXIT trap (armed before any jail exists) uses the guard" \
   "$([ "$(grep -cF 'rm_rf_jail "$STAGE"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 
+echo "== fix-round-6 item 1: /snapshot/create sends no resume_vm field"
+# resume_vm belongs to /snapshot/load's SnapshotLoadParams, not /snapshot/create's
+# SnapshotCreateParams -- confirmed against v1.17.0's firecracker.yaml, which lists
+# only snapshot_path, mem_file_path, snapshot_type and sync_snapshot_files as valid
+# fields on create, and against the real binary's own rejection of this exact
+# request on the rig ("unknown field `resume_vm`, expected one of `snapshot_type`,
+# `snapshot_path`, `mem_file_path`, `sync_snapshot_files`"). Pull out just the JSON
+# body line following the /snapshot/create call so this assertion cannot be
+# satisfied by resume_vm merely being absent from some unrelated line/comment.
+snapshot_create_body=$(awk '/\/snapshot\/create \\$/{getline; print; exit}' "$SCRIPT")
+check "a /snapshot/create call body was found" \
+  "$([ -n "$snapshot_create_body" ] && echo yes || echo no)" "yes"
+check "the /snapshot/create body contains no resume_vm field" \
+  "$(printf '%s' "$snapshot_create_body" | grep -c 'resume_vm')" "0"
+check "the /snapshot/create body still sets snapshot_type Full" \
+  "$(printf '%s' "$snapshot_create_body" | grep -cF '\"snapshot_type\":\"Full\"')" "1"
+
+echo "== fix-round-6 item 2: /snapshot/load's vsock_override is an object, not a bare string"
+# vsock_override is the VsockOverride schema (a JSON object with one required
+# property, uds_path), not a plain string -- confirmed against v1.17.0's
+# firecracker.yaml and against Firecracker's own docs/vsock.md "Unix Domain Socket
+# Renaming" section, whose worked example is
+# `"vsock_override": {"uds_path": "./v.sock.2"}`. This call had never executed
+# against the real binary before fix-round-6, so unlike item 1 this was caught by
+# audit rather than by a rig failure. Pull out just the JSON body line following
+# the /snapshot/load call for the same false-positive-avoidance reason as item 1.
+snapshot_load_body=$(awk '/\/snapshot\/load \\$/{getline; print; exit}' "$SCRIPT")
+check "a /snapshot/load call body was found" \
+  "$([ -n "$snapshot_load_body" ] && echo yes || echo no)" "yes"
+check "the /snapshot/load body's vsock_override is an object keyed by uds_path" \
+  "$(printf '%s' "$snapshot_load_body" | grep -cF '\"vsock_override\":{\"uds_path\":')" "1"
+check "the /snapshot/load body's vsock_override is not a bare string" \
+  "$(printf '%s' "$snapshot_load_body" | grep -cF '\"vsock_override\":\"')" "0"
+check "the /snapshot/load body still sets resume_vm true (valid here, unlike on create)" \
+  "$(printf '%s' "$snapshot_load_body" | grep -cF '\"resume_vm\":true')" "1"
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"

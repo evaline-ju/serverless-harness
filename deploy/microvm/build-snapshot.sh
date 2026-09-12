@@ -802,12 +802,23 @@ boot_quiesce_snapshot_firecracker() {
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
   quiesce_guest "$vsock_uds"
 
-  log "snapshotting (PATCH /vm to pause, then PUT /snapshot/create, resuming nothing afterwards)"
+  log "snapshotting (PATCH /vm to pause, then PUT /snapshot/create; the VM stays paused because create has no resume field at all)"
   # Fix-round-5 item 1: /vm has no PUT method in Firecracker's own spec -- see the
   # api_patch comment above for the real-binary evidence that settled this.
   api_patch "$api_sock" /vm '{"state":"Paused"}'
+  # Fix-round-6 item 1: resume_vm belongs to /snapshot/load's SnapshotLoadParams, not
+  # /snapshot/create's SnapshotCreateParams -- confirmed against v1.17.0's own
+  # firecracker.yaml, whose SnapshotCreateParams accepts only snapshot_path,
+  # mem_file_path, snapshot_type and sync_snapshot_files, and against the real
+  # binary's error text when this was run on the rig: "unknown field `resume_vm`,
+  # expected one of `snapshot_type`, `snapshot_path`, `mem_file_path`,
+  # `sync_snapshot_files`". The invariant this field used to spell out ("don't
+  # resume after snapshotting") is not lost by removing it: the VM is already
+  # paused by the PATCH /vm above, and /snapshot/create has no code path that
+  # would resume it -- resuming is something ONLY /snapshot/load's own resume_vm
+  # can do, on the restore side, not here.
   api_put "$api_sock" /snapshot/create \
-    "{\"snapshot_path\":\"/vmstate\",\"mem_file_path\":\"/memfile\",\"snapshot_type\":\"Full\",\"resume_vm\":false}"
+    "{\"snapshot_path\":\"/vmstate\",\"mem_file_path\":\"/memfile\",\"snapshot_type\":\"Full\"}"
 
   kill "$fc_pid" 2>/dev/null || true
   wait "$fc_pid" 2>/dev/null || true
@@ -1005,11 +1016,21 @@ verify_restore_firecracker() {
   # belongs to the separate /snapshot/create request. vsock_override lets the
   # vsock UDS path move between snapshot and restore; here it does not move
   # (both are /vsock.sock, jail-relative) but is still supplied to match the
-  # launcher's own restore call shape.
+  # launcher's own restore call shape. resume_vm IS a valid field here (unlike
+  # on /snapshot/create, see the fix-round-6 comment above) -- confirmed
+  # against v1.17.0's SnapshotLoadParams.
+  #
+  # Fix-round-6 item 2: vsock_override is an object ({"uds_path": ...}), not a
+  # bare string -- confirmed against v1.17.0's firecracker.yaml VsockOverride
+  # schema (single required property uds_path) and against Firecracker's own
+  # docs/vsock.md "Unix Domain Socket Renaming" section, whose worked example
+  # is `"vsock_override": {"uds_path": "./v.sock.2"}`. This call has never
+  # executed against the real binary before this round, so the wrong shape had
+  # not yet been caught the way the /snapshot/create bug was.
   api_put "$api_sock" /vsock \
     "{\"vsock_id\":\"vsock0\",\"guest_cid\":3,\"uds_path\":\"/vsock.sock\"}"
   api_put "$api_sock" /snapshot/load \
-    "{\"snapshot_path\":\"/vmstate\",\"mem_backend\":{\"backend_path\":\"/memfile\",\"backend_type\":\"File\"},\"vsock_override\":\"/vsock.sock\",\"resume_vm\":true}"
+    "{\"snapshot_path\":\"/vmstate\",\"mem_backend\":{\"backend_path\":\"/memfile\",\"backend_type\":\"File\"},\"vsock_override\":{\"uds_path\":\"/vsock.sock\"},\"resume_vm\":true}"
 
   local exit_code=0
   "$STAGE/guest_client" -uds "$vsock_uds" -port 1024 -timeout-s 30 -command true || exit_code=$?
