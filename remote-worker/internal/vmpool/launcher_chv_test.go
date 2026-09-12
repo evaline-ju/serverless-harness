@@ -73,6 +73,81 @@ func TestVirtiofsdArgvCarriesItsSandbox(t *testing.T) {
 	}
 }
 
+// TestRestorePreparesVirtiofsdOwnership covers fix round 1, item 1: Restore
+// must chown both paths virtiofsd needs (the run dir it binds its own socket
+// inside, and the workspace it must traverse into and serve) to the uid/gid
+// it drops to via SysProcAttr.Credential — otherwise the unprivileged posture
+// CHVOptions.VirtiofsdUID/GID's doc comment requires cannot actually start
+// (virtiofsd's own bind()/traversal hits EACCES the instant it runs).
+//
+// This cannot be tested against the real os.Chown without root (a non-root
+// test runner has neither CAP_CHOWN nor, generally, ownership of a freshly
+// created t.TempDir() under another uid) — stated explicitly, per this
+// round's own instruction, rather than adding an assertion that cannot fail.
+// What IS tested here, by substituting the indirected chvChown, is that
+// Restore's ownership-preparation step calls chown for exactly the run dir
+// and the workspace dir, with the configured (non-zero) uid/gid — not uid/gid
+// 0, and not skipped.
+func TestRestorePreparesVirtiofsdOwnership(t *testing.T) {
+	orig := chvChown
+	defer func() { chvChown = orig }()
+
+	type call struct {
+		path     string
+		uid, gid int
+	}
+	var calls []call
+	chvChown = func(path string, uid, gid int) error {
+		calls = append(calls, call{path, uid, gid})
+		return nil
+	}
+
+	opts := chvOpts(t)
+	runDir := t.TempDir()
+	workspaceDir := t.TempDir()
+	if err := chvPrepareVirtiofsdOwnership(runDir, workspaceDir, opts.VirtiofsdUID, opts.VirtiofsdGID); err != nil {
+		t.Fatalf("chvPrepareVirtiofsdOwnership: %v", err)
+	}
+
+	if len(calls) != 2 {
+		t.Fatalf("chvChown called %d times, want 2: %+v", len(calls), calls)
+	}
+	seen := map[string]bool{}
+	for _, c := range calls {
+		seen[c.path] = true
+		if c.uid == 0 || c.gid == 0 {
+			t.Errorf("chown %q to %d:%d — must never chown to root", c.path, c.uid, c.gid)
+		}
+		if c.uid != opts.VirtiofsdUID || c.gid != opts.VirtiofsdGID {
+			t.Errorf("chown %q to %d:%d, want %d:%d", c.path, c.uid, c.gid, opts.VirtiofsdUID, opts.VirtiofsdGID)
+		}
+	}
+	if !seen[runDir] {
+		t.Errorf("runDir %q was never chowned; got calls %+v", runDir, calls)
+	}
+	if !seen[workspaceDir] {
+		t.Errorf("workspaceDir %q was never chowned; got calls %+v", workspaceDir, calls)
+	}
+}
+
+// TestRestorePreparesVirtiofsdOwnershipPropagatesFailure covers the error
+// path: if the underlying chown fails (e.g. the real EACCES/EPERM a non-root
+// launcher process would hit trying to chown a path it does not own), that
+// failure must propagate rather than being swallowed — a silently-skipped
+// chown would reintroduce exactly the bug this fix closes.
+func TestRestorePreparesVirtiofsdOwnershipPropagatesFailure(t *testing.T) {
+	orig := chvChown
+	defer func() { chvChown = orig }()
+	chvChown = func(path string, uid, gid int) error {
+		return os.ErrPermission
+	}
+	opts := chvOpts(t)
+	err := chvPrepareVirtiofsdOwnership(t.TempDir(), t.TempDir(), opts.VirtiofsdUID, opts.VirtiofsdGID)
+	if err == nil {
+		t.Fatal("chvPrepareVirtiofsdOwnership swallowed a chown failure")
+	}
+}
+
 func TestCloudHypervisorRestoresPausedAndRunsOneCommand(t *testing.T) {
 	requireKVM(t)
 	if _, err := exec.LookPath(chvOpts(t).CHVBin); err != nil {

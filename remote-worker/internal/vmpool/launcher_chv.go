@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -165,6 +164,46 @@ func virtiofsdArgv(opts CHVOptions, sock, dir string) []string {
 	}
 }
 
+// chvChown is os.Chown, indirected so tests can verify Restore's ownership
+// preparation without needing the real syscall's privilege (CAP_CHOWN, or
+// already owning the target) that a non-root test runner has neither — see
+// TestRestorePreparesVirtiofsdOwnership.
+var chvChown = os.Chown
+
+// chvPrepareVirtiofsdOwnership chowns runDir and workspaceDir to uid:gid before
+// virtiofsd is spawned.
+//
+// Review finding (fix round 1, item 1): Restore creates runDir via
+// os.MkdirAll — owned by whatever this launcher process runs as — and then
+// drops virtiofsd to VirtiofsdUID/VirtiofsdGID via SysProcAttr.Credential
+// before exec (chvIsolateAndDropPrivileges). Without this chown, virtiofsd's
+// own bind() of its socket inside runDir fails with EACCES the instant it
+// starts, unless the launcher happens to already run as that uid — the
+// unprivileged posture CHVOptions.VirtiofsdUID's doc comment and validate()
+// exist to require was, before this fix, unable to actually start.
+// workspaceDir needs the same treatment for the same reason one level up:
+// virtiofsd must traverse into and serve it, so a directory it cannot enter
+// fails identically to a socket it cannot create.
+//
+// This does NOT reach workspaceDir's ANCESTORS. Firecracker's UID/GID needs no
+// analogous fix there because it only ever touches paths *inside* its own
+// jail (a directory tree it created and chowns as it goes, exactly like
+// runDir here); virtio-fs is different because virtiofsd serves req.WorkspaceDir
+// directly rather than a copy hardlinked under a launcher-owned root, so its
+// own ancestor chain is out of this launcher's control — it belongs to
+// whatever created WorkspaceDir (the pool/orchestration layer), the same class
+// of assumption this file already makes about RunDir's and SnapshotDir's own
+// parents being reachable.
+func chvPrepareVirtiofsdOwnership(runDir, workspaceDir string, uid, gid int) error {
+	if err := chvChown(runDir, uid, gid); err != nil {
+		return fmt.Errorf("chown run dir %s to %d:%d: %w", runDir, uid, gid, err)
+	}
+	if err := chvChown(workspaceDir, uid, gid); err != nil {
+		return fmt.Errorf("chown workspace dir %s to %d:%d: %w", workspaceDir, uid, gid, err)
+	}
+	return nil
+}
+
 // rewriteSnapshotConfig returns a copy of the golden snapshot's config.json with
 // its embedded vsock and (if present) virtio-fs socket paths replaced by
 // per-VM-unique ones.
@@ -234,9 +273,10 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 	}
 
 	var (
-		vmmCmd  *exec.Cmd
-		fsCmd   *exec.Cmd
-		console *os.File
+		vmmCmd    *exec.Cmd
+		fsCmd     *exec.Cmd
+		console   *os.File
+		fsConsole *os.File
 	)
 	// cleanup mirrors launcher_firecracker.go's Restore cleanup closure: kill
 	// whatever was already spawned (VMM first, then virtiofsd, per the brief and
@@ -262,25 +302,51 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 		if console != nil {
 			_ = console.Close()
 		}
+		if fsConsole != nil {
+			_ = fsConsole.Close()
+		}
 		if err := os.RemoveAll(runDir); err != nil {
 			errs = append(errs, fmt.Errorf("remove run dir %s: %w", runDir, err))
 		}
 		return errors.Join(errs...)
 	}
 
+	// Review finding (fix round 1, item 1): chown BOTH paths virtiofsd needs —
+	// the run dir it will bind its own socket inside, and the workspace it must
+	// traverse into and serve — to the uid/gid it is about to drop to. This must
+	// happen after runDir exists (MkdirAll above) and before fsCmd.Start() below;
+	// doing it any later leaves a window where virtiofsd's own bind()/traversal
+	// hits EACCES instead of finding a directory it can already enter. See
+	// chvPrepareVirtiofsdOwnership's doc comment for what this does and does not
+	// cover (workspaceDir's ancestors are out of scope here).
+	if err := chvPrepareVirtiofsdOwnership(runDir, req.WorkspaceDir, l.opts.VirtiofsdUID, l.opts.VirtiofsdGID); err != nil {
+		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: %w", req.ID, err), cleanup())
+	}
+
 	// --- virtiofsd, privileges dropped before exec (never run as root: see
-	// CHVOptions.VirtiofsdUID's doc comment and validate() above). ---
+	// CHVOptions.VirtiofsdUID's doc comment and validate() above). Its own
+	// stdout/stderr are captured to a file, not discarded (review finding, fix
+	// round 1, item 2): with output discarded, the exact EACCES failure item 1
+	// fixes would have surfaced as nothing but a bare socket timeout below —
+	// which is precisely the "secure configuration looks broken for no visible
+	// reason" trap hardware-corrections C2 warns against, the one that tempts a
+	// reader into "fixing" it by running virtiofsd as root instead. ---
 	fsSock := filepath.Join(runDir, "vfsd.sock")
 	fsArgv := virtiofsdArgv(l.opts, fsSock, req.WorkspaceDir)
 	fsCmd = exec.Command(l.opts.VirtiofsdBin, fsArgv...)
-	fsCmd.Stdout = io.Discard
-	fsCmd.Stderr = io.Discard
+	var err error
+	fsConsole, err = os.Create(filepath.Join(runDir, "virtiofsd.log"))
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: create virtiofsd console log: %w", req.ID, err), cleanup())
+	}
+	fsCmd.Stdout = fsConsole
+	fsCmd.Stderr = fsConsole
 	chvIsolateAndDropPrivileges(fsCmd, l.opts.VirtiofsdUID, l.opts.VirtiofsdGID)
 	if err := fsCmd.Start(); err != nil {
 		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: start virtiofsd: %w", req.ID, err), cleanup())
 	}
 	if err := waitForUnixSocket(ctx, fsSock, 5*time.Second); err != nil {
-		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: virtiofsd socket never appeared: %w", req.ID, err), cleanup())
+		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: virtiofsd socket never appeared: %s: %w", req.ID, chvReadConsole(fsConsole.Name()), err), cleanup())
 	}
 
 	// --- per-VM snapshot config: hardlink the two large golden files unchanged,
@@ -373,6 +439,7 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 		vsockPort: l.opts.VsockPort,
 		chRemote:  l.opts.ChRemoteBin,
 		console:   console,
+		fsConsole: fsConsole,
 	}, nil
 }
 
@@ -418,7 +485,8 @@ type chvVM struct {
 	vsockSock string
 	vsockPort uint32
 	chRemote  string
-	console   *os.File
+	console   *os.File // cloud-hypervisor's stdout/stderr
+	fsConsole *os.File // virtiofsd's stdout/stderr
 
 	mu        sync.Mutex
 	destroyed bool
@@ -478,7 +546,7 @@ func (v *chvVM) Destroy() error {
 		return nil
 	}
 	v.destroyed = true
-	vmmCmd, fsCmd, console := v.vmmCmd, v.fsCmd, v.console
+	vmmCmd, fsCmd, console, fsConsole := v.vmmCmd, v.fsCmd, v.console, v.fsConsole
 	v.mu.Unlock()
 
 	var errs []error
@@ -494,6 +562,9 @@ func (v *chvVM) Destroy() error {
 	}
 	if console != nil {
 		_ = console.Close()
+	}
+	if fsConsole != nil {
+		_ = fsConsole.Close()
 	}
 	if err := os.RemoveAll(v.runDir); err != nil {
 		errs = append(errs, fmt.Errorf("remove run dir %s: %w", v.runDir, err))
