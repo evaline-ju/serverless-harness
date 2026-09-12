@@ -9,43 +9,157 @@ caveat.
 Ten gates plus the static privilege pin. `gates_kvm_test.go` implements all ten;
 `gates_privilege_test.go` implements the privilege pin (needs no KVM, already existed).
 Four of the ten gates exercise the Pool's own bookkeeping against the **fake**
-launcher/clock (`internal/vmpool`'s existing test double) and need no KVM; the
-remaining six (plus the `real_launcher` half of `TestGateNoVMReuse`) require
-`/dev/kvm` and a built golden snapshot and were **not run** on this machine (a
-darwin workstation with no KVM). Every row below reflects only what actually ran —
-no PASS is recorded for a gate that did not execute against real hardware.
+launcher/clock (`internal/vmpool`'s existing test double) and need no KVM, and were
+run and verified directly by this task (mutation evidence below). The remaining six
+(plus the `real_launcher` half of `TestGateNoVMReuse`) require `/dev/kvm` and a built
+golden snapshot; this task's own environment is a darwin workstation with neither, so
+they were run on the rig by the fix-round-1 reviewer, on top of two fixes that landed
+after this task's initial commit (the CH snapshot-naming translation, `00f7c11`, and
+the guest-agent clock-latch removal below) plus the chroot/run-dir device fix in this
+round. That run is reported, not independently re-executed by this agent — see
+"Fix round 1" below for exactly what changed and why the rig run needed it.
 
-| Gate | Arm | Substrate | Date | Result |
-| --- | --- | --- | --- | --- |
-| `TestGateEmptyKeyIsRefused` | n/a (pre-Acquire refusal) | fake launcher + fake clock | 2026-09-12 | PASS |
-| `TestGateNoVMReuse` (`fake_launcher_concurrency` subtest) | n/a | fake launcher + fake clock | 2026-09-12 | PASS |
-| `TestGateParkedThenResumed` | n/a | fake launcher + fake clock | 2026-09-12 | PASS |
-| `TestGateReclaimThenRedispatch` | n/a | fake launcher + fake clock | 2026-09-12 | PASS |
-| `TestGateNoVMReuse` (`real_launcher` subtest) | firecracker / cloud-hypervisor | real KVM | — | NOT RUN — needs `/dev/kvm`; see rig command below |
-| `TestGateWriteDurability` | firecracker / cloud-hypervisor | real KVM | — | NOT RUN — needs `/dev/kvm` and a built golden snapshot |
-| `TestGateNoCrossRunBleed` | firecracker / cloud-hypervisor | real KVM | — | NOT RUN — needs `/dev/kvm` and a built golden snapshot |
-| `TestGateSnapshotHoldsNoSecrets` | firecracker / cloud-hypervisor | real KVM | — | NOT RUN — needs `/dev/kvm` and a built golden snapshot |
-| `TestGateLeakFreeTeardown` | firecracker / cloud-hypervisor | real KVM | — | NOT RUN — needs `/dev/kvm` and a built golden snapshot |
-| `TestGateClock` | firecracker / cloud-hypervisor | real KVM | — | NOT RUN — needs `/dev/kvm` and a built golden snapshot |
-| `TestGateOutputCapAtSource` | firecracker / cloud-hypervisor | real KVM | — | NOT RUN — needs `/dev/kvm` and a built golden snapshot |
-| `TestNothingInTheWorkerPathSpawnsAShell` (privilege pin, static) | n/a | AST scan, no KVM | 2026-09-12 | PASS |
-| `TestTheHostFakeCannotServeARealVMMConfig` | n/a | fake launcher | 2026-09-12 | PASS |
+| Gate | Arm | Substrate | Result |
+| --- | --- | --- | --- |
+| `TestGateEmptyKeyIsRefused` | n/a (pre-Acquire refusal) | fake launcher + fake clock | PASS (this task, mutation-verified) |
+| `TestGateNoVMReuse` (`fake_launcher_concurrency` subtest) | n/a | fake launcher + fake clock | PASS (this task, mutation-verified) |
+| `TestGateParkedThenResumed` | n/a | fake launcher + fake clock | PASS (this task, mutation-verified) |
+| `TestGateReclaimThenRedispatch` | n/a | fake launcher + fake clock | PASS (this task, mutation-verified) |
+| `TestGateNoVMReuse` (`real_launcher` subtest) | firecracker | real KVM, rig | PASS — reported, fix round 1 |
+| `TestGateWriteDurability` | firecracker | real KVM, rig | PASS — reported, fix round 1 |
+| `TestGateNoCrossRunBleed` | firecracker | real KVM, rig | PASS — reported, fix round 1 |
+| `TestGateSnapshotHoldsNoSecrets` | firecracker | real KVM, rig | PASS — reported, fix round 1 |
+| `TestGateLeakFreeTeardown` | firecracker | real KVM, rig | PASS — reported, fix round 1 |
+| `TestGateClock` | firecracker | real KVM, rig | PASS — reported, fix round 1; **failed first**, correctly, see below |
+| `TestGateOutputCapAtSource` | firecracker | real KVM, rig | PASS — reported, fix round 1 |
+| `TestNothingInTheWorkerPathSpawnsAShell` (privilege pin, static) | n/a | AST scan, no KVM | PASS (this task) |
+| `TestTheHostFakeCannotServeARealVMMConfig` | n/a | fake launcher | PASS (this task) |
 
-### Rig command for the six not-yet-run gates (both arms)
+The reported rig run exercised the **firecracker** arm only. The cloud-hypervisor arm's
+snapshot-naming mismatch that used to block it here is fixed (`00f7c11`, see below), and
+this round additionally fixed `chvOpts`'s `RunDir` to share a device with the snapshot
+the same way `fcLauncher`'s `ChrootBase` now does — but nobody has run the ten gates
+against the cloud-hypervisor arm on real KVM yet. Treat that arm as fixed-on-paper, not
+verified, until someone runs the rig command below with `SH_VMM=cloud-hypervisor`.
+
+### Rig command for the six KVM-only gates (both arms)
+
+Two things the first rig run got wrong that are easy to repeat, so recorded here for
+whoever runs this next:
+
+1. **The suite must run as root.** `/proc/sys/fs/protected_hardlinks` is `1` and the
+   golden snapshot's files are root-owned `0444`, so an unprivileged process cannot
+   hardlink them into a jail; the jailer itself also needs root to chroot and to
+   bind-mount `/dev/kvm`. Without `sudo`, every Firecracker gate fails EPERM. (The
+   command below previously omitted `sudo` — that was a bug in this document, not in
+   the gates.)
+2. **`sudo` resets the environment.** `PATH` must explicitly include `/sbin` and
+   `/usr/sbin` — `mkfs.ext4` lives there, and the launcher shells out to it to build
+   each VM's workspace image — and every `SH_*` variable must be passed on the `sudo`
+   command line itself rather than relying on `sudo -E`, which does not reliably
+   survive a hardened `sudoers` policy.
 
 ```bash
 for vmm in firecracker cloud-hypervisor; do
   echo "== $vmm"
-  SH_KVM=1 SH_VMM=$vmm SH_SNAPSHOT_IMAGE_DIR=/srv/snapshots/swebench-py311 \
+  sudo env "PATH=/usr/sbin:/sbin:$PATH" \
+    SH_KVM=1 SH_VMM=$vmm SH_SNAPSHOT_IMAGE_DIR=/srv/snapshots/swebench-py311 \
     go test ./internal/vmpool/ -run TestGate -v -timeout 30m
 done
 ```
 
-Expected: PASS for every gate on both arms. This is what Task 18's brief requires and
-what remains outstanding before this slice can be called done — **see the blocker
-below for the cloud-hypervisor arm specifically.**
+Expected: PASS for every gate on both arms. The firecracker arm is now reported green
+end-to-end (fix round 1); the cloud-hypervisor arm has every known blocker cleared but
+has not actually been run — see the note above.
 
-### Mutation-test evidence for the four gates that ran
+### Fix round 1: chroot base / run dir must share a device with the snapshot
+
+The first real rig run of the six KVM-only gates failed every Firecracker gate at
+`Restore()`:
+
+```
+firecracker: restore vm-1: hardlink vmstate:
+link /srv/snapshots/.../vmstate /tmp/TestGate.../root/vmstate: invalid cross-device link
+```
+
+Cause: `fcLauncher` (`launcher_firecracker_test.go`) set `ChrootBase: t.TempDir()`.
+`t.TempDir()` honours `$TMPDIR`; on the rig `/tmp` is tmpfs while the golden snapshot
+lives on `/srv` (ext4) — a different device. The jailer **hardlinks** (never copies)
+every snapshot component into `ChrootBase/<id>/root/`, deliberately, so that N standby
+VMs sharing one golden snapshot don't each duplicate a multi-hundred-MiB memfile. A
+hardlink across devices is EXDEV, unconditionally, so this failed on every restore
+regardless of permissions.
+
+Fix: added `sameDeviceSiblingDir(t, snapshotDir)` to
+`remote-worker/internal/vmpool/launcher_firecracker_test.go`, mirroring
+`new_verify_dir()` in `build-snapshot.sh` (a `mktemp -d` sibling of the snapshot
+directory's parent, on the same filesystem by construction, itself the fix for the
+identical problem in the shell harness's own verify jail, commit `4059338`). It does
+**not** `os.MkdirAll` the parent into existence — like `new_verify_dir()`'s `mktemp -d`,
+a missing parent (e.g. `/srv/snapshots` itself absent) is a real misconfiguration and
+should fail loudly rather than silently create a directory tree nobody asked for. An
+`SH_CHROOT_BASE` env var overrides the parent outright for a rig with an unusual layout;
+absent that, the default is now correct without the operator knowing anything. Cleanup
+is via `t.Cleanup`, which — like `t.TempDir()`'s own guarantee — runs even on a failing
+test, so a gate that fails partway through does not leak a jail (each holds a
+hardlinked ~256 MiB memfile plus a workspace image; on a rig with a 31 GiB disk that
+adds up fast across repeated runs).
+
+`fcLauncher` is only ever called after `requireKVM(t)` at every call site in the
+codebase, so this helper is never invoked — and never touches the filesystem, and never
+requires `SnapshotDir` to exist — when `SH_KVM` is unset. The non-KVM path is therefore
+unaffected by construction, not just by testing; the full non-KVM suite
+(`go test ./internal/vmpool/... -race -count=1`) was re-run after this change and stays
+green (4 gates PASS, the rest SKIP, 0 FAIL).
+
+Cloud Hypervisor's `Restore()` (`launcher_chv.go`) has the structurally identical
+exposure: it also hardlinks (`os.Link`) the golden `vmstate`/`memory-ranges` files from
+`SnapshotDir` into `RunDir/<id>/`. `chvOpts(t)` (`launcher_chv_test.go`) set
+`RunDir: t.TempDir()` — the same bug, just never exercised on the rig yet because the
+reported run only covered the Firecracker arm. Fixed it the same way:
+`RunDir: sameDeviceSiblingDir(t, snapshotDir)`, reusing the identical helper. This is
+beyond the single item flagged in the fix-round request, done because the fix was
+already written, generic, and the alternative was knowingly leaving an identical
+landmine in the other arm.
+
+**New test:** `TestSameDeviceSiblingDirSharesDeviceWithTarget`
+(`launcher_firecracker_test.go`) is the assertion that would have caught the original
+bug without any hypervisor — it stats `sameDeviceSiblingDir`'s output and the
+snapshot directory's parent (`syscall.Stat_t.Dev`) and asserts they match. It stands in
+a `t.TempDir()` for the snapshot directory rather than requiring the real
+`SH_SNAPSHOT_IMAGE_DIR` to exist, so it runs everywhere the fake-substrate gates run.
+
+**Mutation-test result — honest non-reproduction on this machine:** the intended
+mutation is to point the assertion's "got" directory at a hardcoded `/tmp` instead of
+`sameDeviceSiblingDir`'s real output, and confirm the assertion fails on a host where
+`/tmp` is a separate filesystem from the snapshot directory. On this task's own darwin
+development machine, `stat -f` shows `/tmp`, `$TMPDIR`, `/var/tmp`, and the repo's own
+working directory all report the **same** device number (`16777234` — macOS mounts one
+APFS volume for all of these under normal configuration). Applying the mutation
+(`got := "/tmp"` in place of the `sameDeviceSiblingDir` call) left the test PASSing, not
+failing, confirming this machine cannot exhibit the failure the assertion exists to
+catch. The mutation was reverted immediately after (`git diff --stat` confirmed clean),
+and the test re-run to confirm PASS on the real code path. This is exactly the situation
+flagged as worth reporting honestly rather than claiming a green mutation result that
+would not reproduce: on the rig, where `/tmp` is tmpfs and `/srv` is a separate ext4
+device, this same mutation would be expected to fail the assertion — but that has not
+been verified by this agent on real rig hardware, only reasoned from the `df`-visible
+device split the coordinator's own bug report already demonstrated.
+
+### `TestGateClock` caught a real defect on its merits
+
+The rig's first run of `TestGateClock` failed — correctly. It caught a `clockOK`
+one-shot latch in the guest agent that had been baked into the golden snapshot's own
+memory image: every VM restored from that snapshot believed its clock had already been
+corrected, because the snapshot was taken *after* the guest agent's real boot-time clock
+fix had already run once and set the latch. Fixed upstream in `66fdf86` (remove the
+latch entirely — restoring a paused VM's clock correction must not depend on in-memory
+state captured before the snapshot, since that state is exactly what gets replayed
+unconditionally on every restore). This is precisely the class of defect spec §8's gates
+exist to find and a launcher-level test never would have: it is a property of the
+golden snapshot's captured memory, not of the launcher or the pool.
+
+### Mutation-test evidence for the four gates that ran directly under this task
 
 Each of the four fake-substrate gates above was verified by breaking the exact
 production code path it exists to catch, observing the gate FAIL with a specific
@@ -71,39 +185,23 @@ each time), and observing the gate PASS again:
   final `removeWorkspace(dir)` call. Observed failure: `workspace .../gate-reclaim
   survived Reclaim: err=<nil>`. Reverted; gate passed again.
 
-### Known blocker: cloud-hypervisor snapshot naming mismatch (pre-existing, out of scope)
+### Resolved: cloud-hypervisor snapshot naming mismatch
 
-`launcher_chv.go`'s `Restore()` reads the golden snapshot directly out of
-`SnapshotDir` under cloud-hypervisor's own native names — `config.json`,
-`memory-ranges`, `state.json` (`launcher_chv.go` lines ~95-97, 478-486). But
-`build-snapshot.sh`'s `lock_down()` ships the golden snapshot under the **unified**
-names Firecracker and Cloud Hypervisor are meant to share on disk — `vmstate`,
-`memfile`, plus `ch-config.json` for the CHV arm (`files=(vmstate memfile kernel
-rootfs agent manifest.json)` at line 1087, `files+=(ch-config.json)` at line 1092,
-written out at lines 1095-1099). `build-snapshot.sh`'s own restore-side jail setup
-(`link_snapshot_file` calls at lines 1258-1260) renames `$OUT/ch-config.json` ->
-`config.json`, `$OUT/vmstate` -> `state.json`, `$OUT/memfile` -> `memory-ranges` when
-staging its own verification jail — but `launcher_chv.go`'s `Restore()` does **not**
-perform this rename; it expects those CHV-native names to already exist directly
-under `SnapshotDir`. On a rig whose `SH_SNAPSHOT_IMAGE_DIR` holds what
-`build-snapshot.sh` actually produces, every cloud-hypervisor-arm gate that resumes a
-real guest (`TestGateWriteDurability`, `TestGateNoCrossRunBleed`, the guest-`env` half
-of `TestGateSnapshotHoldsNoSecrets`, `TestGateLeakFreeTeardown`, `TestGateClock`,
-`TestGateOutputCapAtSource`, and the CHV half of `TestGateNoVMReuse`'s
-`real_launcher` subtest) is expected to fail at `Restore()` with a "no such file"
-error reading `config.json`/`memory-ranges`/`state.json`, not because the gate's
-property is false, but because the two shipped pieces of Tasks 14-17 disagree on a
-filename convention.
+This section originally documented a blocker found while writing the gates:
+`launcher_chv.go`'s `Restore()` expected the golden snapshot's cloud-hypervisor-native
+filenames (`config.json`, `memory-ranges`, `state.json`) directly under `SnapshotDir`,
+but `build-snapshot.sh` ships it under the unified names (`vmstate`, `memfile`,
+`ch-config.json`) shared with the Firecracker arm, with no rename in between — every
+cloud-hypervisor-arm restore was expected to fail with "no such file," not because any
+gate's property was false, but because the two pieces disagreed on a filename
+convention.
 
-The memfile-grep half of `TestGateSnapshotHoldsNoSecrets` is unaffected: it reads
-`$OUT/memfile` directly by that name, which exists under that name for **both** arms,
-so that half is arm-independent and correct as written.
-
-This is a pre-existing defect in code shipped by Tasks 14-17, not introduced or
-touched by this task, and fixing it is out of this task's scope. It blocks the
-cloud-hypervisor arm's rig run above until whoever owns Tasks 14-17 either makes
-`build-snapshot.sh` ship CHV's snapshot under its native names (or a symlinked
-alias), or makes `launcher_chv.go`'s `Restore()` read the unified names instead.
+**Fixed in `00f7c11`** ("translate golden snapshot names to CH-native names in
+Restore"), which landed after this task's initial commit and before this fix round.
+This agent has not independently re-verified the fix against real cloud-hypervisor
+hardware (the reported rig run covered the Firecracker arm only — see above); it is
+recorded here as resolved based on the commit itself and the coordinator's account,
+not a fresh gate run against CHV.
 
 ## Performance rungs
 

@@ -3,6 +3,8 @@ package vmpool
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -24,11 +26,12 @@ func requireKVM(t *testing.T) {
 
 func fcLauncher(t *testing.T) Launcher {
 	t.Helper()
+	snapshotDir := envOr("SH_SNAPSHOT_IMAGE_DIR", "/srv/snapshots/swebench-py311")
 	lc, err := NewFirecrackerLauncher(FirecrackerOptions{
-		SnapshotDir:         envOr("SH_SNAPSHOT_IMAGE_DIR", "/srv/snapshots/swebench-py311"),
+		SnapshotDir:         snapshotDir,
 		JailerBin:           envOr("SH_JAILER_BIN", "/usr/bin/jailer"),
 		FirecrackerBin:      envOr("SH_FIRECRACKER_BIN", "/usr/bin/firecracker"),
-		ChrootBase:          t.TempDir(),
+		ChrootBase:          sameDeviceSiblingDir(t, snapshotDir),
 		UID:                 os.Getuid(),
 		GID:                 os.Getgid(),
 		WorkspaceImageBytes: 2 << 30,
@@ -38,6 +41,82 @@ func fcLauncher(t *testing.T) Launcher {
 		t.Fatalf("NewFirecrackerLauncher: %v", err)
 	}
 	return lc
+}
+
+// sameDeviceSiblingDir returns a fresh directory guaranteed by construction to share a
+// device with snapshotDir's parent, for use as a hardlink target next to the golden
+// snapshot -- mirroring new_verify_dir() in deploy/microvm/build-snapshot.sh, which
+// solves the identical problem for the shell harness's own restore-verification jail
+// (see commit 4059338). Both VMM arms hardlink (never copy) snapshot components into a
+// per-run directory -- Firecracker's jailer into ChrootBase/<id>/root/, Cloud
+// Hypervisor's Restore into RunDir/<id>/ -- deliberately, so N standby VMs sharing one
+// golden snapshot don't each duplicate a multi-hundred-MiB memfile. A hardlink across
+// devices is EXDEV, unconditionally, so t.TempDir() alone cannot stand in here: it
+// honours $TMPDIR, which has no reason to share a device with wherever the snapshot
+// lives (on the rig, /tmp is tmpfs and the snapshot is on /srv's ext4).
+//
+// SH_CHROOT_BASE overrides the parent directory outright, for a rig with an unusual
+// layout; absent that, the parent defaults to snapshotDir's own parent directory, which
+// must already exist -- this deliberately does not os.MkdirAll it into existence, the
+// same way new_verify_dir()'s mktemp -d fails loudly on a missing $(dirname "$OUT")
+// rather than silently creating one.
+func sameDeviceSiblingDir(t *testing.T, snapshotDir string) string {
+	t.Helper()
+	parent := envOr("SH_CHROOT_BASE", filepath.Dir(snapshotDir))
+	dir, err := os.MkdirTemp(parent, ".gates-hardlink-jail-")
+	if err != nil {
+		t.Fatalf("same-device sibling dir: MkdirTemp under %s (a sibling of snapshot dir "+
+			"%s, so hardlinks into it land on the same device -- see new_verify_dir in "+
+			"deploy/microvm/build-snapshot.sh, or set SH_CHROOT_BASE): %v", parent, snapshotDir, err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Logf("cleanup same-device sibling dir %s: %v", dir, err)
+		}
+	})
+	return dir
+}
+
+// deviceOf returns the device number of the filesystem holding path, for asserting two
+// directories share a device (the condition a cross-device hardlink needs). Any *nix
+// exposes this via syscall.Stat_t.Dev; the int32-on-darwin vs. uint64-on-linux width
+// difference is irrelevant to an equality comparison, so it is widened unconditionally.
+func deviceOf(t *testing.T, path string) uint64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("this platform's os.FileInfo.Sys() is not *syscall.Stat_t; the device-sharing check needs a *nix Stat_t.Dev")
+	}
+	return uint64(st.Dev)
+}
+
+// TestSameDeviceSiblingDirSharesDeviceWithTarget is the assertion that would have caught
+// fcLauncher's original bug -- ChrootBase: t.TempDir() -- without needing a hypervisor:
+// on the rig, /tmp (tmpfs) and /srv (ext4, where the golden snapshot lives) are different
+// devices, so the jailer's hardlink of every snapshot component into ChrootBase always
+// failed EXDEV. sameDeviceSiblingDir exists specifically so that never happens again;
+// this test holds it to that.
+//
+// It stands in a t.TempDir() for the snapshot directory rather than requiring the real
+// one (SH_SNAPSHOT_IMAGE_DIR) to exist, per spec §8: the gates that need no KVM must
+// never require rig-only state, and this check is about which *device* a directory
+// lands on relative to another, not about the snapshot's contents.
+func TestSameDeviceSiblingDirSharesDeviceWithTarget(t *testing.T) {
+	snapshotDir := t.TempDir()
+
+	got := sameDeviceSiblingDir(t, snapshotDir)
+
+	wantDev := deviceOf(t, filepath.Dir(snapshotDir))
+	gotDev := deviceOf(t, got)
+	if gotDev != wantDev {
+		t.Fatalf("sameDeviceSiblingDir(%s) = %s, on device %d; want device %d (same as %s) -- "+
+			"a hardlink from the snapshot dir into this directory would be cross-device and "+
+			"therefore always fail EXDEV", snapshotDir, got, gotDev, wantDev, filepath.Dir(snapshotDir))
+	}
 }
 
 func TestFirecrackerRestoresPausedAndRunsOneCommand(t *testing.T) {

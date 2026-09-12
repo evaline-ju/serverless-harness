@@ -14,12 +14,21 @@ import (
 
 func chvOpts(t *testing.T) CHVOptions {
 	t.Helper()
+	snapshotDir := envOr("SH_SNAPSHOT_IMAGE_DIR", t.TempDir())
 	return CHVOptions{
-		SnapshotDir:  envOr("SH_SNAPSHOT_IMAGE_DIR", t.TempDir()),
+		SnapshotDir:  snapshotDir,
 		CHVBin:       envOr("SH_CHV_BIN", "/usr/bin/cloud-hypervisor"),
 		ChRemoteBin:  envOr("SH_CH_REMOTE_BIN", "/usr/bin/ch-remote"),
 		VirtiofsdBin: envOr("SH_VIRTIOFSD_BIN", "/usr/libexec/virtiofsd"),
-		RunDir:       t.TempDir(),
+		// RunDir must share a device with snapshotDir: Restore() hardlinks the golden
+		// vmstate/memory-ranges files (os.Link) from SnapshotDir into RunDir/<id>/, and a
+		// hardlink across devices is EXDEV, unconditionally -- the same failure mode
+		// fcLauncher's ChrootBase had (see sameDeviceSiblingDir in
+		// launcher_firecracker_test.go, which this reuses). When SH_SNAPSHOT_IMAGE_DIR is
+		// unset, snapshotDir is itself a t.TempDir(), so the plain default below already
+		// lands beside it on the same device; when it is set to a rig path like
+		// /srv/snapshots/..., this is what keeps RunDir off of tmpfs.
+		RunDir:       sameDeviceSiblingDir(t, snapshotDir),
 		VirtiofsdUID: 65534, // nobody
 		VirtiofsdGID: 65534,
 		VsockPort:    1024,
