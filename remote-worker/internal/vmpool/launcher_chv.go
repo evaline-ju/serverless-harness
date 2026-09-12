@@ -1,6 +1,7 @@
 package vmpool
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,9 +27,12 @@ import (
 // so (a) there are TWO host processes per standby, not one (cloud-hypervisor and
 // its own virtiofsd — spec §7.3's "Σ PSS across VMM + virtiofsd"), and (b) the host
 // filesystem, not a device mount, is the concurrency authority: SerializesExecsPerRun
-// is false, D>1 standbys are safe, and Run neither mounts nor syncs (see Run's
-// comment). That asymmetry with Task 15 is the trade spec §4.3 prices, not an
-// omission.
+// is false, D>1 standbys are safe, and Run mounts (fresh, every Exec, in its own
+// command wrapper — round 8) but never syncs (see Run's comment). The no-sync half
+// of that asymmetry with Task 15 is the trade spec §4.3 prices, not an omission; the
+// mount half is not optional — round 7's gates found writes vanishing between Execs
+// because nothing mounted the device virtio-fs merely attaches (task-16 report,
+// round 8).
 //
 // CONFINEMENT GAP THIS FILE DOES NOT CLOSE (named per hardware-corrections C5):
 // the cloud-hypervisor process itself runs UNCHROOTED on this arm. Firecracker gets
@@ -906,12 +910,15 @@ type chvVM struct {
 
 func (v *chvVM) Key() string { return v.key }
 
-// Resume unpauses the VM via ch-remote. Unlike the Firecracker arm's Resume, this
-// does NOT mount anything: virtio-fs's workspace is already visible to the guest
-// the moment the device is attached (baked into the golden snapshot's boot-time
-// config, per this file's package comment), and there is nothing analogous to
-// ext4's "re-read the device's metadata on every acquire" concern a shared host
-// filesystem does not have.
+// Resume unpauses the VM via ch-remote. It does NOT mount the workspace — round 8
+// moved that into Run, deliberately, not as an oversight this comment used to claim
+// the opposite of (see chvWrapCommand's doc comment for the full reasoning: a
+// virtio-fs session is a live connection to a per-VM virtiofsd whose socket
+// rewriteSnapshotConfig redirects on every restore, and this codebase already
+// distrusts anything analogous surviving a snapshot boundary — established vsock
+// connections do not, only listening ones do (runOverConn's doc comment) — so the
+// mount is not trusted to have survived restore either, and is redone fresh inside
+// Run's own single round-trip instead of a separate call here).
 //
 // Audited against the real ch-remote CLI source alongside the restore-argv fix
 // above (task-16 report, round 6): "resume" is a bare, argument-less subcommand
@@ -931,14 +938,121 @@ func (v *chvVM) Resume(ctx context.Context) error {
 	return nil
 }
 
-// Run sends exactly one command over a fresh vsock connection. The command is
-// UNWRAPPED — no mount, no sync — which is the one deliberate asymmetry with the
-// Firecracker arm's Run/wrapCommand: virtio-fs means every write already lands on
-// the HOST filesystem the moment the guest issues it (there is no guest page cache
-// standing between the write and durability the way there is for the ext4
-// workspace image), so a write in Exec N surviving into Exec N+1 needs no help
-// from this launcher. This is spec §4.3's trade, not an omission — a reader
-// diffing this against wrapCommand should not conclude sync was forgotten.
+// chvWorkspaceTag and chvWorkspaceMountPoint are the two ends of the host/guest
+// virtio-fs contract (round 8): build-snapshot.sh's `--fs tag=workspace,socket=...`
+// attaches the device under this tag; chvWrapCommand below mounts it at this path.
+// Pinned as named constants — not inlined string literals — so a rename on either
+// side of that contract is a one-line diff here, and so a test can assert against
+// the literal values rather than merely against "whatever this function currently
+// does."
+const (
+	chvWorkspaceTag        = "workspace"
+	chvWorkspaceMountPoint = "/workspace"
+
+	// chvMountFailMarker is written to the GUEST's stderr, and ONLY there, the
+	// instant chvWrapCommand's mount step fails — before the user's own command
+	// ever starts. chvMountFailSink watches for it so Run can tell "the mount
+	// failed" apart from "the user's command happened to exit with some identical
+	// code" without remapping the command's own exit status, which Run must never
+	// do (see chvWrapCommand's comment on preserving it exactly, same as
+	// Firecracker's wrapCommand). It cannot collide with real command output: the
+	// mount branch is the only producer of this exact line, and it is unreachable
+	// once the user's command has started.
+	chvMountFailMarker = "CHV-WORKSPACE-MOUNT-FAILED"
+)
+
+// chvWrapCommand mounts the workspace, then runs cmd, preserving cmd's own exit
+// code exactly the way Firecracker's wrapCommand preserves its command's exit code
+// (`(exit $__fc_rc)`) — with two differences from that function, both spelled out
+// here because the two wrappers sit side by side in this codebase and must not read
+// as accidentally inconsistent:
+//
+//  1. WHERE the mount happens, and how often. Firecracker mounts once, in Resume,
+//     because mounting a real block device also re-reads its metadata (spec §4.3)
+//     and a Firecracker VM never shares its disk with another guest. Cloud
+//     Hypervisor's virtio-fs mount is instead embedded HERE, in Run's own single
+//     command, redone on every Exec: whether a virtio-fs session survives
+//     snapshot/restore with its backing socket redirected to a fresh per-VM
+//     virtiofsd (rewriteSnapshotConfig's fs[].socket rewrite) is unverified, and
+//     this codebase already documents the analogous failure shape for vsock —
+//     established connections do not survive resume, only listening ones do
+//     (runOverConn's doc comment) — so a mount baked into the golden snapshot is no
+//     more trusted to have survived restore than a connection would be. Embedding
+//     it in Run's own round-trip, rather than a separate Resume-time call, also
+//     means there is no window where Resume could report success on a mount that
+//     silently didn't take.
+//
+//  2. NO sync. This is the one deliberate, load-bearing asymmetry with Firecracker's
+//     wrapCommand that this file's package comment and Run's own comment already
+//     call out: virtio-fs writes land on the HOST filesystem the moment the guest
+//     issues them, so there is no guest page cache standing between a write and
+//     durability the way there is for Firecracker's ext4 workspace image. Adding a
+//     sync here would be cargo-culted from the other arm, not a fix for anything
+//     this arm actually has wrong.
+//
+// Idempotency: this does NOT check "already mounted" and skip if so, the way
+// Firecracker's Resume does (`mountpoint -q /workspace || mount ...`). That check
+// is safe for Firecracker because its workspace is a directly-attached block device
+// with no daemon in the loop — an already-mounted /workspace is trivially still
+// correct there. Cloud Hypervisor's mount is backed by a per-VM virtiofsd reached
+// over a socket rewriteSnapshotConfig rewrites on every single restore; a
+// /workspace that LOOKS already mounted (e.g. carried in the golden snapshot's
+// captured guest state) could be a stale session pointed at a virtiofsd that no
+// longer exists — which is precisely the "lost write" failure round 8 exists to
+// fix, not a state safe to leave alone. So this unmounts first (tolerating "not
+// mounted") and always remounts fresh, on every single Exec, rather than trusting
+// anything carried across a restore.
+func chvWrapCommand(cmd string) string {
+	return "if mountpoint -q " + chvWorkspaceMountPoint + " 2>/dev/null; then umount " + chvWorkspaceMountPoint + "; fi\n" +
+		"__chv_mount_err=$(mount -t virtiofs " + chvWorkspaceTag + " " + chvWorkspaceMountPoint + " 2>&1)\n" +
+		"if [ $? -ne 0 ]; then\n" +
+		"  echo \"" + chvMountFailMarker + ": tag=" + chvWorkspaceTag + " mountpoint=" + chvWorkspaceMountPoint + ": ${__chv_mount_err}\" >&2\n" +
+		"  exit 97\n" +
+		"fi\n" +
+		"cd " + chvWorkspaceMountPoint + "\n" +
+		"{ " + cmd + "\n}\n" +
+		"__chv_rc=$?\n" +
+		"(exit $__chv_rc)\n"
+}
+
+// chvMountFailSink wraps the caller's real Sink and watches stderr for
+// chvMountFailMarker. When chvWrapCommand's mount step fails, that marker is the
+// ONLY thing written to stderr before the wrapper exits (the user's own command
+// never starts on that branch), so this sink intercepts and holds those bytes
+// instead of forwarding them: a mount failure is an infrastructure error, surfaced
+// by Run as a returned Go error, not something that should appear as if the user's
+// own command produced it. Every other byte on either stream passes straight
+// through untouched.
+type chvMountFailSink struct {
+	out    Sink
+	failed bool
+	detail []byte
+}
+
+func (s *chvMountFailSink) Stdout(b []byte) { s.out.Stdout(b) }
+
+func (s *chvMountFailSink) Stderr(b []byte) {
+	if s.failed || bytes.Contains(b, []byte(chvMountFailMarker)) {
+		s.failed = true
+		s.detail = append(s.detail, b...)
+		return
+	}
+	s.out.Stderr(b)
+}
+
+// Run sends exactly one command over a fresh vsock connection: chvWrapCommand's
+// mount-then-run script, never c.Command unwrapped. See chvWrapCommand's doc
+// comment for why the mount lives here rather than in Resume, and why there is
+// still no sync — the one deliberate asymmetry with the Firecracker arm's
+// Run/wrapCommand, load-bearing per spec §4.3 (the host filesystem, not a guest
+// page cache, is this arm's durability authority) and not an omission for a reader
+// diffing the two wrappers to conclude sync was forgotten.
+//
+// A mount failure never reaches the caller as an ordinary command result: it is
+// detected via chvMountFailSink and turned into a returned error naming both the
+// tag and the mount point, specifically so it cannot present as a lost write —
+// which is exactly the symptom round 8 exists to fix, and exactly what a silent
+// failure here would reproduce.
 func (v *chvVM) Run(ctx context.Context, c Command, out Sink) (Result, error) {
 	if err := v.checkNotDestroyed(); err != nil {
 		return Result{}, err
@@ -947,7 +1061,18 @@ func (v *chvVM) Run(ctx context.Context, c Command, out Sink) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("cloud-hypervisor: run %s: dial vsock: %w", v.id, err)
 	}
-	return runOverConn(ctx, conn, c, out, time.Now())
+	wrapped := c
+	wrapped.Command = chvWrapCommand(c.Command)
+	sink := &chvMountFailSink{out: out}
+	res, err := runOverConn(ctx, conn, wrapped, sink, time.Now())
+	if err != nil {
+		return res, err
+	}
+	if sink.failed {
+		return Result{}, fmt.Errorf("cloud-hypervisor: run %s: mount workspace (tag=%q, mountpoint=%q) failed: %s",
+			v.id, chvWorkspaceTag, chvWorkspaceMountPoint, strings.TrimSpace(string(sink.detail)))
+	}
+	return res, nil
 }
 
 // Destroy SIGKILLs the VMM first, then virtiofsd (per the brief), reaps both, and

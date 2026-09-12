@@ -1,6 +1,7 @@
 package vmpool
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -797,3 +798,161 @@ func TestRestoreStagesCHNativeNamesFromGoldenNames(t *testing.T) {
 		}
 	}
 }
+
+// TestChvWrapCommandMountsWorkspaceBeforeTheCommand is round 8's decisive test: the
+// §8 gates (TestGateWriteDurability, TestGateNoCrossRunBleed) failed on real
+// hardware because nothing mounted virtio-fs in the guest, and this is the pure,
+// KVM-free slice of that fix that CAN be asserted here — the command string
+// chvWrapCommand builds, not the real mount syscall.
+//
+// The tag and mount point are asserted as LITERAL strings ("workspace", "/workspace"),
+// deliberately not via the chvWorkspaceTag/chvWorkspaceMountPoint constants: this is
+// the host/guest contract build-snapshot.sh's `--fs tag=workspace,socket=...` flag
+// is the other half of, so a rename of either constant that drifted away from that
+// flag must fail this test loudly, rather than the test silently tracking whatever
+// the constant currently says and proving nothing.
+func TestChvWrapCommandMountsWorkspaceBeforeTheCommand(t *testing.T) {
+	wrapped := chvWrapCommand("echo hello")
+
+	mountIdx := strings.Index(wrapped, "mount -t virtiofs workspace /workspace")
+	if mountIdx < 0 {
+		t.Fatalf("chvWrapCommand output does not contain the pinned mount invocation (tag=workspace, mountpoint=/workspace); got:\n%s", wrapped)
+	}
+	cmdIdx := strings.Index(wrapped, "echo hello")
+	if cmdIdx < 0 {
+		t.Fatalf("chvWrapCommand output lost the user's command; got:\n%s", wrapped)
+	}
+	if !(mountIdx < cmdIdx) {
+		t.Fatalf("chvWrapCommand mounts AFTER the user's command (mount at %d, cmd at %d) — the command could run against an unmounted /workspace; got:\n%s", mountIdx, cmdIdx, wrapped)
+	}
+}
+
+// TestChvWrapCommandNeverSyncs pins the deliberate asymmetry with Firecracker's
+// wrapCommand (which DOES sync): on this arm the host filesystem is the durability
+// authority (spec §4.3), so a guest-side sync would be cargo-culted from the other
+// arm, not a fix for anything. A future edit that "fixes" this by copying
+// Firecracker's sync must fail this test, not slip through as a harmless-looking
+// consistency improvement.
+func TestChvWrapCommandNeverSyncs(t *testing.T) {
+	wrapped := chvWrapCommand("echo hello")
+	if strings.Contains(wrapped, "sync") {
+		t.Fatalf("chvWrapCommand contains \"sync\" — this arm's Run must never sync (spec §4.3: the host filesystem is the durability authority, not the guest page cache); got:\n%s", wrapped)
+	}
+}
+
+// TestChvWrapCommandPreservesExitCode asserts the same invariant Firecracker's
+// wrapCommand documents for itself ("(exit $__fc_rc) preserves the command's own
+// exit status"): this wrapper must not let the mount step, or its own bookkeeping,
+// change what the user's command reports.
+func TestChvWrapCommandPreservesExitCode(t *testing.T) {
+	wrapped := chvWrapCommand("false")
+	if !strings.Contains(wrapped, "$?") {
+		t.Fatalf("chvWrapCommand does not appear to capture the command's own exit code; got:\n%s", wrapped)
+	}
+	if !strings.Contains(wrapped, "(exit $__chv_rc)") {
+		t.Fatalf("chvWrapCommand does not re-exit with the captured code; got:\n%s", wrapped)
+	}
+}
+
+// TestChvWrapCommandUnmountsStaleWorkspaceFirst is the idempotency decision round 8
+// asked for explicitly: unlike Firecracker's Resume (`mountpoint -q /workspace ||
+// mount ...`, which SKIPS mounting if already mounted), this arm cannot trust an
+// already-mounted /workspace, because it is backed by a per-VM virtiofsd whose
+// socket rewriteSnapshotConfig redirects on every restore — a mount that "looks"
+// already there could be a stale session pointed at a virtiofsd that no longer
+// exists. So this must unmount first and always remount fresh, never short-circuit
+// on mountpoint -q succeeding.
+func TestChvWrapCommandUnmountsStaleWorkspaceFirst(t *testing.T) {
+	wrapped := chvWrapCommand("echo hello")
+	if strings.Contains(wrapped, "mountpoint -q /workspace || mount") {
+		t.Fatalf("chvWrapCommand uses Firecracker's short-circuit idempotency pattern — that is unsafe here (a stale virtio-fs session must not be trusted); got:\n%s", wrapped)
+	}
+	if !strings.Contains(wrapped, "umount /workspace") {
+		t.Fatalf("chvWrapCommand does not unmount a possibly-stale /workspace before remounting; got:\n%s", wrapped)
+	}
+	umountIdx := strings.Index(wrapped, "umount /workspace")
+	mountIdx := strings.Index(wrapped, "mount -t virtiofs workspace /workspace")
+	if !(umountIdx >= 0 && mountIdx >= 0 && umountIdx < mountIdx) {
+		t.Fatalf("chvWrapCommand does not unmount BEFORE remounting; got:\n%s", wrapped)
+	}
+}
+
+// TestChvWrapCommandMountFailureBlocksTheCommand asserts the diagnosability
+// requirement round 8 called out directly: "if the mount fails, the command must
+// not run." The wrapper cannot exercise a real mount here (no KVM), so this checks
+// the shell control flow instead: the mount-failure branch must exit before ever
+// reaching the block that runs cmd.
+func TestChvWrapCommandMountFailureBlocksTheCommand(t *testing.T) {
+	wrapped := chvWrapCommand("echo should-not-run")
+	failIdx := strings.Index(wrapped, "exit 97")
+	if failIdx < 0 {
+		t.Fatalf("chvWrapCommand's mount-failure branch does not exit before the command; got:\n%s", wrapped)
+	}
+	cmdIdx := strings.Index(wrapped, "echo should-not-run")
+	if !(failIdx < cmdIdx) {
+		t.Fatalf("chvWrapCommand's mount-failure exit is not before the command block; got:\n%s", wrapped)
+	}
+	if !strings.Contains(wrapped, chvMountFailMarker) {
+		t.Fatalf("chvWrapCommand's mount-failure branch does not emit chvMountFailMarker; got:\n%s", wrapped)
+	}
+	// The marker line itself must name both the tag and the mount point — the exact
+	// diagnosability ask: "the error must say the mount failed and name the tag and
+	// mount point... otherwise it presents as a lost write."
+	if !strings.Contains(wrapped, "tag=workspace") || !strings.Contains(wrapped, "mountpoint=/workspace") {
+		t.Fatalf("chvWrapCommand's mount-failure marker does not name both the tag and the mount point; got:\n%s", wrapped)
+	}
+}
+
+// TestChvMountFailSinkInterceptsTheMarker is the other half of the diagnosability
+// fix: chvMountFailSink is what turns the marker chvWrapCommand emits into
+// Run's returned error, rather than letting it flow through as if it were the
+// user's own command output.
+func TestChvMountFailSinkInterceptsTheMarker(t *testing.T) {
+	inner := &fakeSink{}
+	s := &chvMountFailSink{out: inner}
+
+	s.Stdout([]byte("normal stdout\n"))
+	s.Stderr([]byte(chvMountFailMarker + ": tag=workspace mountpoint=/workspace: mount: wrong fs type\n"))
+
+	if !s.failed {
+		t.Fatal("chvMountFailSink did not detect the marker")
+	}
+	if !bytes.Contains(s.detail, []byte("wrong fs type")) {
+		t.Fatalf("chvMountFailSink.detail = %q, want it to contain the underlying mount error", s.detail)
+	}
+	if bytes.Contains(inner.stderr, []byte(chvMountFailMarker)) {
+		t.Fatalf("chvMountFailSink forwarded the marker to the real Sink; inner.stderr = %q", inner.stderr)
+	}
+	if string(inner.stdout) != "normal stdout\n" {
+		t.Fatalf("chvMountFailSink altered stdout pass-through; inner.stdout = %q", inner.stdout)
+	}
+}
+
+// TestChvMountFailSinkPassesThroughOrdinaryOutput guards the "every other byte
+// passes straight through" half of chvMountFailSink's contract: a successful run's
+// real stderr (the user's own command output) must reach the caller unmodified.
+func TestChvMountFailSinkPassesThroughOrdinaryOutput(t *testing.T) {
+	inner := &fakeSink{}
+	s := &chvMountFailSink{out: inner}
+
+	s.Stdout([]byte("out\n"))
+	s.Stderr([]byte("err\n"))
+
+	if s.failed {
+		t.Fatal("chvMountFailSink.failed = true for ordinary output containing no marker")
+	}
+	if string(inner.stdout) != "out\n" || string(inner.stderr) != "err\n" {
+		t.Fatalf("chvMountFailSink did not pass ordinary output through unchanged: stdout=%q stderr=%q", inner.stdout, inner.stderr)
+	}
+}
+
+// fakeSink is a minimal Sink that records what it was given, used by the
+// chvMountFailSink tests above to assert on pass-through behavior directly (unlike
+// discardingSink, which throws everything away and so cannot be inspected).
+type fakeSink struct {
+	stdout []byte
+	stderr []byte
+}
+
+func (f *fakeSink) Stdout(b []byte) { f.stdout = append(f.stdout, b...) }
+func (f *fakeSink) Stderr(b []byte) { f.stderr = append(f.stderr, b...) }
