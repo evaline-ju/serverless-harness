@@ -1161,25 +1161,43 @@ verify_restore_firecracker() {
     </dev/null >"$STAGE/verify-console.log" 2>&1 &
   CLEANUP_PID=$!
 
+  # Fix-round-8: a restoring instance must be FRESH. The real binary enforces
+  # this -- the rig's own failure was PUT /snapshot/load returning HTTP 400
+  # "Loading a microVM snapshot not allowed after configuring boot-specific
+  # resources." This function used to PUT its own vsock device here first
+  # (copying boot_quiesce_snapshot_firecracker's *fresh-boot* sequence, item
+  # 3's PUT /vsock), reasoning that since the UDS path does not move
+  # (both build-time and here are jail-relative /vsock.sock) a same-value PUT
+  # was harmless. It is not harmless: /snapshot/load's ONE call is the only
+  # configuration a restoring instance gets at all, no matter whether the
+  # value being configured matches what the snapshot already carries.
+  #
+  # launcher_firecracker.go's Restore is the reference for the correct shape:
+  # after waitForUnixSocket it calls exactly fc.setVsockOverride(vsockRelPath)
+  # then fc.LoadSnapshot(...) -- no PUT /vsock, /boot-source, /drives/... or
+  # /machine-config anywhere in that function. setVsockOverride itself (see
+  # fcapi.go) does not touch the wire at all; it just records a string field
+  # that LoadSnapshot's own request body includes as vsock_override. That is
+  # Firecracker's *only* restore-time path override -- there is no equivalent
+  # for drives (see boot_quiesce_snapshot_firecracker's item 2 comment), which
+  # is exactly why /workspace.img has to already be staged into this jail
+  # (done above, via ensure_workspace_image) rather than configured here.
+  #
   # Wire format confirmed against fcapi.go's loadSnapshotRequest struct:
   # snapshot_path is top-level, the memory file nests under mem_backend as
   # {backend_path, backend_type} -- NOT the flat mem_file_path field, which
-  # belongs to the separate /snapshot/create request. vsock_override lets the
-  # vsock UDS path move between snapshot and restore; here it does not move
-  # (both are /vsock.sock, jail-relative) but is still supplied to match the
-  # launcher's own restore call shape. resume_vm IS a valid field here (unlike
-  # on /snapshot/create, see the fix-round-6 comment above) -- confirmed
-  # against v1.17.0's SnapshotLoadParams.
+  # belongs to the separate /snapshot/create request. resume_vm IS a valid
+  # field here (unlike on /snapshot/create, see the fix-round-6 comment
+  # above) -- confirmed against v1.17.0's SnapshotLoadParams.
   #
   # Fix-round-6 item 2: vsock_override is an object ({"uds_path": ...}), not a
   # bare string -- confirmed against v1.17.0's firecracker.yaml VsockOverride
   # schema (single required property uds_path) and against Firecracker's own
   # docs/vsock.md "Unix Domain Socket Renaming" section, whose worked example
-  # is `"vsock_override": {"uds_path": "./v.sock.2"}`. This call has never
-  # executed against the real binary before this round, so the wrong shape had
-  # not yet been caught the way the /snapshot/create bug was.
-  api_put "$api_sock" /vsock \
-    "{\"vsock_id\":\"vsock0\",\"guest_cid\":3,\"uds_path\":\"/vsock.sock\"}"
+  # is `"vsock_override": {"uds_path": "./v.sock.2"}`.
+  #
+  # This is the ONLY Firecracker API call verify_restore_firecracker makes
+  # after starting the VMM -- see the test asserting exactly that.
   api_put "$api_sock" /snapshot/load \
     "{\"snapshot_path\":\"/vmstate\",\"mem_backend\":{\"backend_path\":\"/memfile\",\"backend_type\":\"File\"},\"vsock_override\":{\"uds_path\":\"/vsock.sock\"},\"resume_vm\":true}"
 

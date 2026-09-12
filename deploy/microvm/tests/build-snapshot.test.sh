@@ -539,5 +539,42 @@ check "both verify functions register their verify_root with CLEANUP_EXTRA_DIR" 
 check "both verify functions remove verify_root on their own normal-path teardown too" \
   "$([ "$(grep -cF 'rm_rf_jail "$verify_root"' "$SCRIPT")" -eq 2 ] && echo yes || echo no)" "yes"
 
+echo "== fix-round-8: verify_restore_firecracker makes no boot-resource configuration calls before /snapshot/load"
+# Real rig failure: PUT /snapshot/load returned HTTP 400 "Loading a microVM
+# snapshot not allowed after configuring boot-specific resources." A restoring
+# instance gets exactly ONE configuration call -- /snapshot/load itself, with
+# vsock_override standing in for the one restore-time path override
+# Firecracker offers. Any PUT /boot-source, /drives/..., /machine-config or
+# /vsock issued between starting the VMM and calling /snapshot/load
+# reproduces that rejection, no matter that the values being configured
+# already match what the snapshot carries.
+#
+# Comment-collision trap (bit fix-round-7's tests): this file's own comments,
+# and build-snapshot.sh's, deliberately quote "/vsock", "vsock_override" and
+# "/vsock.sock" while explaining why a bare device PUT is forbidden -- a grep
+# across the whole function body would match those explanations, not just
+# live code. Strip comment lines first, every time.
+restore_fc_body="$(awk '/^verify_restore_firecracker\(\)/{flag=1} flag{print} flag && /^}/{exit}' "$SCRIPT" | grep -v '^[[:space:]]*#')"
+check "verify_restore_firecracker starts exactly one VMM (one CLEANUP_PID=\$!)" \
+  "$([ "$(printf '%s\n' "$restore_fc_body" | grep -cF 'CLEANUP_PID=$!')" -eq 1 ] && echo yes || echo no)" "yes"
+check "verify_restore_firecracker calls /snapshot/load exactly once" \
+  "$([ "$(printf '%s\n' "$restore_fc_body" | grep -cF '/snapshot/load')" -eq 1 ] && echo yes || echo no)" "yes"
+# The segment strictly between starting the VMM and the /snapshot/load call
+# (the sed '$d' drops the /snapshot/load line itself, which is the range's
+# terminator, not something "between" the two events).
+restore_segment="$(printf '%s\n' "$restore_fc_body" | sed -n '/CLEANUP_PID=\$!/,/\/snapshot\/load/p' | sed '$d')"
+check "no PUT /boot-source between starting the VMM and /snapshot/load" \
+  "$(printf '%s\n' "$restore_segment" | grep -cF '/boot-source')" "0"
+check "no PUT /drives/... between starting the VMM and /snapshot/load" \
+  "$(printf '%s\n' "$restore_segment" | grep -cF '/drives/')" "0"
+check "no PUT /machine-config between starting the VMM and /snapshot/load" \
+  "$(printf '%s\n' "$restore_segment" | grep -cF '/machine-config')" "0"
+# Word-boundary, not a bare substring match: the /snapshot/load body itself
+# legitimately carries "/vsock.sock" (inside vsock_override's uds_path) and
+# that must NOT trip this check -- only a standalone /vsock path argument
+# (Firecracker's device-configuration endpoint) should.
+check "no PUT /vsock (device config) between starting the VMM and /snapshot/load" \
+  "$(printf '%s\n' "$restore_segment" | grep -cE '/vsock([[:space:]]|"|$)')" "0"
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"
