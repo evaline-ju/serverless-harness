@@ -1,0 +1,41 @@
+{
+  "spec": "docs/specs/2026-09-09-p4-microvm-sandbox-design.md",
+  "section": "7.4",
+  "recordedAt": "2026-09-10",
+  "note": "Written BEFORE the first rung. §7.4 says 'the four below' and then lists five; all five are recorded here, because the count is a drafting artifact and dropping one would be exactly the reinterpretation the pin exists to prevent.",
+  "predictions": [
+    {
+      "id": 1,
+      "claim": "Replenishment binds on process/memory count before CPU.",
+      "metric": "host MemAvailable + Mlocked + process count vs host CPU utilisation at the knee",
+      "falsifiedBy": "CPU saturating at or before the memory gate first refuses",
+      "onlyObservableBecause": "§6's memory gate exists; without it the prediction would be 'confirmed' by the host falling over, which is not a measurement"
+    },
+    {
+      "id": 2,
+      "claim": "The warm hot path lands within 2x of the container baseline, because both pay the relay hop and it dominates.",
+      "metric": "E10 rung 2 p50 / E10 rung 1 p50",
+      "falsifiedBy": "ratio > 2 on metal"
+    },
+    {
+      "id": 3,
+      "claim": "The knee is a replenishment knee, not a latency knee: cold-acquire rate stays approximately 0 until replenishment rate meets Exec rate, then rises sharply.",
+      "metric": "cold-acquire rate vs active runs across E11's rungs",
+      "falsifiedBy": "cold-acquire rate rising gradually from the first rung, or p95 degrading while cold-acquire rate stays flat",
+      "note": "This predicts the knee's SHAPE, a stronger commitment than a number."
+    },
+    {
+      "id": 4,
+      "claim": "Cloud Hypervisor's virtio-fs costs more per metadata op than Firecracker's block, visible in ls/find-heavy commands rather than in cat.",
+      "metric": "per-command p50 by command class, both arms, E10 rung 2",
+      "falsifiedBy": "no arm difference on ls/find, or a difference of the same size on cat"
+    },
+    {
+      "id": 5,
+      "claim": "Idle standby residency returns to zero within StandbyIdle + ReclaimScanInterval of a rung's last Exec on an otherwise idle host, while workspace count does not change until WorkspaceIdle; and because a run's final Exec pops a standby and mints its replacement, the run's full complement of D stands idle rather than being reclaimed, so idle standby residency tracks (runs finishing per StandbyIdle) x D x GuestRAMBytes and not zero.",
+      "metric": "idle standby residency and workspace count, sampled after each rung's last Exec",
+      "falsifiedBy": "standbys outliving StandbyIdle + ReclaimScanInterval on an idle host, workspaces vanishing before WorkspaceIdle, or residency reading zero rather than (runs finishing) x D",
+      "note": "Predicts the reclamation path's SHAPE — convergence with no arrival to trigger it, and RAM released long before state is."
+    }
+  ]
+}
