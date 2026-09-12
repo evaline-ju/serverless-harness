@@ -219,5 +219,105 @@ if [ -n "$start" ]; then
 fi
 check "write_guest_client arms the temp-dir cleanup trap before mkdir (source order)" "$ok" "yes"
 
+echo "== fix-round-4 item 1: init exports a PATH before execing the agent"
+# The kernel hands init an essentially empty environment (no PATH at all). init
+# itself never needed one (every command it runs is absolute), but the agent it
+# execs resolves the commands IT runs (bash, python3, curl, ...) by name via
+# exec.LookPath, and an unset PATH makes every one of those fail even though the
+# binary is present in the image -- this is exactly the bug that panicked the
+# guest ("exec: \"bash\": executable file not found in \$PATH"). Scope every
+# check to the init heredoc itself (between the `cat >.../sbin/init <<'INIT'`
+# line and the closing bare `INIT` line), not the outer build script, so this
+# can't accidentally pass by matching unrelated text elsewhere.
+init_start=$(grep -nF 'cat >"$STAGE/rootfs-tree/sbin/init" <<'"'"'INIT'"'"'' "$SCRIPT" | head -n1 | cut -d: -f1)
+init_end=""
+if [ -n "$init_start" ]; then
+  init_end=$(awk -v s="$init_start" 'NR>s && /^INIT$/{print NR; exit}' "$SCRIPT")
+fi
+ok=no
+path_line=""
+exec_line=""
+if [ -n "$init_start" ] && [ -n "$init_end" ]; then
+  path_line=$(awk -v s="$init_start" -v e="$init_end" \
+    'NR>=s && NR<=e && /^export PATH=/{print NR; exit}' "$SCRIPT")
+  exec_line=$(awk -v s="$init_start" -v e="$init_end" \
+    'NR>=s && NR<=e && /^exec \/usr\/local\/bin\/agent/{print NR; exit}' "$SCRIPT")
+  [ -n "$path_line" ] && ok=yes
+fi
+check "init exports a PATH" "$ok" "yes"
+
+ok=no
+if [ -n "$path_line" ]; then
+  path_text=$(sed -n "${path_line}p" "$SCRIPT")
+  case "$path_text" in
+    *:/usr/bin:* | *:/usr/bin)
+      case "$path_text" in
+        *:/bin:* | *:/bin) ok=yes ;;
+      esac
+      ;;
+  esac
+fi
+check "init's PATH covers both /usr/bin and /bin (merged-\$usr and split trees)" "$ok" "yes"
+
+ok=no
+if [ -n "$path_line" ] && [ -n "$exec_line" ] && [ "$path_line" -lt "$exec_line" ]; then
+  ok=yes
+fi
+check "init's PATH export precedes the agent exec (source order)" "$ok" "yes"
+
+ok=no
+if [ -n "$init_start" ] && [ -n "$init_end" ]; then
+  exec_check_line=$(awk -v s="$init_start" -v e="$init_end" \
+    'NR>=s && NR<=e && /-x \/usr\/local\/bin\/agent/{print NR; exit}' "$SCRIPT")
+  if [ -n "$exec_check_line" ] && [ -n "$exec_line" ] && [ "$exec_check_line" -lt "$exec_line" ]; then
+    ok=yes
+  fi
+fi
+check "init fails loudly if the agent binary is missing/non-executable, before exec" "$ok" "yes"
+
+echo "== fix-round-4 item 2: a failed wait_for_agent preserves the guest console log"
+# wait_for_agent's timeout path used to just print a generic timeout message and
+# exit 1 -- and the EXIT trap then deletes \$STAGE, which is where the console
+# log (the only artifact that explains a guest boot failure) lives. The failure
+# most likely to occur on a new host was erasing its own diagnosis. A
+# source-level assertion that the timeout path references and preserves
+# \$console_log is legitimate and sufficient here (no live VMM needed).
+wfa_start=$(grep -n "^wait_for_agent() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+ok=no
+timeout_line=""
+if [ -n "$wfa_start" ]; then
+  wfa_end=$(awk -v s="$wfa_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$wfa_end" ]; then
+    timeout_line=$(awk -v s="$wfa_start" -v e="$wfa_end" \
+      'NR>=s && NR<=e && /never became reachable/{print NR; exit}' "$SCRIPT")
+    save_line=$(awk -v s="$wfa_start" -v e="$wfa_end" \
+      'NR>=s && NR<=e && /cp "\$console_log"/{print NR; exit}' "$SCRIPT")
+    excerpt_line=$(awk -v s="$wfa_start" -v e="$wfa_end" \
+      'NR>=s && NR<=e && /tail -n [0-9]+ "\$console_log"/{print NR; exit}' "$SCRIPT")
+    if [ -n "$save_line" ] && [ -n "$excerpt_line" ] && [ -n "$timeout_line" ] \
+      && [ "$save_line" -lt "$timeout_line" ] && [ "$excerpt_line" -lt "$timeout_line" ]; then
+      ok=yes
+    fi
+  fi
+fi
+check "wait_for_agent's timeout path saves and prints the console log before exiting" "$ok" "yes"
+
+ok=no
+if [ -n "$wfa_start" ]; then
+  wfa_end=$(awk -v s="$wfa_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$wfa_end" ]; then
+    saved_var_line=$(awk -v s="$wfa_start" -v e="$wfa_end" \
+      'NR>=s && NR<=e && /saved_console=/{print NR; exit}' "$SCRIPT")
+    if [ -n "$saved_var_line" ]; then
+      saved_var_text=$(sed -n "${saved_var_line}p" "$SCRIPT")
+      case "$saved_var_text" in
+        *'$STAGE'*) ok=no ;;
+        *) ok=yes ;;
+      esac
+    fi
+  fi
+fi
+check "the saved console-log path is outside \$STAGE (survives the EXIT trap)" "$ok" "yes"
+
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"

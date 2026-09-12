@@ -330,6 +330,33 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t tmpfs -o mode=1777 tmpfs /tmp
 mount -t tmpfs tmpfs /var
+
+# Fix-round-4 item 1: the kernel hands init an essentially empty environment --
+# no PATH at all. This script never needed one (every command above is called
+# by absolute path), but the agent below resolves the commands it execs
+# (bash, python3, curl, ...) by NAME via exec.LookPath, and an unset PATH makes
+# every one of those fail to resolve even though the binary is sitting right
+# there in the image. DO NOT DELETE THIS LINE: without it the agent still
+# boots and parks in accept() -- the build looks successful -- but the first
+# real Exec a user runs, and every one after it, fails "command not found"
+# for a tool that is actually present, which gets diagnosed days later by
+# someone with no reason to suspect init. List both the merged-/usr paths and
+# the split /bin, /sbin paths so this init works on either kind of tree (this
+# ROOTFS has /bin and /sbin symlinked into /usr, but that is a property of
+# this base image, not something init should assume).
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Fail loudly here rather than let a missing/non-executable agent binary reach
+# `exec` and communicate only as a bare kernel panic ("Attempted to kill
+# init!") with nothing on the console saying why. This is a different failure
+# than the PATH bug above (the build never installed the agent at all) and
+# deserves a different, explicit message.
+if [ ! -x /usr/local/bin/agent ]; then
+  echo "init: /usr/local/bin/agent is missing or not executable -- the" >&2
+  echo "init: build did not install the guest agent into this rootfs" >&2
+  exit 1
+fi
+
 exec /usr/local/bin/agent --listen vsock:1024 --workdir /workspace
 INIT
   chmod 0555 "$STAGE/rootfs-tree/sbin/init"
@@ -522,6 +549,27 @@ wait_for_agent() {
     sleep 1
     waited=$((waited + 1))
   done
+  # Fix-round-4 item 2: $console_log lives under $STAGE, and $STAGE is deleted by
+  # this script's own EXIT trap the instant this function's caller returns (or,
+  # on this failure path, the instant this function's own `exit 1` below runs)
+  # -- so the ONLY artifact that explains why the guest never came up was about
+  # to be destroyed by the same failure it would have diagnosed. Copy it
+  # somewhere that outlives $STAGE and print that path, and echo an excerpt here
+  # too, so the reader does not have to go find it. Keep this whole block off
+  # the success path above: nobody wants a kernel log dumped on a good build.
+  local saved_console="${TMPDIR:-/tmp}/build-snapshot-console-$$.log"
+  if [ -f "$console_log" ]; then
+    cp "$console_log" "$saved_console" 2>/dev/null || true
+    echo "build-snapshot.sh: guest console log saved to $saved_console (survives this script's cleanup)" >&2
+    echo "build-snapshot.sh: look there for 'Kernel panic', 'init:', or 'guest-agent: exec:' -- or an empty" \
+      "file, which means the VMM itself never started" >&2
+    echo "build-snapshot.sh: --- last 40 lines of the guest console ---" >&2
+    tail -n 40 "$console_log" >&2
+    echo "build-snapshot.sh: --- end of guest console excerpt ---" >&2
+  else
+    echo "build-snapshot.sh: no guest console log exists at $console_log --" \
+      "the VMM itself likely never started" >&2
+  fi
   echo "build-snapshot.sh: guest agent never became reachable on vsock:1024 within 120s" >&2
   exit 1
 }
