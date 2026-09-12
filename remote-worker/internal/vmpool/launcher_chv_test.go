@@ -429,3 +429,89 @@ func TestRewriteSnapshotConfigToleratesNoFsSection(t *testing.T) {
 		t.Fatalf("fs key should not have been invented: %v", doc["fs"])
 	}
 }
+
+// TestRestoreStagesCHNativeNamesFromGoldenNames is the test the coordinator's
+// round-4 ruling required: it exists because launcher_chv.go's Restore once read
+// CH's own native names (config.json, memory-ranges, state.json) straight out of
+// the golden SnapshotDir, but deploy/microvm/build-snapshot.sh's lock_down ships
+// that same golden directory under the UNIFIED cross-VMM names (vmstate, memfile,
+// ch-config.json) instead — so a real restore would have failed on a missing
+// file, and nothing on this branch caught it because every prior test only
+// asserted on the chvSnapshot*/chvGolden* constants, never on what actually landed
+// on disk. This test populates a fake golden directory using the real golden
+// names, runs the pure staging step, and inspects runDir directly: it must
+// contain CH's native names (and only those — not the golden names) for
+// vm.restore to have anything to replay.
+func TestRestoreStagesCHNativeNamesFromGoldenNames(t *testing.T) {
+	goldenDir := t.TempDir()
+	runDir := t.TempDir()
+
+	// Same synthetic shape as TestRewriteSnapshotConfigGivesEachVMItsOwnSockets,
+	// reused here because chvStageSnapshotFiles' config path runs through the same
+	// rewriteSnapshotConfig — the point of this test is the file-name translation
+	// around it, not re-litigating the JSON rewrite itself.
+	goldenConfig := `{
+		"vsock": {"cid": 3, "socket": "/golden/vsock.sock"},
+		"fs": [{"tag": "workspace", "socket": "/golden/vfsd.sock", "num_queues": 1, "queue_size": 1024}],
+		"disks": [{"path": "/golden/rootfs.ext4", "readonly": true}]
+	}`
+	golden := map[string]string{
+		chvGoldenVMState:    "fake vmstate bytes",
+		chvGoldenMemFile:    "fake memfile bytes",
+		chvGoldenConfigFile: goldenConfig,
+	}
+	for name, content := range golden {
+		if err := os.WriteFile(filepath.Join(goldenDir, name), []byte(content), 0o600); err != nil {
+			t.Fatalf("seed golden %s: %v", name, err)
+		}
+	}
+
+	vsockSock := filepath.Join(runDir, "vsock.sock")
+	fsSock := filepath.Join(runDir, "vfsd.sock")
+	if err := chvStageSnapshotFiles(goldenDir, runDir, vsockSock, fsSock); err != nil {
+		t.Fatalf("chvStageSnapshotFiles: %v", err)
+	}
+
+	// The decisive assertion: CH's native names must be PRESENT in runDir, by
+	// filename, with the right content carried over from their golden counterpart —
+	// not merely "the constants exist somewhere in the source".
+	wantContent := map[string]string{
+		chvSnapshotStateFile:    "fake vmstate bytes", // golden vmstate -> native state.json
+		chvSnapshotMemoryRanges: "fake memfile bytes", // golden memfile -> native memory-ranges
+	}
+	for native, want := range wantContent {
+		got, err := os.ReadFile(filepath.Join(runDir, native))
+		if err != nil {
+			t.Fatalf("runDir missing native file %q: %v", native, err)
+		}
+		if string(got) != want {
+			t.Fatalf("runDir/%s content = %q, want %q", native, got, want)
+		}
+	}
+	// config.json (native) must exist and be the REWRITTEN golden ch-config.json,
+	// with this VM's own socket paths substituted in.
+	cfg, err := os.ReadFile(filepath.Join(runDir, chvSnapshotConfigFile))
+	if err != nil {
+		t.Fatalf("runDir missing native %q: %v", chvSnapshotConfigFile, err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(cfg, &doc); err != nil {
+		t.Fatalf("runDir/%s is not valid JSON: %v", chvSnapshotConfigFile, err)
+	}
+	if vsock, _ := doc["vsock"].(map[string]any); vsock["socket"] != vsockSock {
+		t.Fatalf("runDir/%s vsock.socket = %v, want %v", chvSnapshotConfigFile, vsock["socket"], vsockSock)
+	}
+
+	// And the golden names themselves must NOT be the names runDir exposes to CH —
+	// this is what actually catches a reversed or mis-pointed mapping, since a
+	// broken mapping that merely renamed golden->golden would otherwise slip past
+	// the assertions above.
+	for _, goldenName := range []string{chvGoldenVMState, chvGoldenMemFile, chvGoldenConfigFile} {
+		if goldenName == chvSnapshotConfigFile || goldenName == chvSnapshotMemoryRanges || goldenName == chvSnapshotStateFile {
+			continue // names happen to collide; nothing to check
+		}
+		if _, err := os.Stat(filepath.Join(runDir, goldenName)); err == nil {
+			t.Fatalf("runDir unexpectedly has a file under the GOLDEN name %q; vm.restore needs CH's native names", goldenName)
+		}
+	}
+}

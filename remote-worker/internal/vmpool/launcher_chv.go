@@ -92,14 +92,40 @@ const (
 	// memory-ranges, state.json — structurally different from Firecracker's
 	// vmstate+memfile pair (snapshot.go's fileVMState/fileMemory), and NOT added as
 	// package-level constants there because they are CH-specific, not shared shape.
+	//
+	// THESE ARE THE WRITE SIDE ONLY: the names Restore's staging step writes INTO
+	// runDir, because that is what CH's own vm.restore requires inside the
+	// directory it restores from. They are NOT the names the golden SnapshotDir
+	// ships its files under — see chvGoldenVMState/chvGoldenMemFile/
+	// chvGoldenConfigFile immediately below for the READ side, and do not collapse
+	// the two blocks: config.json appears on the write side here but as
+	// ch-config.json on the golden side, while memory-ranges/state.json here read
+	// from golden files named memfile/vmstate — no name is shared between the two
+	// sides, which is exactly what makes merging them back into one constant set
+	// silently wrong.
 	chvSnapshotConfigFile   = "config.json"
 	chvSnapshotMemoryRanges = "memory-ranges"
 	chvSnapshotStateFile    = "state.json"
+
+	// chvGoldenVMState, chvGoldenMemFile, chvGoldenConfigFile are the names the
+	// GOLDEN artifact (SnapshotDir) ships CH's snapshot files under. They differ
+	// from chvSnapshot* above on purpose: deploy/microvm/build-snapshot.sh's
+	// lock_down renames CH's native three-file output (config.json, memory-ranges,
+	// state.json) into vmstate/memfile (the SAME pair Firecracker's snapshot uses)
+	// plus ch-config.json, "so both VMMs feed write_manifest identically" (that
+	// script's own comment) — one manifest schema, one hash set, one verify path
+	// covers both arms. Restore's staging step is where that gets translated back:
+	// it reads these golden names and writes the chvSnapshot* native names into
+	// runDir, which is the one place CH's own native-name requirement actually has
+	// to be satisfied.
+	chvGoldenVMState    = "vmstate"
+	chvGoldenMemFile    = "memfile"
+	chvGoldenConfigFile = "ch-config.json"
 )
 
 // CHVOptions configures the Cloud Hypervisor launcher.
 type CHVOptions struct {
-	SnapshotDir  string // golden snapshot dir: config.json, memory-ranges, state.json
+	SnapshotDir  string // golden snapshot dir: vmstate, memfile, ch-config.json (see build-snapshot.sh's lock_down)
 	CHVBin       string
 	ChRemoteBin  string
 	VirtiofsdBin string
@@ -373,6 +399,48 @@ func rewriteSnapshotConfig(src []byte, vsockPath, fsSocketPath string) ([]byte, 
 	return out, nil
 }
 
+// chvStageSnapshotFiles stages one standby's snapshot files into runDir under
+// CH's OWN required native names, translating from the golden artifact's unified
+// names as it goes (see chvGoldenVMState/chvGoldenMemFile/chvGoldenConfigFile and
+// chvSnapshotMemoryRanges/chvSnapshotStateFile/chvSnapshotConfigFile above for
+// the full naming rationale). This translation exists because
+// deploy/microvm/build-snapshot.sh's lock_down deliberately ships CH's snapshot
+// under the SAME vmstate/memfile names Firecracker uses (plus ch-config.json)
+// rather than CH's native config.json/memory-ranges/state.json — one manifest
+// schema and hash set covers both arms — while CH's own vm.restore still requires
+// its native names inside the directory it restores from. runDir is that
+// directory, so this function is where the two requirements reconcile: it is a
+// pure filesystem operation (hardlink + read/rewrite/write), no exec and no KVM,
+// so it is unit-testable on its own — see
+// TestRestoreStagesCHNativeNamesFromGoldenNames, added specifically because a
+// mismatch here (reading CH-native names from a golden dir that never has them)
+// shipped once already and no test caught it.
+func chvStageSnapshotFiles(snapshotDir, runDir, vsockSock, fsSock string) error {
+	for _, m := range []struct{ golden, native string }{
+		{chvGoldenMemFile, chvSnapshotMemoryRanges},
+		{chvGoldenVMState, chvSnapshotStateFile},
+	} {
+		src := filepath.Join(snapshotDir, m.golden)
+		dst := filepath.Join(runDir, m.native)
+		_ = os.Remove(dst) // best-effort: a stale link from an aborted prior attempt at this ID
+		if err := os.Link(src, dst); err != nil {
+			return fmt.Errorf("hardlink %s: %w", m.native, err)
+		}
+	}
+	golden, err := os.ReadFile(filepath.Join(snapshotDir, chvGoldenConfigFile))
+	if err != nil {
+		return fmt.Errorf("read golden config.json: %w", err)
+	}
+	rewritten, err := rewriteSnapshotConfig(golden, vsockSock, fsSock)
+	if err != nil {
+		return fmt.Errorf("rewrite config.json: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, chvSnapshotConfigFile), rewritten, 0o600); err != nil {
+		return fmt.Errorf("write per-VM config.json: %w", err)
+	}
+	return nil
+}
+
 // Restore brings up one standby from the golden snapshot and returns it PAUSED
 // (CH's own restore does not resume — Resume, below, does). Every failure path
 // cleans up whatever it already created and returns (nil, err), mirroring
@@ -469,31 +537,16 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: virtiofsd socket never appeared: %s: %w", req.ID, chvReadConsole(fsConsole.Name()), err), cleanup())
 	}
 
-	// --- per-VM snapshot config: hardlink the two large golden files unchanged,
-	// copy+rewrite config.json's embedded vsock/fs socket paths so two standbys
-	// restored from the SAME golden snapshot never collide on either socket path —
-	// see rewriteSnapshotConfig's doc comment for the full justification and its
-	// "unverified end to end" caveat. ---
+	// --- per-VM snapshot config: hardlink the two large golden files unchanged
+	// (renaming golden -> CH-native as they land in runDir — see chvGolden* above
+	// and chvStageSnapshotFiles's own doc comment for why this translation exists
+	// at all), copy+rewrite config.json's embedded vsock/fs socket paths so two
+	// standbys restored from the SAME golden snapshot never collide on either
+	// socket path — see rewriteSnapshotConfig's doc comment for the full
+	// justification and its "unverified end to end" caveat. ---
 	vsockSock := filepath.Join(runDir, "vsock.sock")
-	for _, name := range []string{chvSnapshotMemoryRanges, chvSnapshotStateFile} {
-		src := filepath.Join(l.opts.SnapshotDir, name)
-		dst := filepath.Join(runDir, name)
-		_ = os.Remove(dst) // best-effort: a stale link from an aborted prior attempt at this ID
-		if err := os.Link(src, dst); err != nil {
-			return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: hardlink %s: %w", req.ID, name, err), cleanup())
-		}
-	}
-	golden, err := os.ReadFile(filepath.Join(l.opts.SnapshotDir, chvSnapshotConfigFile))
-	if err != nil {
-		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: read golden config.json: %w", req.ID, err), cleanup())
-	}
-	rewritten, err := rewriteSnapshotConfig(golden, vsockSock, fsSock)
-	if err != nil {
-		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: rewrite config.json: %w", req.ID, err), cleanup())
-	}
-	perVMConfigPath := filepath.Join(runDir, chvSnapshotConfigFile)
-	if err := os.WriteFile(perVMConfigPath, rewritten, 0o600); err != nil {
-		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: write per-VM config.json: %w", req.ID, err), cleanup())
+	if err := chvStageSnapshotFiles(l.opts.SnapshotDir, runDir, vsockSock, fsSock); err != nil {
+		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: %w", req.ID, err), cleanup())
 	}
 
 	// --- cloud-hypervisor itself. UNCHROOTED on this arm — see this file's
