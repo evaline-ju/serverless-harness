@@ -40,6 +40,47 @@ import (
 // just the VMM process. Spec §5.3 expects an equivalent for it; Task 17 owns
 // supplying the per-arm confinement/cgroup mechanism split, not this task. This is
 // verified and known, not a guess — see task-16-hardware-corrections.md C5.
+//
+// TASK 17'S DISPOSITION OF C5 (D3/D4, hardware-corrections): D3 — the cgroup half —
+// IS closed below: chvSystemdRunScopeArgv wraps the cloud-hypervisor exec in
+// `systemd-run --scope --slice=<the same slice Firecracker's jailer --parent-cgroup
+// targets> -p MemoryMax=<vmpool.PerVMBytes(cfg)>`, giving this arm the same per-VM
+// cgroup and memory.max bound jailer gives Firecracker's, from the same
+// single-source-of-truth function (config.go's PerVMBytes) so the two arms cannot
+// drift apart (spec §5.3). `--scope` was chosen specifically because it execs the
+// target IN PLACE of the systemd-run client process rather than forking a detached
+// unit (confirmed against systemd-run(1): "the invoked process is run as part of
+// the scope unit... rather than as a child process of systemd-run"), so
+// vmmCmd.Process.Pid, fcKillProcessGroup(pid), and vmmCmd.Wait() below all keep
+// working unmodified — the single most safety-critical property this whole file
+// has (Destroy must always be able to kill and reap what Restore started) is
+// preserved exactly, not merely assumed.
+//
+// D4 — the chroot/filesystem-isolation half — is DELIBERATELY NOT closed here,
+// and this is a reasoned finding, not a silent gap. The one mechanism that could
+// close it without hand-rolled Go-level mount-namespace code is switching from
+// `systemd-run --scope` to a transient systemd *service* (drop --scope), because
+// only a full service unit's execution context grants access to systemd's
+// filesystem-sandboxing properties (RootDirectory=, ProtectSystem=strict,
+// BindPaths=/BindReadOnlyPaths=, DeviceAllow=/dev/kvm rw with PrivateDevices=yes,
+// NoNewPrivileges=yes) — a --scope unit only relocates an already-running process
+// into a cgroup and applies none of those. But a transient service forks
+// asynchronously and is reaped by the systemd manager, not by this process, so
+// keeping our foreground exec.Cmd handle synchronized with it would require one of
+// systemd-run's --pipe/--wait/--collect flags, whose exact interaction with
+// signal delivery and process-group membership this task has no real Linux host
+// with systemd + KVM to verify. Getting that interaction wrong would silently
+// break exactly the property D3 above was careful to preserve: sending SIGKILL to
+// vmmCmd's own pid would kill the systemd-run client but NOT the systemd-managed
+// service process tree it detached from, so Destroy would report success having
+// killed nothing — reintroducing, for this arm, the precise "worker crash leaks
+// VMs" failure spec §6 names as the #1 practical failure this whole task exists to
+// prevent, except now on ordinary Destroy rather than only on a crash. Shipping
+// that unverified is a worse outcome than shipping the already-disclosed gap: a
+// known, named absence versus a confinement mechanism that looks correct in argv
+// construction and quietly defeats cleanup in production. Closing D4 properly is
+// left as a follow-up that needs hardware verification, not a code change made
+// blind.
 const (
 	// defaultCHVVsockPort mirrors launcher_firecracker.go's defaultFCVsockPort: the
 	// guest agent's own default ("vsock:1024"), duplicated rather than imported for
@@ -75,8 +116,25 @@ type CHVOptions struct {
 
 	// ParentCgroup mirrors FirecrackerOptions.ParentCgroup's doc comment exactly:
 	// must be configured consistently with Task 17's systemd slice, or left empty
-	// to defer to a default this launcher does not guess.
+	// to defer to a default this launcher does not guess. When set, it names a
+	// cgroupfs path (e.g. "/sys/fs/cgroup/microvm-vms.slice") — chvCgroupSliceName
+	// derives the bare slice name systemd-run --slice wants from it, so callers
+	// configure this launcher and the Firecracker one with the identical value.
 	ParentCgroup string
+
+	// CgroupMemoryMaxBytes mirrors FirecrackerOptions.CgroupMemoryMaxBytes exactly
+	// (see that field's doc comment for the full D1 argument): the per-VM cgroup
+	// memory.max this arm's systemd-run --scope is told to set via
+	// `-p MemoryMax=`, MUST equal vmpool.PerVMBytes(cfg) — the same figure
+	// admission control charges per VM — set by the caller, never a fresh
+	// constant. Only meaningful, and only applied, when ParentCgroup is also set.
+	CgroupMemoryMaxBytes int64
+
+	// SystemdRunBin is the systemd-run binary used to create this VM's per-VM
+	// cgroup scope (D3, hardware-corrections). Defaults to "systemd-run" (PATH
+	// lookup) when empty; overridable for tests the same way CHVBin/ChRemoteBin/
+	// VirtiofsdBin are.
+	SystemdRunBin string
 
 	// VsockPort is the guest agent's listen port. Defaults to 1024 when zero.
 	VsockPort uint32
@@ -85,6 +143,9 @@ type CHVOptions struct {
 func (o *CHVOptions) setDefaults() {
 	if o.VsockPort == 0 {
 		o.VsockPort = defaultCHVVsockPort
+	}
+	if o.SystemdRunBin == "" {
+		o.SystemdRunBin = "systemd-run"
 	}
 }
 
@@ -108,6 +169,15 @@ func (o CHVOptions) validate() error {
 		return errors.New("cloud-hypervisor: VirtiofsdUID/VirtiofsdGID must not be 0: " +
 			"virtiofsd resolves guest paths on the host and is spec §3.5's confinement " +
 			"boundary — running it as root would make that boundary decorative")
+	case o.ParentCgroup != "" && o.CgroupMemoryMaxBytes <= 0:
+		// D1's mirror for this arm: a ParentCgroup with no memory bound would leave
+		// systemd-run --scope with nothing to set via -p MemoryMax=, which is this
+		// arm's version of jailer moving a process into the slice without ever
+		// creating a bounded per-VM cgroup. Fail loudly at construction, matching
+		// launcher_firecracker.go's identical check.
+		return errors.New("cloud-hypervisor: ParentCgroup is set but CgroupMemoryMaxBytes is <= 0 " +
+			"— systemd-run --scope would create a per-VM cgroup with no memory.max " +
+			"(spec §6 mitigation #3 would be unimplemented); set it from vmpool.PerVMBytes(cfg)")
 	}
 	return nil
 }
@@ -162,6 +232,43 @@ func virtiofsdArgv(opts CHVOptions, sock, dir string) []string {
 		"--cache=never",
 		"--inode-file-handles=mandatory",
 	}
+}
+
+// chvCgroupSliceName derives the bare slice unit name systemd-run --slice wants
+// (e.g. "microvm-vms.slice") from ParentCgroup's cgroupfs path (e.g.
+// "/sys/fs/cgroup/microvm-vms.slice") — the same value FirecrackerOptions.ParentCgroup
+// takes, so a caller configures both arms identically and this is the one place that
+// translates it into what systemd-run itself expects on its command line.
+func chvCgroupSliceName(parentCgroup string) string {
+	return filepath.Base(parentCgroup)
+}
+
+// chvSystemdRunScopeArgv returns the systemd-run argv PREFIX (everything before the
+// real cloud-hypervisor binary and its own args) that creates and bounds this VM's
+// per-VM cgroup (D3, hardware-corrections): --scope so the target execs in place of
+// the systemd-run client rather than forking a detached unit (this file's
+// package-level comment explains why that property is load-bearing for Destroy's
+// kill-and-reap contract), --unit so the transient scope has a stable,
+// human-diagnosable name, --slice so it lands under the SAME parent slice
+// Firecracker's jailer --parent-cgroup targets (spec §5.3), and
+// -p MemoryMax=<bytes> — the value that must equal vmpool.PerVMBytes(cfg), never a
+// second constant (D1's argument, mirrored here). Split out of Restore's argv
+// construction, like firecrackerCgroupArgs, so a test can assert the memory bound
+// agrees with PerVMBytes(cfg) without spawning systemd-run.
+//
+// UNVERIFIED END TO END (see this file's package comment, D4 disposition): this task
+// has no host with systemd + KVM to run this argv for real. What IS verified is the
+// documented behaviour of --scope (systemd-run(1)) that motivated choosing it over a
+// transient service.
+func chvSystemdRunScopeArgv(opts CHVOptions, unitName string) []string {
+	if opts.ParentCgroup == "" {
+		return nil
+	}
+	args := []string{"--scope", "--unit=" + unitName, "--slice=" + chvCgroupSliceName(opts.ParentCgroup)}
+	if opts.CgroupMemoryMaxBytes > 0 {
+		args = append(args, "-p", fmt.Sprintf("MemoryMax=%d", opts.CgroupMemoryMaxBytes))
+	}
+	return args
 }
 
 // chvChown is os.Chown, indirected so tests can verify Restore's ownership
@@ -390,11 +497,14 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 	}
 
 	// --- cloud-hypervisor itself. UNCHROOTED on this arm — see this file's
-	// package-level comment (hardware-corrections C5): that gap is Task 17's to
-	// close, not this task's. Console output is captured to a file (not discarded,
-	// unlike Firecracker's jailed stdout/stderr) specifically so a guest panic —
-	// e.g. hardware-corrections C3's missing-`root=`-on-cmdline panic — surfaces in
-	// the returned error instead of degrading into an opaque waitForUnixSocket/
+	// package-level comment (hardware-corrections C5, and Task 17's D3/D4
+	// disposition of it just below that): the per-VM CGROUP half of that gap IS
+	// closed here, via chvSystemdRunScopeArgv, when l.opts.ParentCgroup is set; the
+	// filesystem-confinement half is a documented, reasoned non-closure, not a
+	// silent one. Console output is captured to a file (not discarded, unlike
+	// Firecracker's jailed stdout/stderr) specifically so a guest panic — e.g.
+	// hardware-corrections C3's missing-`root=`-on-cmdline panic — surfaces in the
+	// returned error instead of degrading into an opaque waitForUnixSocket/
 	// ch-remote timeout indistinguishable from a wedged VMM. ---
 	apiSock := filepath.Join(runDir, "api.sock")
 	console, err = os.Create(filepath.Join(runDir, "console.log"))
@@ -402,7 +512,19 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: create console log: %w", req.ID, err), cleanup())
 	}
 	vmmArgv := []string{"--api-socket", apiSock}
-	vmmCmd = exec.Command(l.opts.CHVBin, vmmArgv...)
+	vmmBin := l.opts.CHVBin
+	if l.opts.ParentCgroup != "" {
+		// D3: wrap the real binary+args behind systemd-run --scope so this VM gets
+		// its own cgroup under the same slice Firecracker's jailer targets, bounded
+		// to the same PerVMBytes(cfg) figure. --scope execs cloud-hypervisor IN
+		// PLACE of the systemd-run client (see chvSystemdRunScopeArgv's doc
+		// comment), so vmmCmd.Process.Pid below is cloud-hypervisor's own pid, not
+		// a detached systemd-managed process this handle can no longer kill —
+		// Destroy's kill-and-reap contract is unchanged by this wrapping.
+		vmmBin = l.opts.SystemdRunBin
+		vmmArgv = append(chvSystemdRunScopeArgv(l.opts, "vm-"+req.ID), append([]string{l.opts.CHVBin}, vmmArgv...)...)
+	}
+	vmmCmd = exec.Command(vmmBin, vmmArgv...)
 	vmmCmd.Stdout = console
 	vmmCmd.Stderr = console
 	chvIsolateAndDropPrivileges(vmmCmd, 0, 0) // Setpgid only: uid==0 is a no-op sentinel, see the helper's doc comment

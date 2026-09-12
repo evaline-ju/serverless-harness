@@ -78,6 +78,19 @@ type FirecrackerOptions struct {
 	// guess a value Task 17 has not defined yet.
 	ParentCgroup string
 
+	// CgroupMemoryMaxBytes is the per-VM cgroup memory.max jailer is told to write via
+	// --cgroup (Task 17, hardware-corrections D1). Without --cgroup, jailer only
+	// MOVES the jailed process into --parent-cgroup if that path already exists — it
+	// does NOT create a new cgroup, so on its own ParentCgroup produces no per-VM
+	// memory.max at all and spec §6's mitigation #3 ("a ballooning command is killed
+	// inside its own cgroup") is unimplemented; this was confirmed directly against
+	// real jailer output (task-17-hardware-corrections.md D1). This value MUST equal
+	// vmpool.PerVMBytes(cfg) — the same figure admission control charges per VM — set
+	// by the caller (cmd/microvm-worker/main.go's launcherFor), never a fresh
+	// constant, or the two numbers drift apart (spec §5.3). Only meaningful, and only
+	// applied, when ParentCgroup is also set.
+	CgroupMemoryMaxBytes int64
+
 	// WorkspaceImageBytes sizes the lazily-created workspace.img ext4 filesystem
 	// (the second drive, guest /dev/vdb). Created once per run (RestoreRequest.
 	// WorkspaceDir) on first Restore into that workspace, then hardlinked into every
@@ -109,8 +122,35 @@ func (o FirecrackerOptions) validate() error {
 		return errors.New("firecracker: FirecrackerBin is required")
 	case o.ChrootBase == "":
 		return errors.New("firecracker: ChrootBase is required")
+	case o.ParentCgroup != "" && o.CgroupMemoryMaxBytes <= 0:
+		// D1: a ParentCgroup with no memory bound is exactly the half-wired state the
+		// hardware corrections found in committed code — jailer moves the process into
+		// the slice but creates no per-VM cgroup and sets no memory.max. Fail loudly at
+		// construction rather than silently omitting --cgroup at Restore time.
+		return errors.New("firecracker: ParentCgroup is set but CgroupMemoryMaxBytes is <= 0 " +
+			"— jailer would move the VM into the slice without creating a per-VM cgroup or " +
+			"memory.max (spec §6 mitigation #3 would be unimplemented); set it from vmpool.PerVMBytes(cfg)")
 	}
 	return nil
+}
+
+// firecrackerCgroupArgs returns the jailer flags that create and bound this VM's own
+// cgroup: --cgroup-version 2 (D2: jailer's own default is version "1", which this
+// cgroup2-only host does not have — always pass 2 explicitly), --parent-cgroup (so the
+// VM's cgroup lands under Task 17's systemd slice, spec §5.3), and --cgroup
+// memory.max=<bytes> (D1: the flag that actually creates the per-VM cgroup at all;
+// --parent-cgroup alone only relocates the process into the shared parent). Split out
+// of Restore's argv construction so a test can assert the memory bound agrees with
+// PerVMBytes(cfg) without spawning jailer.
+func firecrackerCgroupArgs(opts FirecrackerOptions) []string {
+	if opts.ParentCgroup == "" {
+		return nil
+	}
+	args := []string{"--cgroup-version", "2", "--parent-cgroup", opts.ParentCgroup}
+	if opts.CgroupMemoryMaxBytes > 0 {
+		args = append(args, "--cgroup", fmt.Sprintf("memory.max=%d", opts.CgroupMemoryMaxBytes))
+	}
+	return args
 }
 
 // firecrackerLauncher is the Firecracker arm of Launcher.
@@ -256,9 +296,11 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		"--gid", strconv.Itoa(l.opts.GID),
 		"--chroot-base-dir", l.opts.ChrootBase,
 	}
-	if l.opts.ParentCgroup != "" {
-		args = append(args, "--cgroup-version", "2", "--parent-cgroup", l.opts.ParentCgroup)
-	}
+	// firecrackerCgroupArgs appends --cgroup-version/--parent-cgroup/--cgroup: the last
+	// of the three is load-bearing, not decorative — without it jailer relocates this
+	// process into the shared parent cgroup but creates no cgroup of its own, so no
+	// per-VM memory.max is ever set (Task 17, hardware-corrections D1).
+	args = append(args, firecrackerCgroupArgs(l.opts)...)
 	// Coordinator finding #5: this launcher never issues PUT /network-interfaces —
 	// standbys are headless by construction, not by omission. Nothing below adds one.
 	args = append(args, "--", "--api-sock", apiSockRelPath)

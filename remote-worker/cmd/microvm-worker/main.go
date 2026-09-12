@@ -125,8 +125,14 @@ func poolConfig(get func(string) string) (vmpool.Config, error) {
 //
 // get and snapDir are threaded through (rather than read from the environment
 // inline) so this function stays a pure mapping from already-resolved config to a
-// Launcher — the same shape poolConfig above already uses.
-func launcherFor(kind vmpool.VMMKind, get func(string) string, snapDir string) (vmpool.Launcher, error) {
+// Launcher — the same shape poolConfig above already uses. perVMBytes is
+// vmpool.PerVMBytes(cfg) (Task 17, hardware-corrections D1): the SAME figure
+// admission control charges per VM, threaded into both arms' CgroupMemoryMaxBytes
+// below so jailer's --cgroup memory.max= (Firecracker) and systemd-run --scope's
+// -p MemoryMax= (Cloud Hypervisor) can never drift from a second, independently
+// maintained constant — there must be exactly one number, computed once in main(),
+// not re-derived per arm.
+func launcherFor(kind vmpool.VMMKind, get func(string) string, snapDir string, perVMBytes int64) (vmpool.Launcher, error) {
 	switch kind {
 	case vmpool.Firecracker:
 		wsImageMB, err := envInt64(get, "SH_WORKSPACE_IMAGE_MB", 2048)
@@ -134,15 +140,16 @@ func launcherFor(kind vmpool.VMMKind, get func(string) string, snapDir string) (
 			return nil, err
 		}
 		return vmpool.NewFirecrackerLauncher(vmpool.FirecrackerOptions{
-			SnapshotDir:         snapDir,
-			JailerBin:           env(get, "SH_JAILER_BIN", "/usr/bin/jailer"),
-			FirecrackerBin:      env(get, "SH_FIRECRACKER_BIN", "/usr/bin/firecracker"),
-			ChrootBase:          env(get, "SH_CHROOT_BASE", "/srv/jail"),
-			UID:                 os.Getuid(),
-			GID:                 os.Getgid(),
-			ParentCgroup:        env(get, "SH_PARENT_CGROUP", "microvm-vms.slice"),
-			WorkspaceImageBytes: wsImageMB << 20,
-			VsockPort:           1024,
+			SnapshotDir:          snapDir,
+			JailerBin:            env(get, "SH_JAILER_BIN", "/usr/bin/jailer"),
+			FirecrackerBin:       env(get, "SH_FIRECRACKER_BIN", "/usr/bin/firecracker"),
+			ChrootBase:           env(get, "SH_CHROOT_BASE", "/srv/jail"),
+			UID:                  os.Getuid(),
+			GID:                  os.Getgid(),
+			ParentCgroup:         env(get, "SH_PARENT_CGROUP", "microvm-vms.slice"),
+			CgroupMemoryMaxBytes: perVMBytes,
+			WorkspaceImageBytes:  wsImageMB << 20,
+			VsockPort:            1024,
 		})
 	case vmpool.CloudHypervisor:
 		// VirtiofsdUID/VirtiofsdGID deliberately do NOT mirror the Firecracker case's
@@ -174,15 +181,16 @@ func launcherFor(kind vmpool.VMMKind, get func(string) string, snapDir string) (
 		// removes structurally, matching this file's existing "no code path that
 		// could do otherwise" preference over a documentation-only guarantee.
 		return vmpool.NewCloudHypervisorLauncher(vmpool.CHVOptions{
-			SnapshotDir:  snapDir,
-			CHVBin:       env(get, "SH_CHV_BIN", "/usr/bin/cloud-hypervisor"),
-			ChRemoteBin:  env(get, "SH_CH_REMOTE_BIN", "/usr/bin/ch-remote"),
-			VirtiofsdBin: env(get, "SH_VIRTIOFSD_BIN", "/usr/libexec/virtiofsd"),
-			RunDir:       env(get, "SH_CHV_RUN_DIR", "/run/microvm-worker/chv"),
-			VirtiofsdUID: int(uid),
-			VirtiofsdGID: int(gid),
-			ParentCgroup: env(get, "SH_PARENT_CGROUP", "microvm-vms.slice"),
-			VsockPort:    1024,
+			SnapshotDir:          snapDir,
+			CHVBin:               env(get, "SH_CHV_BIN", "/usr/bin/cloud-hypervisor"),
+			ChRemoteBin:          env(get, "SH_CH_REMOTE_BIN", "/usr/bin/ch-remote"),
+			VirtiofsdBin:         env(get, "SH_VIRTIOFSD_BIN", "/usr/libexec/virtiofsd"),
+			RunDir:               env(get, "SH_CHV_RUN_DIR", "/run/microvm-worker/chv"),
+			VirtiofsdUID:         int(uid),
+			VirtiofsdGID:         int(gid),
+			ParentCgroup:         env(get, "SH_PARENT_CGROUP", "microvm-vms.slice"),
+			CgroupMemoryMaxBytes: perVMBytes,
+			VsockPort:            1024,
 		})
 	default:
 		return nil, fmt.Errorf("SH_VMM=%q must be %q or %q; there is no host-execution fallback (spec §3.5)",
@@ -368,7 +376,7 @@ func main() {
 	// kernel/rootfs/agent/manifest.json set), not cfg.SnapshotDir itself, which is
 	// only the parent directory a specific image lives under.
 	snapDir := filepath.Join(cfg.SnapshotDir, env(get, "SH_SNAPSHOT_IMAGE", "default"))
-	lc, err := launcherFor(cfg.VMM, get, snapDir)
+	lc, err := launcherFor(cfg.VMM, get, snapDir, vmpool.PerVMBytes(cfg))
 	if err != nil {
 		log.Fatalf("microvm-worker: %v", err)
 	}
@@ -397,6 +405,30 @@ func main() {
 		log.Fatalf("microvm-worker: %v", err)
 	}
 	defer func() { _ = unpin() }()
+
+	// Task 17 (spec §6's #1 practical failure: a worker crash leaks VMs). Both steps
+	// below run before Probe, in the same "fail at start, not on a user's first
+	// request" posture as everything else in this block.
+	soft, hard, err := vmpool.RaiseMemlockLimit()
+	if err != nil {
+		log.Fatalf("microvm-worker: RLIMIT_MEMLOCK: %v", err)
+	}
+	// Recorded, per spec §7.5: a kernel limit mistaken for a density ceiling fails at
+	// 500 VMs after working at 20, indistinguishably from the real thing.
+	log.Printf("microvm-worker: RLIMIT_MEMLOCK soft=%d hard=%d", soft, hard)
+
+	// Orphans from a previous incarnation. Spec §6's #1 practical failure: without this,
+	// a crash-restart loop leaks VMs at the crash rate and every density number after it
+	// is a fiction. Arm-agnostic (hardware-corrections D3): this walks whatever either
+	// VMM's cgroup-creation mechanism left under the slice, keyed on cgroup.procs pids
+	// rather than process names (D8: cloud-hypervisor's comm is truncated to 15 chars by
+	// the kernel, so a name-based sweep would silently miss that arm's orphans).
+	if n, err := vmpool.SweepOrphans(env(get, "SH_PARENT_CGROUP", "/sys/fs/cgroup/microvm-vms.slice")); err != nil {
+		log.Printf("microvm-worker: orphan sweep: %v", err)
+	} else if n > 0 {
+		log.Printf("microvm-worker: swept %d orphaned VM cgroups from a previous incarnation", n)
+	}
+
 	if err := pool.Probe(context.Background()); err != nil {
 		log.Fatalf("microvm-worker: %v", err)
 	}

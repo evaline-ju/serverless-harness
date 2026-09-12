@@ -1,0 +1,58 @@
+# deploy/microvm/microvm-worker.service
+#
+# Runs cmd/microvm-worker (see remote-worker/cmd/microvm-worker/main.go) as the unit
+# that owns every VM's cgroup for the lifetime of the process (Task 17, spec §6's #1
+# practical failure: "Worker crash leaks VMs"). KillMode=control-group below is the
+# half of that mitigation systemd itself provides -- on stop or crash, systemd kills
+# every process left in this unit's control group, VMs included, rather than only the
+# worker's own pid. SweepOrphans (called from main(), before Probe) is the OTHER half:
+# it reconciles whatever survived a kill-9/OOM/power-loss that KillMode=control-group
+# never got a chance to run for.
+
+[Unit]
+Description=microvm-worker: ephemeral microVM sandbox tier (serverless-harness P4)
+Documentation=https://github.com/kagenti/serverless-harness
+After=network-online.target
+Wants=network-online.target
+# Spec §6: "KVM unavailable at startup ... Fail the unit at start with an explicit
+# message; never fall back to running commands on the host." AssertPathExists fails
+# the unit before ExecStart even runs, which is a stronger, earlier form of that
+# posture than leaving it to the process's own vmpool.New/Probe checks alone.
+AssertPathExists=/dev/kvm
+
+[Service]
+Type=simple
+Slice=microvm-vms.slice
+ExecStart=/usr/local/bin/microvm-worker
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+# RLIMIT_MEMLOCK: PinMemoryFile (memfile mlock, spec §4.3) and, per VM, the guest's
+# own memory need to be lockable. main() also calls vmpool.RaiseMemlockLimit() at
+# startup to raise the soft limit to the hard limit within whatever this unit grants,
+# but the unit's own ceiling is the hard cap that call cannot exceed -- infinity here
+# is deliberate for exactly the reason spec §7.5 names: a kernel limit mistaken for a
+# density ceiling fails at 500 VMs after working at 20, indistinguishably from the
+# real thing, so this must not be the thing that silently caps density.
+LimitMEMLOCK=infinity
+# Every VM's vsock/API socket, plus the relay connection and whatever standby depth
+# is configured, each cost file descriptors; spec §7.5 names nofile as one of the
+# kernel limits that must be raised deliberately rather than discovered at 500 VMs.
+LimitNOFILE=1048576
+
+Environment=SH_VMM=firecracker
+Environment=SH_SNAPSHOT_DIR=/srv/snapshots
+Environment=SH_WORKSPACE_ROOT=/srv/workspaces
+Environment=SH_CHROOT_BASE=/srv/jail
+Environment=SH_PARENT_CGROUP=/sys/fs/cgroup/microvm-vms.slice
+Environment=SH_STANDBY_DEPTH=2
+Environment=SH_GUEST_RAM_MB=256
+Environment=SH_MAX_RUNS=64
+Environment=SH_MAX_COMMITTED_MB=24576
+Environment=SH_MEMORY_RESERVE_MB=4096
+
+[Install]
+WantedBy=multi-user.target

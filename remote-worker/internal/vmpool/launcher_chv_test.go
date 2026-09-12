@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -72,6 +73,61 @@ func TestVirtiofsdArgvCarriesItsSandbox(t *testing.T) {
 	// regression back to the brief's original (wrong) default.
 	if strings.Contains(joined, "--cache=auto") {
 		t.Error("--cache=auto is a known dead end (disconnects immediately) — must not appear in argv")
+	}
+}
+
+// TestCloudHypervisorParentCgroupRequiresMemoryMax is validate()'s mirror of
+// launcher_firecracker.go's identical check: a ParentCgroup with no memory bound
+// would leave systemd-run --scope creating a per-VM cgroup with no memory.max at
+// all, which is this arm's version of D1's "half-wired state".
+func TestCloudHypervisorParentCgroupRequiresMemoryMax(t *testing.T) {
+	opts := chvOpts(t)
+	opts.ParentCgroup = "/sys/fs/cgroup/microvm-vms.slice"
+	opts.CgroupMemoryMaxBytes = 0
+	if _, err := NewCloudHypervisorLauncher(opts); err == nil {
+		t.Fatal("NewCloudHypervisorLauncher accepted ParentCgroup with CgroupMemoryMaxBytes <= 0")
+	}
+}
+
+// TestCloudHypervisorSystemdRunScopeAgreesWithPerVMBytes is
+// TestFirecrackerJailerCgroupMemoryMaxAgreesWithPerVMBytes's mirror for this arm
+// (D1/D3): the -p MemoryMax= value systemd-run --scope is told to set must equal
+// vmpool.PerVMBytes(cfg), not a second, independently maintained constant.
+func TestCloudHypervisorSystemdRunScopeAgreesWithPerVMBytes(t *testing.T) {
+	cfg := Config{
+		GuestRAMBytes:   256 << 20,
+		VMOverheadBytes: DefaultVMOverheadBytes,
+	}
+	want := PerVMBytes(cfg)
+
+	opts := chvOpts(t)
+	opts.ParentCgroup = "/sys/fs/cgroup/microvm-vms.slice"
+	opts.CgroupMemoryMaxBytes = want
+	opts.setDefaults()
+	if err := opts.validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	args := chvSystemdRunScopeArgv(opts, "vm-7")
+	joined := strings.Join(args, " ")
+	wantFlag := "MemoryMax=" + strconv.FormatInt(want, 10)
+	if !strings.Contains(joined, wantFlag) {
+		t.Fatalf("systemd-run args %q do not contain %q — the cgroup bound has drifted from PerVMBytes(cfg) = %d", joined, wantFlag, want)
+	}
+	if !strings.Contains(joined, "--slice=microvm-vms.slice") {
+		t.Fatalf("systemd-run args %q do not target the microvm-vms.slice parent (spec §5.3: both arms must agree on the same slice)", joined)
+	}
+}
+
+// TestChvCgroupSliceNameStripsTheCgroupfsPrefix guards the ParentCgroup ->
+// --slice translation: systemd-run --slice wants a bare unit name
+// ("microvm-vms.slice"), not the full cgroupfs path
+// ("/sys/fs/cgroup/microvm-vms.slice") FirecrackerOptions.ParentCgroup and this
+// arm's own ParentCgroup share.
+func TestChvCgroupSliceNameStripsTheCgroupfsPrefix(t *testing.T) {
+	got := chvCgroupSliceName("/sys/fs/cgroup/microvm-vms.slice")
+	if got != "microvm-vms.slice" {
+		t.Fatalf("chvCgroupSliceName = %q, want %q", got, "microvm-vms.slice")
 	}
 }
 

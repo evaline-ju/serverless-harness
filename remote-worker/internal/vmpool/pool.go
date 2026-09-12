@@ -446,7 +446,11 @@ func (p *pool) Stats() Stats {
 // RAM even though it is paused and CoW-shared, because it is one Resume away from
 // consuming all of it — admission control that charged the paused footprint would
 // admit a host it cannot then run (spec §6, §7.3).
-func (p *pool) perVMBytes() int64 { return p.cfg.GuestRAMBytes + p.cfg.VMOverheadBytes }
+//
+// Delegates to the package-level PerVMBytes so this figure and the per-VM cgroup
+// memory.max Task 17 sets (both arms) are computed from one function, not two
+// independently maintained numbers that can drift apart (spec §5.3).
+func (p *pool) perVMBytes() int64 { return PerVMBytes(p.cfg) }
 
 func (p *pool) Close() error {
 	p.mu.Lock()

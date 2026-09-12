@@ -40,16 +40,27 @@ func TestPoolConfigFromEnvironment(t *testing.T) {
 // not be reachable here.
 func TestThereIsNoHostFallbackLauncher(t *testing.T) {
 	get := envFrom(map[string]string{})
-	if _, err := launcherFor(vmpool.VMMKind("fake"), get, t.TempDir()); err == nil {
+	if _, err := launcherFor(vmpool.VMMKind("fake"), get, t.TempDir(), testPerVMBytes); err == nil {
 		t.Fatal("launcherFor accepted the host-bash fake — §3.5's privilege argument rests on " +
 			"nothing agent-influenced ever executing outside a VM")
 	}
 	for _, k := range []vmpool.VMMKind{"", "qemu", "gvisor"} {
-		if _, err := launcherFor(k, get, t.TempDir()); err == nil {
+		if _, err := launcherFor(k, get, t.TempDir(), testPerVMBytes); err == nil {
 			t.Fatalf("launcherFor(%q) accepted an unknown VMM", k)
 		}
 	}
 }
+
+// testPerVMBytes stands in for vmpool.PerVMBytes(cfg) in tests that call launcherFor
+// directly without going through poolConfig/main — any positive value works for these
+// tests, since none of them assert the SPECIFIC memory.max/MemoryMax value reaches the
+// launcher (that agreement is asserted at the vmpool package level: see
+// TestFirecrackerJailerCgroupMemoryMaxAgreesWithPerVMBytes and
+// TestCloudHypervisorSystemdRunScopeAgreesWithPerVMBytes in internal/vmpool). What
+// matters here is only that it is > 0, so CHVOptions.validate()/FirecrackerOptions.
+// validate() do not refuse the ParentCgroup default launcherFor always sets
+// (hardware-corrections D1).
+const testPerVMBytes = int64(256 << 20)
 
 // Fix round 3: launcherFor must actually route vmpool.CloudHypervisor to
 // NewCloudHypervisorLauncher. Before this, the switch case was a hardcoded "not
@@ -62,7 +73,7 @@ func TestThereIsNoHostFallbackLauncher(t *testing.T) {
 // os.Getgid(), which is 0 on the privileged worker this process actually runs as.
 func TestLauncherForWiresCloudHypervisor(t *testing.T) {
 	get := envFrom(map[string]string{})
-	lc, err := launcherFor(vmpool.CloudHypervisor, get, t.TempDir())
+	lc, err := launcherFor(vmpool.CloudHypervisor, get, t.TempDir(), testPerVMBytes)
 	if err != nil {
 		t.Fatalf("launcherFor(CloudHypervisor): %v", err)
 	}
@@ -84,7 +95,7 @@ func TestLauncherForWiresCloudHypervisor(t *testing.T) {
 // explicit 0 override too.
 func TestLauncherForRefusesAnExplicitZeroVirtiofsdUID(t *testing.T) {
 	get := envFrom(map[string]string{"SH_VIRTIOFSD_UID": "0"})
-	if _, err := launcherFor(vmpool.CloudHypervisor, get, t.TempDir()); err == nil {
+	if _, err := launcherFor(vmpool.CloudHypervisor, get, t.TempDir(), testPerVMBytes); err == nil {
 		t.Fatal("launcherFor(CloudHypervisor) accepted SH_VIRTIOFSD_UID=0 — virtiofsd is " +
 			"spec §3.5's confinement boundary and must never run as root")
 	}

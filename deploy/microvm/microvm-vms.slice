@@ -1,0 +1,32 @@
+# deploy/microvm/microvm-vms.slice
+#
+# The parent cgroup slice Task 17 puts every VM's own cgroup under, for both VMM
+# arms (hardware-corrections D3): Firecracker's jailer targets this via
+# --parent-cgroup, and Cloud Hypervisor's launcher targets it via `systemd-run
+# --scope --slice=`. Neither arm's per-VM cgroup memory.max is set here — that is
+# each VM's OWN cgroup bound (jailer's --cgroup memory.max=, or systemd-run's -p
+# MemoryMax=), computed from vmpool.PerVMBytes(cfg) at launch time, never a fixed
+# constant in this file (spec §5.3: "two numbers that can drift is the bug").
+#
+# This slice's own MemoryMax is deliberately infinity: bounding the SLICE would
+# let one VM's memory pressure count against every other VM's headroom, which is
+# exactly the "ballooning guest is bounded by the whole slice, not by its own VM"
+# failure mode spec §6 mitigation #3 exists to avoid (hardware-corrections D1).
+# microvm-worker's own admission control (SH_MAX_COMMITTED_MB) is the real
+# density ceiling; this slice only needs to exist so systemd's KillMode=
+# control-group on microvm-worker.service can tear down every VM cgroup under it
+# on worker stop/crash, and so SweepOrphans has a slice to walk on the next start.
+
+[Unit]
+Description=Parent slice for ephemeral microVM sandboxes (serverless-harness P4)
+Documentation=https://github.com/kagenti/serverless-harness
+
+[Slice]
+# Swap is off host-wide already (spec §2.4) -- this makes that explicit for the
+# slice too, rather than relying on the host-wide setting alone: a future host
+# that re-enables swap must not silently let this slice's VMs balloon into it,
+# which would turn spec §6 mitigation #3's fast, attributable in-cgroup OOM kill
+# into a slow, host-wide thrash instead.
+MemorySwapMax=0
+MemoryMax=infinity
+TasksMax=infinity

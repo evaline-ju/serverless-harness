@@ -137,6 +137,20 @@ func (c *Config) Normalize() error {
 	return nil
 }
 
+// PerVMBytes is what one VM costs the admission-control budget: guest RAM plus the
+// launcher-and-sidecar overhead outside it (DefaultVMOverheadBytes' doc comment). This
+// is the single source of truth for that figure — pool.go's perVMBytes delegates to it,
+// and Task 17's per-VM cgroup memory.max (both arms: firecrackerCgroupArgs for
+// Firecracker, the systemd-run --scope memory bound for Cloud Hypervisor) is also
+// computed from this function, never from a second, independently maintained constant.
+// Spec §5.3 names exactly this trap: "jailer's own --cgroup args must be configured
+// consistently with the systemd slice §6 relies on, or the two mechanisms fight" — two
+// numbers that can drift is the bug that trap describes, and giving both call sites the
+// same function instead of the same intent is what keeps them from drifting.
+func PerVMBytes(cfg Config) int64 {
+	return cfg.GuestRAMBytes + cfg.VMOverheadBytes
+}
+
 // ReclaimScanIntervalForTest exposes the derived interval. Normalize runs inside
 // New, so a test that wants to advance exactly one tick cannot compute it from the
 // Config it passed in.
