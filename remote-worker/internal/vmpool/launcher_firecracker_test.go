@@ -73,6 +73,35 @@ func sameDeviceSiblingDir(t *testing.T, snapshotDir string) string {
 			t.Logf("cleanup same-device sibling dir %s: %v", dir, err)
 		}
 	})
+	// Review finding (fix round 3): os.MkdirTemp creates dir at mode 0700,
+	// root-owned when these gates run as root -- gates_kvm_test.go's poolFor
+	// and this file's own fcLauncher require exactly that (see round 1's fix).
+	// On the Firecracker arm a 0700 root-owned dir is harmless: jailer's whole
+	// process tree runs as root too, so root needs no permission bit to enter
+	// anywhere. On the Cloud Hypervisor arm it is NOT harmless: virtiofsd drops
+	// privileges to VirtiofsdUID/GID (an unprivileged uid, e.g. 65534 "nobody" —
+	// CHVOptions.validate() refuses 0) before it ever touches the workspace
+	// directory this function's callers nest beneath dir (chvOpts's RunDir,
+	// and every per-run WorkspaceDir under a WorkspaceRoot rooted here), and the
+	// kernel checks execute permission on EVERY ancestor between "/" and that
+	// workspace, not just the workspace's own (correctly chowned, by
+	// chvPrepareOwnership) mode. A 0700 ancestor blocks that unprivileged
+	// traversal exactly as effectively as a 0700 leaf would -- this is the bug
+	// the coordinator diagnosed on the rig: virtiofsd's own EACCES on this
+	// ancestor surfaced as the misleading "does not exist" on the leaf it could
+	// never reach.
+	//
+	// chmod to 0711 -- execute-without-read -- rather than 0755: it lets an
+	// unprivileged process traverse THROUGH to a path it already knows the name
+	// of, without letting it list what else is in here (the standard "reachable
+	// but not listable" posture), so this jail's other per-run contents stay
+	// unlistable by anyone but its root owner. Do NOT tighten this back to
+	// 0700: root needs no permission bit at all, so every Firecracker gate
+	// would keep passing while every Cloud Hypervisor one silently broke again.
+	if err := os.Chmod(dir, 0o711); err != nil {
+		t.Fatalf("same-device sibling dir: chmod %s to 0711 (needed so an unprivileged "+
+			"virtiofsd can traverse into it -- see this function's doc comment): %v", dir, err)
+	}
 	return dir
 }
 
@@ -116,6 +145,30 @@ func TestSameDeviceSiblingDirSharesDeviceWithTarget(t *testing.T) {
 		t.Fatalf("sameDeviceSiblingDir(%s) = %s, on device %d; want device %d (same as %s) -- "+
 			"a hardlink from the snapshot dir into this directory would be cross-device and "+
 			"therefore always fail EXDEV", snapshotDir, got, gotDev, wantDev, filepath.Dir(snapshotDir))
+	}
+}
+
+// TestSameDeviceSiblingDirIsTraversableButNotListable is fix round 3's Item 1
+// mutation test: pins the exact mode sameDeviceSiblingDir chmods its directory
+// to, and that it is exactly 0711 -- not os.MkdirTemp's own default 0700 (the
+// bug the coordinator diagnosed on the rig: a root-owned 0700 ancestor blocks
+// an unprivileged virtiofsd's traversal into a correctly-chowned workspace
+// beneath it), and not a looser 0755 (the coordinator's explicit "reachable
+// but not listable" choice). Reverting the chmod call's argument to 0700, or
+// deleting the chmod entirely, makes this fail immediately -- observed locally
+// (see this task's report): with the chmod removed, this test fails with
+// "mode = 0700, want 0711"; restoring the chmod makes it pass again.
+func TestSameDeviceSiblingDirIsTraversableButNotListable(t *testing.T) {
+	snapshotDir := t.TempDir()
+	dir := sameDeviceSiblingDir(t, snapshotDir)
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat %s: %v", dir, err)
+	}
+	if got := info.Mode().Perm(); got != 0o711 {
+		t.Fatalf("sameDeviceSiblingDir(%s) mode = %04o, want 0711 (execute-without-read: "+
+			"traversable by an unprivileged virtiofsd, not listable by it)", dir, got)
 	}
 }
 

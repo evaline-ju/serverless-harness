@@ -371,6 +371,143 @@ whole `remote-worker` module exits 0 (all packages PASS or `[no test files]`,
 pre-existing gate/unit test passing, KVM-gated gates SKIPping as expected on
 this machine.
 
+### Fix round 3: a root-owned 0700 ancestor blocks virtiofsd's own unprivileged traversal
+
+The coordinator diagnosed this on the rig: a hardlink-jail sibling directory
+`sameDeviceSiblingDir` (`launcher_firecracker_test.go`, fix round 1) creates via
+`os.MkdirTemp` — mode `0700`, root-owned when the gates run as root — becomes an
+**ancestor** of the per-run workspace directory both arms use. The Firecracker
+arm never notices: `jailer`'s whole process tree runs as root too, and root
+needs no permission bit to enter anywhere. The Cloud Hypervisor arm does notice:
+virtiofsd drops privileges to `CHVOptions.VirtiofsdUID/GID` (an unprivileged
+uid — `validate()` refuses `0`) before it ever touches the workspace, and the
+kernel checks execute permission on **every** ancestor between `/` and that
+workspace, not just the workspace's own (correctly chowned, by
+`chvPrepareOwnership`) mode. A `0700` ancestor blocks that unprivileged
+traversal exactly as effectively as a `0700` leaf would. virtiofsd does not
+diagnose this itself: an `EACCES` on an ancestor, from virtiofsd's own side,
+looks identical to the leaf "not existing" at all — which is exactly the
+confusing message the coordinator saw for a directory plainly present on disk.
+
+**Item 1 — `sameDeviceSiblingDir` now chmods its directory to `0711`, not the
+default `0700`.** `0711` — execute-without-read, `rwx--x--x` — was the
+coordinator's deliberate choice over `0755`: it lets an unprivileged process
+traverse *through* to a path it has been told the name of, without letting it
+`readdir` what else lives in there, keeping this jail's other per-run contents
+unlistable by anyone but its root owner — the standard "reachable but not
+listable" posture. The fix carries an explicit comment warning against
+"tightening" this back to `0700`: root needs no permission bit at all, so every
+Firecracker gate would keep passing while every Cloud Hypervisor one silently
+broke again — which is exactly how this bug reached the rig undetected in the
+first place.
+
+**Item 2 — a pre-flight reachability check in `chvLauncher.Restore`, before
+virtiofsd is ever spawned.** `chvPrepareOwnership` (fix round 1) correctly
+chowns `req.WorkspaceDir` itself, but its own doc comment says plainly it does
+not reach the workspace's ancestors — those belong to whoever created
+`WorkspaceDir` (the pool/orchestration layer, or, in the gates,
+`sameDeviceSiblingDir`), not to this launcher. Authorized by the coordinator as
+scope-crossing production-code fix ("the traversal rule spans the harness that
+creates directories and the launcher that consumes them"), but explicitly
+diagnostic-only — no self-healing: "a launcher silently chmod'ing directories it
+did not create would be worse than the error it replaces."
+
+Added:
+
+- `remote-worker/internal/vmpool/traversalcheck.go` (new) —
+  `checkPathTraversableBy(path string, uid, gid uint32) error` walks every
+  ancestor of `path` from its immediate parent up to the filesystem root,
+  confirming stat(2)'s permission bits grant execute to `uid:gid` at each level.
+  `canTraverse` mirrors the kernel's own class-selection order: owner class if
+  `uid` matches the ancestor's owning uid, else group class (primary group
+  only — a documented simplification, not an oversight), else "other". The
+  failure names the specific blocking ancestor's path, its mode, its owning
+  uid:gid, and the uid:gid being checked — the coordinator's literal ask
+  ("say so precisely: which path, which uid, and which ancestor's mode is
+  blocking").
+- `statOwnerMode` (`device_unix.go`/`device_other.go`) — a `//go:build
+  unix`/`!unix`-split stat helper returning a path's owning uid/gid/mode,
+  alongside the existing `deviceNumber` from fix round 2's identical platform
+  split, for the identical reason: `GOOS=windows go vet` compiles `_test.go`
+  files and `syscall.Stat_t` does not exist there.
+- `chvCheckWorkspaceReachable` (`launcher_chv.go`) — `checkPathTraversableBy`
+  through a seam (mirroring `chvPrepareOwnership`'s own seam), wired into
+  `Restore` immediately after `chvPrepareOwnership` and before virtiofsd is
+  spawned. On failure, `Restore` aborts with the ancestor/mode/uid detail
+  instead of letting virtiofsd hit the same `EACCES` from underneath and
+  mis-report it as the leaf "does not exist."
+
+**Fixing the tests, not just the code: a non-root test runner and macOS's own
+`$TMPDIR`.** The first full run after writing this surfaced three failures, all
+environment artifacts of the new tests' own setup, not bugs in the logic:
+
+- `TestRestoreChecksWorkspaceReachableBeforeVirtiofsd` and
+  `TestRestoreFailsWhenWorkspaceIsUnreachable` both let the real
+  `chvPrepareOwnership` run ahead of the code under test, and its real
+  `os.Chown(..., 65534, 65534)` fails with "operation not permitted" on this
+  non-root darwin test runner — the same, already-documented limitation
+  `TestRestorePreparesVirtiofsdOwnershipPropagatesFailure` carries. Fixed by
+  stubbing `chvPrepareOwnership` to `return nil` in both tests, the same
+  pattern `TestRestoreCallsPrepareOwnership` already uses.
+- `TestCheckPathTraversableByAllowsWorldExecutableAncestors` failed because
+  `t.TempDir()`'s own ancestry is not actually world-executable on this
+  machine: `testing.T.TempDir()` creates two levels at default `0700`
+  (a per-test root, then a per-call numbered subdirectory), and — after
+  chmodding both to `0711` — the walk kept going and hit darwin's own
+  `$TMPDIR` (`/var/folders/<hash>/<hash>/T`), itself `0700` and owned by the
+  logged-in user, not this test. Chmodding a real, shared, system-owned
+  directory just to pass a unit test would itself be the kind of self-healing
+  Item 2 deliberately refuses to do to a caller's directories — so this test
+  instead fakes `statOwnerModeFunc` for every ancestor above what it created
+  and chmodded itself, exercising the real walk/logic for the part it
+  controls and a synthetic "world-executable" answer for the host's own
+  temp-directory layout above that.
+
+**Mutation test, Item 1 — reproducible locally.** Reverted
+`sameDeviceSiblingDir`'s `os.Chmod(dir, 0o711)` to `0o700` and re-ran
+`TestSameDeviceSiblingDirIsTraversableButNotListable`. Observed failure:
+
+```
+sameDeviceSiblingDir(.../.gates-hardlink-jail-1439721737) mode = 0700, want 0711
+(execute-without-read: traversable by an unprivileged virtiofsd, not listable by it)
+```
+
+Reverted; test passes again, full suite green.
+
+**Mutation test, Item 2 — reproducible locally, two ways.**
+
+- *Point the shared dir at an unreachable path* (the coordinator's literal
+  ask): `TestRestoreFailsWhenWorkspaceIsUnreachable` builds a genuine `0700`
+  `blocker` directory (owned by this test's own uid, never
+  `chvOpts`'s `VirtiofsdUID` 65534) as an ancestor of `WorkspaceDir`, then
+  drives the real `lc.Restore(...)`. The resulting error names all three: the
+  blocking ancestor's path (`blocker`), its mode (`0700`), and the checked uid
+  (`65534`) — confirmed by both the standalone unit test
+  (`TestCheckPathTraversableByDetectsBlockingAncestor`) and this end-to-end one
+  passing, and by inspecting the assertions directly (both assert
+  `strings.Contains` on all three).
+- *Remove the check itself*: temporarily wrapped the `chvCheckWorkspaceReachable`
+  call site in `Restore` in `if false { ... }` (simulating "call site
+  deleted"), rebuilt, and re-ran the suite. Observed failure: exactly
+  `TestRestoreChecksWorkspaceReachableBeforeVirtiofsd` and
+  `TestRestoreFailsWhenWorkspaceIsUnreachable` FAILed —
+  `TestRestoreFailsWhenWorkspaceIsUnreachable` now got as far as `Restore`
+  actually attempting to spawn virtiofsd (`fork/exec /usr/libexec/virtiofsd:
+  operation not permitted` — an unrelated, expected failure on this machine),
+  never reporting the blocked ancestor at all — exactly the regression this
+  test exists to catch. Every other test, including the two Item 1 tests and
+  the three standalone `traversalcheck_test.go` unit tests, stayed green.
+  Reverted from a diff-checked copy; suite green again.
+
+**Verification after fix round 3:** all six `go build`/`go vet` combinations
+(`linux`/`darwin`/`windows` × `build`/`vet`) exit 0; `go test ./...` for the
+whole `remote-worker` module exits 0; `internal/vmpool` alone shows all
+pre-existing tests plus the 6 new tests (`TestSameDeviceSiblingDirIsTraversableButNotListable`,
+`TestRestoreChecksWorkspaceReachableBeforeVirtiofsd`,
+`TestRestoreFailsWhenWorkspaceIsUnreachable`, and the three in
+`traversalcheck_test.go`) passing, KVM-gated gates SKIPping as expected on this
+machine.
+
 ## Performance rungs
 
 Not yet run. E10/E11 depend on the rig and a built golden snapshot, same as the

@@ -293,6 +293,127 @@ func TestRestoreCallsPrepareOwnership(t *testing.T) {
 	}
 }
 
+// TestRestoreChecksWorkspaceReachableBeforeVirtiofsd covers fix round 3, item
+// 2's wiring: Restore must call the reachability check (via the indirected
+// chvCheckWorkspaceReachable) with req.WorkspaceDir and the configured
+// VirtiofsdUID/GID, and must abort — before any process spawn, so no binaries
+// and no KVM are needed — if that check fails. Mirrors
+// TestRestoreCallsPrepareOwnership's structure exactly, for the same reason:
+// without this, a mutation that deleted the call site, or passed the wrong
+// path/uid/gid, would pass every other test in this file.
+func TestRestoreChecksWorkspaceReachableBeforeVirtiofsd(t *testing.T) {
+	origCheck := chvCheckWorkspaceReachable
+	defer func() { chvCheckWorkspaceReachable = origCheck }()
+
+	// chvPrepareOwnership runs just before this check and, for real, calls
+	// os.Chown(..., VirtiofsdUID, VirtiofsdGID) — as a non-root test runner
+	// that chown itself fails with "operation not permitted" before Restore
+	// ever reaches the code under test here (see
+	// TestRestorePreparesVirtiofsdOwnershipPropagatesFailure's own doc comment
+	// for the identical, already-documented limitation). Stub it out so this
+	// test exercises only the reachability-check wiring, not real chown.
+	origPrepare := chvPrepareOwnership
+	defer func() { chvPrepareOwnership = origPrepare }()
+	chvPrepareOwnership = func(runDir, workspaceDir string, uid, gid int) error { return nil }
+
+	type call struct {
+		path     string
+		uid, gid uint32
+	}
+	var got []call
+	sentinel := errors.New("sentinel: workspace unreachable")
+	chvCheckWorkspaceReachable = func(path string, uid, gid uint32) error {
+		got = append(got, call{path, uid, gid})
+		return sentinel
+	}
+
+	opts := chvOpts(t)
+	lc, err := NewCloudHypervisorLauncher(opts)
+	if err != nil {
+		t.Fatalf("NewCloudHypervisorLauncher: %v", err)
+	}
+	workspaceDir := t.TempDir()
+	vm, err := lc.Restore(context.Background(), RestoreRequest{
+		ID: "vm-chv-reachable", Key: "run-a", WorkspaceDir: workspaceDir, GuestRAMBytes: 256 << 20,
+	})
+
+	// Restore's own invariant: never a non-nil VM alongside a non-nil error.
+	if err == nil {
+		t.Fatal("Restore returned nil error despite chvCheckWorkspaceReachable failing")
+	}
+	if vm != nil {
+		t.Fatalf("Restore returned a non-nil VM alongside an error: %v", vm)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Restore's error does not wrap the sentinel: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("chvCheckWorkspaceReachable called %d times via Restore, want 1: %+v", len(got), got)
+	}
+	c := got[0]
+	if c.path != workspaceDir {
+		t.Fatalf("chvCheckWorkspaceReachable called with path %q, want %q", c.path, workspaceDir)
+	}
+	if c.uid != uint32(opts.VirtiofsdUID) || c.gid != uint32(opts.VirtiofsdGID) {
+		t.Fatalf("chvCheckWorkspaceReachable called with %d:%d, want configured %d:%d",
+			c.uid, c.gid, opts.VirtiofsdUID, opts.VirtiofsdGID)
+	}
+}
+
+// TestRestoreFailsWhenWorkspaceIsUnreachable is fix round 3, item 2's
+// mutation test run for real, through the actual Restore entry point rather
+// than the seam above: a genuine 0700 ancestor above workspaceDir, owned by
+// this test's own uid (never chvOpts's VirtiofsdUID 65534), reproduces exactly
+// the rig's failure shape without needing virtiofsd, cloud-hypervisor, or
+// root — the check runs and fails before any binary is exec'd. Asserts the
+// resulting error names the blocking ancestor, so a reader gets the
+// coordinator's ask ("which path, which uid, and which ancestor's mode is
+// blocking") instead of virtiofsd's own misleading "does not exist".
+func TestRestoreFailsWhenWorkspaceIsUnreachable(t *testing.T) {
+	// chvPrepareOwnership runs just before the reachability check under test
+	// and, for real, calls os.Chown(..., VirtiofsdUID, VirtiofsdGID) — as a
+	// non-root test runner that chown itself fails with "operation not
+	// permitted" before Restore ever reaches the check this test targets (see
+	// TestRestorePreparesVirtiofsdOwnershipPropagatesFailure's own doc comment
+	// for the identical, already-documented limitation). Stub it out so the
+	// real chvCheckWorkspaceReachable (not faked here — this test exercises it
+	// for real) is what actually fails Restore.
+	origPrepare := chvPrepareOwnership
+	defer func() { chvPrepareOwnership = origPrepare }()
+	chvPrepareOwnership = func(runDir, workspaceDir string, uid, gid int) error { return nil }
+
+	opts := chvOpts(t)
+	lc, err := NewCloudHypervisorLauncher(opts)
+	if err != nil {
+		t.Fatalf("NewCloudHypervisorLauncher: %v", err)
+	}
+
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	workspaceDir := filepath.Join(blocker, "workspace")
+	if err := os.MkdirAll(workspaceDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll %s: %v", workspaceDir, err)
+	}
+	if err := os.Chmod(blocker, 0o700); err != nil {
+		t.Fatalf("chmod %s to 0700: %v", blocker, err)
+	}
+
+	vm, err := lc.Restore(context.Background(), RestoreRequest{
+		ID: "vm-chv-unreachable", Key: "run-a", WorkspaceDir: workspaceDir, GuestRAMBytes: 256 << 20,
+	})
+	if err == nil {
+		t.Fatal("Restore with an unreachable workspace: want error, got nil")
+	}
+	if vm != nil {
+		t.Fatalf("Restore returned a non-nil VM alongside an error: %v", vm)
+	}
+	for _, want := range []string{blocker, "0700", "65534"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Restore error %q: missing %q", err.Error(), want)
+		}
+	}
+}
+
 func TestCloudHypervisorRestoresPausedAndRunsOneCommand(t *testing.T) {
 	requireKVM(t)
 	if _, err := exec.LookPath(chvOpts(t).CHVBin); err != nil {

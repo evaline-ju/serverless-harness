@@ -4,6 +4,7 @@ package vmpool
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 )
 
@@ -20,4 +21,14 @@ import (
 // and fine" to anyone reading the startup log.
 func deviceNumber(path string) (uint64, error) {
 	return 0, fmt.Errorf("vmpool: device-sharing check is not supported on %s (path %s)", runtime.GOOS, path)
+}
+
+// statOwnerMode has no non-unix implementation, for the identical reason
+// deviceNumber above has none: st_uid/st_gid have no equivalent this package
+// uses on Windows, which is not a deployment target. checkPathTraversableBy
+// (traversalcheck.go) treats this error as "cannot verify" and returns it
+// verbatim, the same contract checkPathsShareDevice already has with
+// deviceNumber's stub.
+func statOwnerMode(path string) (uid, gid uint32, mode os.FileMode, err error) {
+	return 0, 0, 0, fmt.Errorf("vmpool: traversal check is not supported on %s (path %s)", runtime.GOOS, path)
 }

@@ -367,6 +367,14 @@ func chvPrepareVirtiofsdOwnership(runDir, workspaceDir string, uid, gid int) err
 // nothing was watching that call site. See TestRestoreCallsPrepareOwnership.
 var chvPrepareOwnership = chvPrepareVirtiofsdOwnership
 
+// chvCheckWorkspaceReachable is checkPathTraversableBy (traversalcheck.go)
+// through a seam, for the same reason chvPrepareOwnership is one: a test can
+// then observe the CALL SITE inside Restore — that it runs, with which path
+// and uid/gid, and that a failure here aborts Restore before virtiofsd is ever
+// spawned — not just the underlying check in isolation. See
+// TestRestoreChecksWorkspaceReachableBeforeVirtiofsd.
+var chvCheckWorkspaceReachable = checkPathTraversableBy
+
 // rewriteSnapshotConfig returns a copy of the golden snapshot's config.json with
 // its embedded vsock and (if present) virtio-fs socket paths replaced by
 // per-VM-unique ones.
@@ -526,6 +534,32 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 	// cover (workspaceDir's ancestors are out of scope here).
 	if err := chvPrepareOwnership(runDir, req.WorkspaceDir, l.opts.VirtiofsdUID, l.opts.VirtiofsdGID); err != nil {
 		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: %w", req.ID, err), cleanup())
+	}
+
+	// Review finding (fix round 3): chvPrepareOwnership, just above, correctly
+	// chowns req.WorkspaceDir itself — but its own doc comment says plainly it
+	// does not reach WorkspaceDir's ANCESTORS, which belong to whoever created
+	// WorkspaceDir, not to this launcher. On the rig, one of those ancestors
+	// was a root-owned 0700 directory (a hardlink-jail sibling dir the gates
+	// harness created next to the golden snapshot — see
+	// sameDeviceSiblingDir's fix round 3 doc comment in
+	// launcher_firecracker_test.go), and it silently blocked virtiofsd's own
+	// unprivileged (VirtiofsdUID/GID) traversal into the correctly-chowned
+	// leaf beneath it. virtiofsd does not diagnose that itself: it reported
+	// the leaf as though it "does not exist" — an EACCES on an ancestor, from
+	// virtiofsd's side, looks identical to the leaf never having been created
+	// at all — which sent the coordinator chasing a phantom missing directory
+	// they could plainly see on disk.
+	//
+	// Check reachability explicitly, before virtiofsd is ever spawned, so a
+	// real fault here surfaces as a precise ancestor + mode + uid error
+	// instead of virtiofsd's own misleading one. This is a DIAGNOSTIC ONLY:
+	// it must never chmod anything on the caller's behalf — a launcher
+	// silently loosening permissions on a directory it did not create would
+	// be worse than the error it replaces, and it is not this launcher's
+	// directory to fix.
+	if err := chvCheckWorkspaceReachable(req.WorkspaceDir, uint32(l.opts.VirtiofsdUID), uint32(l.opts.VirtiofsdGID)); err != nil {
+		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: workspace unreachable by virtiofsd: %w", req.ID, err), cleanup())
 	}
 
 	// --- virtiofsd, privileges dropped before exec (never run as root: see
