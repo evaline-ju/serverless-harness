@@ -594,6 +594,48 @@ GOEOF
   CLEANUP_EXTRA_DIR=""
 }
 
+# save_and_print_console_log copies $1 (a VMM's console log) to a
+# $TMPDIR-rooted path that outlives this script's own cleanup, prints that
+# saved path, and tails an excerpt directly to stderr so the reader does not
+# have to go find it.
+#
+# Fix-round-4 item 2: $console_log lives under $STAGE (or a verify_root), and
+# both are deleted by this script's own EXIT trap the instant a caller's
+# `exit 1` runs -- so the ONLY artifact that explains why a VMM never came up
+# was about to be destroyed by the same failure it would have diagnosed.
+#
+# Fix-round-11 item 2: originally this logic was inlined only in
+# wait_for_agent's own timeout path. wait_for_socket's timeout path (fix-
+# round-10) grew the identical need -- the coordinator's own rig failure (a
+# broken jail binary that only wait_for_socket's timeout caught) could only be
+# diagnosed by manually defeating this script's cleanup to read the console
+# log, because wait_for_socket swallowed it instead of surrendering it. Rather
+# than write a second, independent copy of this save/tail logic (exactly the
+# "one implementation, N callers" mistake fix-rounds 9 and 10 already fixed
+# for prepare_jail/teardown_jail and wait_for_socket itself), this was
+# extracted here so both timeout paths call the same helper. Every place this
+# script gives up waiting for something should surrender its evidence, not
+# swallow it: a bounded timeout with no output is better than an unbounded
+# hang, but it is still a failure that destroys what would explain it. Keep
+# this whole helper off every success path: nobody wants a kernel log dumped
+# on a good build.
+save_and_print_console_log() {
+  local console_log="$1"
+  local saved_console="${TMPDIR:-/tmp}/build-snapshot-console-$$.log"
+  if [ -f "$console_log" ]; then
+    cp "$console_log" "$saved_console" 2>/dev/null || true
+    echo "build-snapshot.sh: guest console log saved to $saved_console (survives this script's cleanup)" >&2
+    echo "build-snapshot.sh: look there for 'Kernel panic', 'init:', or 'guest-agent: exec:' -- or an empty" \
+      "file, which means the VMM itself never started" >&2
+    echo "build-snapshot.sh: --- last 40 lines of the guest console ---" >&2
+    tail -n 40 "$console_log" >&2
+    echo "build-snapshot.sh: --- end of guest console excerpt ---" >&2
+  else
+    echo "build-snapshot.sh: no guest console log exists at $console_log --" \
+      "the VMM itself likely never started" >&2
+  fi
+}
+
 wait_for_agent() {
   local uds="$1" console_log="$2"
   log "waiting for the guest agent to park in accept()"
@@ -608,27 +650,7 @@ wait_for_agent() {
     sleep 1
     waited=$((waited + 1))
   done
-  # Fix-round-4 item 2: $console_log lives under $STAGE, and $STAGE is deleted by
-  # this script's own EXIT trap the instant this function's caller returns (or,
-  # on this failure path, the instant this function's own `exit 1` below runs)
-  # -- so the ONLY artifact that explains why the guest never came up was about
-  # to be destroyed by the same failure it would have diagnosed. Copy it
-  # somewhere that outlives $STAGE and print that path, and echo an excerpt here
-  # too, so the reader does not have to go find it. Keep this whole block off
-  # the success path above: nobody wants a kernel log dumped on a good build.
-  local saved_console="${TMPDIR:-/tmp}/build-snapshot-console-$$.log"
-  if [ -f "$console_log" ]; then
-    cp "$console_log" "$saved_console" 2>/dev/null || true
-    echo "build-snapshot.sh: guest console log saved to $saved_console (survives this script's cleanup)" >&2
-    echo "build-snapshot.sh: look there for 'Kernel panic', 'init:', or 'guest-agent: exec:' -- or an empty" \
-      "file, which means the VMM itself never started" >&2
-    echo "build-snapshot.sh: --- last 40 lines of the guest console ---" >&2
-    tail -n 40 "$console_log" >&2
-    echo "build-snapshot.sh: --- end of guest console excerpt ---" >&2
-  else
-    echo "build-snapshot.sh: no guest console log exists at $console_log --" \
-      "the VMM itself likely never started" >&2
-  fi
+  save_and_print_console_log "$console_log"
   echo "build-snapshot.sh: guest agent never became reachable on vsock:1024 within 120s" >&2
   exit 1
 }
@@ -780,7 +802,7 @@ api_patch() {
 # non-root/different-uid caller does not get a silent EACCES and mistake it
 # for the daemon simply not being up yet.
 wait_for_socket() {
-  local sock="$1" timeout_s="${2:-5}"
+  local sock="$1" console_log="$2" timeout_s="${3:-5}"
   # 100ms poll interval -> timeout_s * 10 attempts.
   local attempts=$((timeout_s * 10))
   local i=0
@@ -791,6 +813,15 @@ wait_for_socket() {
     i=$((i + 1))
     sleep 0.1
   done
+  # Fix-round-11 item 2: this timeout path used to swallow the VMM's console
+  # log exactly the way wait_for_agent's did before fix-round-4 fixed it there
+  # -- and it has now cost a real diagnosis: the coordinator's own rig hit
+  # this exact timeout (a jail binary that chroot could not execve -- see
+  # hardlink_or_copy_bin's own fix-round-11 comment) and could only read the
+  # console log by manually defeating this script's cleanup, because this
+  # function was throwing it away. save_and_print_console_log (see its own
+  # comment, next to wait_for_agent) is reused here rather than reimplemented.
+  save_and_print_console_log "$console_log"
   echo "build-snapshot.sh: timed out after ${timeout_s}s waiting for $sock to accept connections" >&2
   exit 1
 }
@@ -800,13 +831,37 @@ wait_for_socket() {
 # inside its own jail -- chroot resolves the command it execs AFTER changing
 # root, so the binary must physically exist inside the jail, not just on $PATH.
 hardlink_or_copy_bin() {
-  local name="$1" dst="$2" src
+  local name="$1" dst="$2" src resolved
   src="$(command -v "$name")" || {
     echo "build-snapshot.sh: $name not found on PATH" >&2
     exit 1
   }
+  # Fix-round-11: resolve $src to its real, non-symlink target BEFORE linking
+  # or copying it. GNU `ln SRC DST` hardlinks whatever inode SRC names -- if
+  # SRC is itself a symlink (an entirely ordinary shape: Debian's alternatives
+  # system makes /usr/bin/<tool> a symlink into /etc/alternatives/, versioned
+  # installs and package managers do the same, and so does a maintainer's own
+  # `ln -s` housekeeping, which is exactly how this broke on the coordinator's
+  # rig), the hardlink duplicates the SYMLINK, not its target -- `readlink
+  # $dst` inside the jail still shows the original target path, which does
+  # not exist inside the chroot. The jail then looks correct in a plain `ls`
+  # (the entry is right there) but chroot's own execve fails with a confusing
+  # "No such file or directory" about a file that is plainly present in the
+  # listing. `realpath -e` (not `readlink -f`) is used deliberately: -e
+  # requires the resolved target to actually exist, so a dangling symlink
+  # fails LOUDLY right here, at the actual bug, instead of producing a jail
+  # that only fails later, much less clearly, at chroot.
+  resolved="$(realpath -e "$src")" || {
+    echo "build-snapshot.sh: $name resolved via PATH to $src, but that could not be" \
+      "resolved to an existing file (broken/dangling symlink?)" >&2
+    exit 1
+  }
+  if [ ! -x "$resolved" ]; then
+    echo "build-snapshot.sh: $name resolved to $resolved, which is not executable" >&2
+    exit 1
+  fi
   rm -f "$dst"
-  ln "$src" "$dst" 2>/dev/null || cp -p "$src" "$dst"
+  ln "$resolved" "$dst" 2>/dev/null || cp -p "$resolved" "$dst"
   chmod 0555 "$dst"
 }
 
@@ -1018,7 +1073,7 @@ boot_quiesce_snapshot_firecracker() {
   # the very first api_put below -- see wait_for_socket's own comment for why
   # this was missing on both VMM arms and why FC's own speed, not correctness,
   # is the only reason this call site had not yet been seen to lose the race.
-  wait_for_socket "$api_sock"
+  wait_for_socket "$api_sock" "$console_log"
 
   # Item 1: kernel_image_path and the rootfs drive's path_on_host are now
   # jail-relative ("/kernel", "/rootfs"), exactly like launcher_firecracker.go's
@@ -1153,7 +1208,7 @@ boot_quiesce_snapshot_cloud_hypervisor() {
   # already have enough of a delay by accident" (that reasoning is exactly
   # how verify_restore_firecracker ended up racy-but-lucky in the first
   # place).
-  wait_for_socket "$api_sock"
+  wait_for_socket "$api_sock" "$console_log"
 
   wait_for_agent "$vsock_uds" "$console_log"
   MANIFEST_CAPABILITIES="$(probe_capabilities "$vsock_uds")"
@@ -1283,7 +1338,8 @@ verify_restore_firecracker() {
   verify_root="$(new_verify_dir)"
   CLEANUP_EXTRA_DIR="$verify_root"
   local jail="$verify_root/verify-jail"
-  local api_sock="$jail/run/verify-api.sock" vsock_uds="$jail/vsock.sock"
+  local api_sock="$jail/run/verify-api.sock" vsock_uds="$jail/vsock.sock" \
+    console_log="$STAGE/verify-console.log"
   # Fix-round-9: jail skeleton via the shared prepare_jail helper -- see its
   # definition next to jail_mount_dev. Same call shape as
   # boot_quiesce_snapshot_firecracker's (no extra directories): a failing `ln`
@@ -1302,7 +1358,7 @@ verify_restore_firecracker() {
   ensure_workspace_image "$jail/workspace.img"
 
   chroot "$jail" /firecracker --api-sock /run/verify-api.sock \
-    </dev/null >"$STAGE/verify-console.log" 2>&1 &
+    </dev/null >"$console_log" 2>&1 &
   CLEANUP_PID=$!
 
   # Fix-round-10: wait for the API socket before the /snapshot/load call
@@ -1312,7 +1368,15 @@ verify_restore_firecracker() {
   # This also matches launcher_firecracker.go's own Restore, which calls
   # waitForUnixSocket before setVsockOverride/LoadSnapshot -- see the next
   # comment block's own reference to that call order.
-  wait_for_socket "$api_sock"
+  #
+  # Fix-round-11 item 2: $console_log is now a named local (it used to be
+  # only the literal string "$STAGE/verify-console.log" inlined in the
+  # redirection above) so it can be passed to wait_for_socket -- this is one
+  # of the two call sites (the other is verify_restore_cloud_hypervisor) that
+  # had no console-log variable in scope, and is exactly where the
+  # coordinator had to manually intervene to read the console log, because
+  # wait_for_socket's timeout path had nothing to print it from.
+  wait_for_socket "$api_sock" "$console_log"
 
   # Fix-round-8: a restoring instance must be FRESH. The real binary enforces
   # this -- the rig's own failure was PUT /snapshot/load returning HTTP 400
@@ -1384,7 +1448,8 @@ verify_restore_cloud_hypervisor() {
   verify_root="$(new_verify_dir)"
   CLEANUP_EXTRA_DIR="$verify_root"
   local jail="$verify_root/verify-jail"
-  local api_sock="$jail/run/verify-ch-api.sock" vsock_uds="$jail/vsock.sock"
+  local api_sock="$jail/run/verify-ch-api.sock" vsock_uds="$jail/vsock.sock" \
+    console_log="$STAGE/verify-console.log"
   # Fix-round-9: jail skeleton via the shared prepare_jail helper -- see its
   # definition next to jail_mount_dev. This call's "$jail/ch-snapshot" extra
   # directory is the one this function already got right; the fix this round
@@ -1406,7 +1471,7 @@ verify_restore_cloud_hypervisor() {
   link_snapshot_file "$OUT/memfile" "$jail/ch-snapshot/memory-ranges"
 
   chroot "$jail" /cloud-hypervisor --api-socket /run/verify-ch-api.sock \
-    </dev/null >"$STAGE/verify-console.log" 2>&1 &
+    </dev/null >"$console_log" 2>&1 &
   CLEANUP_PID=$!
 
   # Fix-round-10: THE call site the rig's own failure came from -- all of this
@@ -1415,7 +1480,15 @@ verify_restore_cloud_hypervisor() {
   # after the process is backgrounded, with nothing at all between "started"
   # and "first call". See wait_for_socket's own comment for the exact curl
   # error this reproduced ("after 0 ms: Could not connect to server").
-  wait_for_socket "$api_sock"
+  #
+  # Fix-round-11: THE call site the coordinator's actual round-11 bug (a jail
+  # binary chroot could not execve, see hardlink_or_copy_bin's own comment)
+  # reproduced at, and also THE call site whose wait_for_socket timeout used
+  # to swallow the console log that was the entire diagnosis. $console_log is
+  # now a named local (previously only the literal string inlined in the
+  # redirection above) so it can be passed through to wait_for_socket, which
+  # now preserves and prints it on timeout via save_and_print_console_log.
+  wait_for_socket "$api_sock" "$console_log"
 
   api_put "$api_sock" /api/v1/vm.restore \
     '{"source_url":"file:///ch-snapshot","resume":true}'

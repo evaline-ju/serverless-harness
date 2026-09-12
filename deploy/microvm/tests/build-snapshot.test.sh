@@ -293,38 +293,43 @@ if [ -n "$init_start" ] && [ -n "$init_end" ]; then
 fi
 check "init fails loudly if the agent binary is missing/non-executable, before exec" "$ok" "yes"
 
-echo "== fix-round-4 item 2: a failed wait_for_agent preserves the guest console log"
+echo "== fix-round-4 item 2 (extracted in fix-round-11): a failed wait_for_agent preserves the guest console log"
 # wait_for_agent's timeout path used to just print a generic timeout message and
 # exit 1 -- and the EXIT trap then deletes \$STAGE, which is where the console
 # log (the only artifact that explains a guest boot failure) lives. The failure
 # most likely to occur on a new host was erasing its own diagnosis. A
 # source-level assertion that the timeout path references and preserves
 # \$console_log is legitimate and sufficient here (no live VMM needed).
-wfa_start=$(grep -n "^wait_for_agent() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+#
+# Fix-round-11: this save/tail logic moved out of wait_for_agent's own body
+# and into a new shared helper, save_and_print_console_log, so that
+# wait_for_socket's timeout path (below) could reuse it rather than
+# reimplementing it a second time. These checks now look inside the helper's
+# body, not wait_for_agent's.
+sapcl_start=$(grep -n "^save_and_print_console_log() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+check "save_and_print_console_log helper exists" \
+  "$([ -n "$sapcl_start" ] && echo yes || echo no)" "yes"
+
 ok=no
-timeout_line=""
-if [ -n "$wfa_start" ]; then
-  wfa_end=$(awk -v s="$wfa_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
-  if [ -n "$wfa_end" ]; then
-    timeout_line=$(awk -v s="$wfa_start" -v e="$wfa_end" \
-      'NR>=s && NR<=e && /never became reachable/{print NR; exit}' "$SCRIPT")
-    save_line=$(awk -v s="$wfa_start" -v e="$wfa_end" \
+if [ -n "$sapcl_start" ]; then
+  sapcl_end=$(awk -v s="$sapcl_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$sapcl_end" ]; then
+    save_line=$(awk -v s="$sapcl_start" -v e="$sapcl_end" \
       'NR>=s && NR<=e && /cp "\$console_log"/{print NR; exit}' "$SCRIPT")
-    excerpt_line=$(awk -v s="$wfa_start" -v e="$wfa_end" \
+    excerpt_line=$(awk -v s="$sapcl_start" -v e="$sapcl_end" \
       'NR>=s && NR<=e && /tail -n [0-9]+ "\$console_log"/{print NR; exit}' "$SCRIPT")
-    if [ -n "$save_line" ] && [ -n "$excerpt_line" ] && [ -n "$timeout_line" ] \
-      && [ "$save_line" -lt "$timeout_line" ] && [ "$excerpt_line" -lt "$timeout_line" ]; then
+    if [ -n "$save_line" ] && [ -n "$excerpt_line" ]; then
       ok=yes
     fi
   fi
 fi
-check "wait_for_agent's timeout path saves and prints the console log before exiting" "$ok" "yes"
+check "save_and_print_console_log saves the console log and prints an excerpt" "$ok" "yes"
 
 ok=no
-if [ -n "$wfa_start" ]; then
-  wfa_end=$(awk -v s="$wfa_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
-  if [ -n "$wfa_end" ]; then
-    saved_var_line=$(awk -v s="$wfa_start" -v e="$wfa_end" \
+if [ -n "$sapcl_start" ]; then
+  sapcl_end=$(awk -v s="$sapcl_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$sapcl_end" ]; then
+    saved_var_line=$(awk -v s="$sapcl_start" -v e="$sapcl_end" \
       'NR>=s && NR<=e && /saved_console=/{print NR; exit}' "$SCRIPT")
     if [ -n "$saved_var_line" ]; then
       saved_var_text=$(sed -n "${saved_var_line}p" "$SCRIPT")
@@ -336,6 +341,31 @@ if [ -n "$wfa_start" ]; then
   fi
 fi
 check "the saved console-log path is outside \$STAGE (survives the EXIT trap)" "$ok" "yes"
+
+# wait_for_agent itself must not have regressed to inlining this logic again
+# (that would silently reintroduce fix-round-11's exact "second copy" problem)
+# -- it must instead call the shared helper, strictly before its own timeout
+# message and exit.
+wfa_start=$(grep -n "^wait_for_agent() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+ok=no
+if [ -n "$wfa_start" ]; then
+  wfa_end=$(awk -v s="$wfa_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$wfa_end" ]; then
+    call_line=$(awk -v s="$wfa_start" -v e="$wfa_end" \
+      'NR>=s && NR<=e && /save_and_print_console_log "\$console_log"/{print NR; exit}' "$SCRIPT")
+    timeout_line=$(awk -v s="$wfa_start" -v e="$wfa_end" \
+      'NR>=s && NR<=e && /never became reachable/{print NR; exit}' "$SCRIPT")
+    exit_line=$(awk -v s="$wfa_start" -v e="$wfa_end" \
+      'NR>=s && NR<=e && /^  exit 1$/{print NR; exit}' "$SCRIPT")
+    if [ -n "$call_line" ] && [ -n "$timeout_line" ] && [ -n "$exit_line" ] \
+      && [ "$call_line" -lt "$timeout_line" ] && [ "$timeout_line" -lt "$exit_line" ]; then
+      ok=yes
+    fi
+  fi
+fi
+check "wait_for_agent's timeout path calls save_and_print_console_log before exiting" "$ok" "yes"
+own_body_check=$(awk -v s="$wfa_start" 'NR>s && /^}$/{exit} NR>s' "$SCRIPT" | grep -c 'saved_console=')
+check "wait_for_agent no longer inlines its own copy of the save/tail logic" "$own_body_check" "0"
 
 echo "== fix-round-5 item 1: /vm is paused with PATCH, not PUT (Firecracker has no PUT /vm)"
 # Confirmed against the real firecracker v1.17.0 binary: PUT /vm returns HTTP 400
@@ -755,6 +785,158 @@ check "verify_restore_cloud_hypervisor waits for the socket before /api/v1/vm.re
 teardown_body="$(awk '/^teardown_jail\(\) \{/{f=1} f{print} f && /^}$/{exit}' "$SCRIPT")"
 check "teardown_jail removes any stale *.sock.lock left in the jail's run dir" \
   "$(printf '%s\n' "$teardown_body" | grep -v '^[[:space:]]*#' | grep -cF '.sock.lock')" "1"
+
+echo "== fix-round-11 item 2: wait_for_socket's timeout path preserves the console log too"
+# Real rig failure: verify_restore_cloud_hypervisor's chroot could not execve
+# a jail binary (see the hardlink_or_copy_bin section below) and the ONLY way
+# to read why was to manually defeat this script's cleanup, because
+# wait_for_socket's timeout path -- unlike wait_for_agent's, since fix-round-4
+# -- threw the console log away. This is the third occurrence of the same
+# "a bounded timeout with no output destroys the evidence that would explain
+# it" pattern; the fix reuses save_and_print_console_log rather than writing
+# a second, independent copy of the same save/tail logic.
+wfs_start=$(grep -n "^wait_for_socket() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+check "wait_for_socket helper still exists (unmoved by the round-11 refactor)" \
+  "$([ -n "$wfs_start" ] && echo yes || echo no)" "yes"
+
+ok=no
+if [ -n "$wfs_start" ]; then
+  wfs_end=$(awk -v s="$wfs_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$wfs_end" ]; then
+    call_line=$(awk -v s="$wfs_start" -v e="$wfs_end" \
+      'NR>=s && NR<=e && /save_and_print_console_log "\$console_log"/{print NR; exit}' "$SCRIPT")
+    timeout_line=$(awk -v s="$wfs_start" -v e="$wfs_end" \
+      'NR>=s && NR<=e && /timed out after/{print NR; exit}' "$SCRIPT")
+    exit_line=$(awk -v s="$wfs_start" -v e="$wfs_end" \
+      'NR>=s && NR<=e && /^  exit 1$/{print NR; exit}' "$SCRIPT")
+    if [ -n "$call_line" ] && [ -n "$timeout_line" ] && [ -n "$exit_line" ] \
+      && [ "$call_line" -lt "$timeout_line" ] && [ "$timeout_line" -lt "$exit_line" ]; then
+      ok=yes
+    fi
+  fi
+fi
+check "wait_for_socket's timeout path calls save_and_print_console_log before exiting" "$ok" "yes"
+
+# wait_for_socket's signature grew a console_log parameter to make this
+# possible -- and every one of the four call sites must supply it, or the
+# helper above receives an empty path and silently no-ops on the "no guest
+# console log exists" branch instead of ever finding the real one.
+check "wait_for_socket's signature takes a console_log parameter (2nd positional)" \
+  "$(sed -n "$((wfs_start + 1))p" "$SCRIPT" | grep -cF 'console_log="$2"')" "1"
+check "all four wait_for_socket call sites now pass a console_log argument" \
+  "$(grep -cF 'wait_for_socket "$api_sock" "$console_log"' "$SCRIPT")" "4"
+
+# The two verify_restore_* functions had no named console_log local before
+# this round (only the literal string "$STAGE/verify-console.log" inlined in
+# their chroot redirections) -- exactly the two sites where the coordinator's
+# own bug manifested. A named variable must now exist in each, and the
+# redirection must use it too (not keep the inline literal, which would let
+# the two drift apart the moment either one is edited again).
+for fn in verify_restore_firecracker verify_restore_cloud_hypervisor; do
+  fn_start=$(grep -n "^${fn}() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+  ok=no
+  if [ -n "$fn_start" ]; then
+    fn_end=$(awk -v s="$fn_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+    if [ -n "$fn_end" ]; then
+      body="$(sed -n "${fn_start},${fn_end}p" "$SCRIPT")"
+      has_local=$(printf '%s\n' "$body" | grep -cF 'console_log="$STAGE/verify-console.log"')
+      has_literal_left=$(printf '%s\n' "$body" | grep -v '^[[:space:]]*#' | grep -cF '>"$STAGE/verify-console.log"')
+      if [ "$has_local" -ge 1 ] && [ "$has_literal_left" -eq 0 ]; then
+        ok=yes
+      fi
+    fi
+  fi
+  check "$fn declares a named console_log local and uses it (not the inline literal) in its redirection" "$ok" "yes"
+done
+
+echo "== fix-round-11 item 1: hardlink_or_copy_bin resolves symlinks before linking"
+# Real rig failure: /usr/local/bin/cloud-hypervisor was a symlink to a path
+# under the coordinator's home directory. GNU `ln SRC DST` hardlinks whatever
+# inode SRC names -- since SRC was itself a symlink, the hardlink duplicated
+# the SYMLINK, not its target, so the jail ended up containing a symlink
+# pointing at a path that does not exist inside the chroot. `ls` inside the
+# jail showed the entry right there; chroot's own exec still failed with a
+# confusing "No such file or directory". This is an entirely ordinary
+# deployment shape (Debian's alternatives system, versioned installs, and
+# manual PATH housekeeping all make binaries under /usr/bin symlinks), not an
+# exotic one.
+hocb_start=$(grep -n "^hardlink_or_copy_bin() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+check "hardlink_or_copy_bin helper still exists" \
+  "$([ -n "$hocb_start" ] && echo yes || echo no)" "yes"
+
+hocb_body=""
+if [ -n "$hocb_start" ]; then
+  hocb_end=$(awk -v s="$hocb_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$hocb_end" ]; then
+    hocb_body="$(sed -n "${hocb_start},${hocb_end}p" "$SCRIPT")"
+  fi
+fi
+
+ok=no
+resolve_line=""
+if [ -n "$hocb_body" ]; then
+  resolve_line=$(printf '%s\n' "$hocb_body" | grep -nE 'realpath -e|readlink -f' | head -n1 | cut -d: -f1)
+  ln_line=$(printf '%s\n' "$hocb_body" | grep -nF 'ln "$resolved" "$dst"' | head -n1 | cut -d: -f1)
+  if [ -n "$resolve_line" ] && [ -n "$ln_line" ] && [ "$resolve_line" -lt "$ln_line" ]; then
+    ok=yes
+  fi
+fi
+check "hardlink_or_copy_bin resolves the symlink (realpath -e or readlink -f) before ln/cp" "$ok" "yes"
+
+check "hardlink_or_copy_bin links the RESOLVED path, not the original possibly-symlinked \$src" \
+  "$(printf '%s\n' "$hocb_body" | grep -cF 'ln "$src" "$dst"')" "0"
+
+# Fail loudly rather than deferring to a confusing downstream chroot error:
+# both a resolution failure (dangling symlink) and a non-executable resolved
+# target must exit 1 with a message naming the tool, not silently proceed to
+# stage a broken jail.
+check "hardlink_or_copy_bin fails loudly if the resolved path does not exist (realpath -e's own contract)" \
+  "$(printf '%s\n' "$hocb_body" | grep -cE 'resolved="\$\(realpath -e "\$src"\)" \|\|')" "1"
+check "hardlink_or_copy_bin fails loudly if the resolved path is not executable" \
+  "$(printf '%s\n' "$hocb_body" | grep -cF '[ ! -x "$resolved" ]')" "1"
+
+# Behavioral assertion, not just source inspection: create a real symlink to a
+# real file in a temp dir, actually RUN the helper against it, and assert the
+# result is a regular file, not a symlink. A grep-only test cannot see this
+# bug -- it can only see whether the source text CONTAINS a resolution call,
+# not whether that call actually runs before the ln/cp it is meant to guard.
+# The whole script cannot be sourced for this (it ends in an unconditional
+# `main` call that would immediately demand real CLI flags and root), so the
+# helper's own source is extracted into an isolated snippet and sourced by
+# itself instead.
+hocb_ok=no
+hocb_ok_resolved_content=no
+if [ -n "$hocb_body" ]; then
+  hocb_tmpdir="$(mktemp -d)"
+  hocb_real_bin="$hocb_tmpdir/real-vmm-binary"
+  printf '#!/bin/sh\necho hi\n' >"$hocb_real_bin"
+  chmod +x "$hocb_real_bin"
+  hocb_pathdir="$hocb_tmpdir/pathdir"
+  mkdir -p "$hocb_pathdir"
+  ln -s "$hocb_real_bin" "$hocb_pathdir/fake-vmm"
+  hocb_dst="$hocb_tmpdir/jail-bin"
+  hocb_snippet="$hocb_tmpdir/hocb.sh"
+  printf '%s\n' "$hocb_body" >"$hocb_snippet"
+
+  (
+    PATH="$hocb_pathdir:$PATH"
+    # shellcheck disable=SC1090
+    . "$hocb_snippet"
+    hardlink_or_copy_bin fake-vmm "$hocb_dst"
+  ) >/dev/null 2>&1
+
+  if [ -e "$hocb_dst" ] && [ ! -L "$hocb_dst" ]; then
+    hocb_ok=yes
+    if diff -q "$hocb_dst" "$hocb_real_bin" >/dev/null 2>&1; then
+      hocb_ok_resolved_content=yes
+    fi
+  fi
+  rm -rf "$hocb_tmpdir"
+fi
+check "hardlink_or_copy_bin, actually run against a symlinked PATH entry, produces a regular file (not a symlink)" \
+  "$hocb_ok" "yes"
+check "...and that regular file's content matches the real binary the symlink pointed to" \
+  "$hocb_ok_resolved_content" "yes"
 
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"
