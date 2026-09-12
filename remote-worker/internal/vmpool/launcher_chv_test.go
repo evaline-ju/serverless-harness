@@ -574,9 +574,10 @@ func TestRewriteSnapshotConfigGivesEachVMItsOwnSockets(t *testing.T) {
 	golden := `{
 		"vsock": {"cid": 3, "socket": "/golden/vsock.sock"},
 		"fs": [{"tag": "workspace", "socket": "/golden/vfsd.sock", "num_queues": 1, "queue_size": 1024}],
-		"disks": [{"path": "/golden/rootfs.ext4", "readonly": true}]
+		"disks": [{"path": "/rootfs", "readonly": true}]
 	}`
-	out, err := rewriteSnapshotConfig([]byte(golden), "/run/vm-a/vsock.sock", "/run/vm-a/vfsd.sock")
+	rootfsPath := "/srv/snapshots/swebench-py311-chv/rootfs"
+	out, err := rewriteSnapshotConfig([]byte(golden), "/run/vm-a/vsock.sock", "/run/vm-a/vfsd.sock", rootfsPath)
 	if err != nil {
 		t.Fatalf("rewriteSnapshotConfig: %v", err)
 	}
@@ -596,16 +597,68 @@ func TestRewriteSnapshotConfigGivesEachVMItsOwnSockets(t *testing.T) {
 	if got := fs["socket"]; got != "/run/vm-a/vfsd.sock" {
 		t.Fatalf("fs[0].socket = %v, want /run/vm-a/vfsd.sock", got)
 	}
-	// The disk path/readonly flag must be untouched: C4/C8 already settled that
-	// readonly=on (baked into the golden snapshot) is what makes the disk lock
-	// shareable across standbys, so nothing about it should vary per VM.
+	// Fix round 7: disks[].path MUST now be rewritten to the given absolute
+	// rootfsPath — the golden snapshot's own jail-relative "/rootfs" resolves
+	// against the HOST's real root once this launcher's unchrooted
+	// cloud-hypervisor tries to open it, which is the exact "No such file or
+	// directory" ch-remote restore reported on real hardware. readonly, in
+	// contrast, MUST stay untouched: C4/C8 already settled that readonly=on
+	// (baked into the golden snapshot by the build pipeline) is what makes the
+	// disk lock shareable across standbys, and rewriting the path does not
+	// change who owns that decision.
 	disks, _ := doc["disks"].([]any)
 	disk, _ := disks[0].(map[string]any)
-	if got := disk["path"]; got != "/golden/rootfs.ext4" {
-		t.Fatalf("disks[0].path = %v, want unchanged /golden/rootfs.ext4", got)
+	if got := disk["path"]; got != rootfsPath {
+		t.Fatalf("disks[0].path = %v, want rewritten to %v", got, rootfsPath)
 	}
 	if got, ok := disk["readonly"].(bool); !ok || !got {
 		t.Fatalf("disks[0].readonly = %v, want unchanged true", disk["readonly"])
+	}
+}
+
+// TestRewriteSnapshotConfigRewritesEveryDiskToTheSharedGoldenPath is the
+// assertion the coordinator's fix-round-7 ruling required: disks[].path must be
+// absolute and point INTO the snapshot directory (never jail-relative like
+// "/rootfs", never into a per-VM runDir), and — because every standby shares the
+// identical golden rootfs file on purpose, unlike vsock/fs sockets — every disk
+// entry in a multi-disk config.json must be rewritten to that SAME path, not a
+// distinct one per entry.
+func TestRewriteSnapshotConfigRewritesEveryDiskToTheSharedGoldenPath(t *testing.T) {
+	golden := `{
+		"vsock": {"cid": 3, "socket": "/golden/vsock.sock"},
+		"disks": [
+			{"path": "/rootfs", "readonly": true},
+			{"path": "/rootfs", "readonly": true}
+		]
+	}`
+	rootfsPath := "/srv/snapshots/swebench-py311-chv/rootfs"
+	out, err := rewriteSnapshotConfig([]byte(golden), "/run/vm-a/vsock.sock", "", rootfsPath)
+	if err != nil {
+		t.Fatalf("rewriteSnapshotConfig: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+	disks, _ := doc["disks"].([]any)
+	if len(disks) != 2 {
+		t.Fatalf("disks = %v, want 2 entries", disks)
+	}
+	for i, entry := range disks {
+		disk, _ := entry.(map[string]any)
+		path, _ := disk["path"].(string)
+		if path != rootfsPath {
+			t.Fatalf("disks[%d].path = %q, want %q (every standby shares the one golden rootfs)", i, path, rootfsPath)
+		}
+		if !filepath.IsAbs(path) {
+			t.Fatalf("disks[%d].path = %q, want an absolute path", i, path)
+		}
+		if path == "/rootfs" {
+			t.Fatalf("disks[%d].path is still the jail-relative golden value %q — not rewritten", i, path)
+		}
+		if !strings.HasPrefix(path, "/srv/snapshots/swebench-py311-chv/") {
+			t.Fatalf("disks[%d].path = %q, want it to point INTO the snapshot directory", i, path)
+		}
 	}
 }
 
@@ -614,7 +667,7 @@ func TestRewriteSnapshotConfigGivesEachVMItsOwnSockets(t *testing.T) {
 // fail or invent an "fs" key that was not there.
 func TestRewriteSnapshotConfigToleratesNoFsSection(t *testing.T) {
 	golden := `{"vsock": {"cid": 3, "socket": "/golden/vsock.sock"}}`
-	out, err := rewriteSnapshotConfig([]byte(golden), "/run/vm-a/vsock.sock", "")
+	out, err := rewriteSnapshotConfig([]byte(golden), "/run/vm-a/vsock.sock", "", "/srv/snapshots/swebench-py311-chv/rootfs")
 	if err != nil {
 		t.Fatalf("rewriteSnapshotConfig: %v", err)
 	}
@@ -624,6 +677,9 @@ func TestRewriteSnapshotConfigToleratesNoFsSection(t *testing.T) {
 	}
 	if _, present := doc["fs"]; present {
 		t.Fatalf("fs key should not have been invented: %v", doc["fs"])
+	}
+	if _, present := doc["disks"]; present {
+		t.Fatalf("disks key should not have been invented: %v", doc["disks"])
 	}
 }
 
@@ -697,6 +753,35 @@ func TestRestoreStagesCHNativeNamesFromGoldenNames(t *testing.T) {
 	}
 	if vsock, _ := doc["vsock"].(map[string]any); vsock["socket"] != vsockSock {
 		t.Fatalf("runDir/%s vsock.socket = %v, want %v", chvSnapshotConfigFile, vsock["socket"], vsockSock)
+	}
+
+	// Fix round 7's required assertion: disks[].path in the rewritten config must
+	// be absolute and point INTO the snapshot directory (goldenDir here stands in
+	// for opts.SnapshotDir) — never the jail-relative golden value ("/golden/rootfs.ext4"
+	// in this fixture, "/rootfs" for a real build), and never into runDir, since
+	// every standby is meant to open the ONE shared golden rootfs file, not a
+	// per-VM copy staged alongside its sockets.
+	wantRootfsPath := filepath.Join(goldenDir, fileRootfs)
+	disks, _ := doc["disks"].([]any)
+	if len(disks) != 1 {
+		t.Fatalf("runDir/%s disks = %v, want 1 entry", chvSnapshotConfigFile, disks)
+	}
+	disk, _ := disks[0].(map[string]any)
+	gotPath, _ := disk["path"].(string)
+	if gotPath != wantRootfsPath {
+		t.Fatalf("runDir/%s disks[0].path = %q, want %q", chvSnapshotConfigFile, gotPath, wantRootfsPath)
+	}
+	if !filepath.IsAbs(gotPath) {
+		t.Fatalf("runDir/%s disks[0].path = %q, want an absolute path", chvSnapshotConfigFile, gotPath)
+	}
+	if gotPath == "/golden/rootfs.ext4" || gotPath == "/rootfs" {
+		t.Fatalf("runDir/%s disks[0].path is still the jail-relative golden value %q — not rewritten", chvSnapshotConfigFile, gotPath)
+	}
+	if strings.HasPrefix(gotPath, runDir) {
+		t.Fatalf("runDir/%s disks[0].path = %q, want it to point into goldenDir/SnapshotDir, not into runDir", chvSnapshotConfigFile, gotPath)
+	}
+	if got, ok := disk["readonly"].(bool); !ok || !got {
+		t.Fatalf("runDir/%s disks[0].readonly = %v, want unchanged true", chvSnapshotConfigFile, disk["readonly"])
 	}
 
 	// And the golden names themselves must NOT be the names runDir exposes to CH —

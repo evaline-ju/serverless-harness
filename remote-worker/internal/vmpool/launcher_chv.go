@@ -419,8 +419,8 @@ var chvPrepareOwnership = chvPrepareVirtiofsdOwnership
 var chvCheckWorkspaceReachable = checkPathTraversableBy
 
 // rewriteSnapshotConfig returns a copy of the golden snapshot's config.json with
-// its embedded vsock and (if present) virtio-fs socket paths replaced by
-// per-VM-unique ones.
+// its embedded vsock socket path, (if present) virtio-fs socket path, and every
+// disk's path replaced by host-resolvable ones.
 //
 // WHY THIS EXISTS (a design decision this task made, not one the brief or
 // hardware-corrections prescribe a mechanism for): the reference tutorial
@@ -435,15 +435,79 @@ var chvCheckWorkspaceReachable = checkPathTraversableBy
 // hardware-corrections C8 anticipates needing exactly this: "If that test
 // nonetheless fails, the disk lock is not your cause; look at ... the vsock
 // socket path, or the snapshot's own config.json." This function, plus Restore's
-// per-VM directory below, is this task's answer to that hint. The `disks` array
-// is deliberately left untouched: C4/C8 already confirmed readonly=on (baked into
-// the golden snapshot by the build pipeline) makes the rootfs's advisory lock
-// shareable across standbys, so nothing about the disk path needs to vary per VM.
+// per-VM directory below, is this task's answer to that hint.
+//
+// Fix round 7 EXTENDS this to disks[].path, for a DIFFERENT reason than vsock/fs:
+// vsock and fs sockets vary PER VM (each standby needs its own, or they collide).
+// disks[].path does not vary per VM at all — every standby is rewritten to the
+// exact SAME absolute host path, filepath.Join(SnapshotDir, fileRootfs) — every
+// standby shares the one golden rootfs file, unconditionally. The reason it still
+// needs rewriting is different: build-snapshot.sh's CH arm builds the golden
+// snapshot chrooted into a jail, so config.json's disks[].path is recorded
+// JAIL-RELATIVE ("/rootfs") — meaningless once this launcher restores it
+// unchrooted (a documented gap this file's package comment attributes to Task
+// 17), where "/rootfs" resolves against the HOST's real root, and nothing lives
+// there. ch-remote restore's own error on real hardware is exact about this:
+// "Cannot open disk path","I/O error (path=/rootfs op=open)","No such file or
+// directory (os error 2)".
+//
+// THIS IS NOT A REVERSAL of the earlier "disks is deliberately left untouched"
+// decision — that decision was, and remains, about disks[].readonly, not
+// disks[].path, and the two must not be conflated:
+//   - readonly stays exactly as the golden snapshot's own config.json already has
+//     it (readonly=on, baked in by build-snapshot.sh's own
+//     `--disk "path=/rootfs,readonly=on"`). This launcher still never sets or
+//     forces it. C4/C8 already confirmed readonly=on gives the rootfs a
+//     SharedRead advisory lock, and SharedRead locks coexist — verified directly
+//     on the rig (a writable open was refused with "Can't get Write lock ... as
+//     there is already a SharedRead lock", while a readonly one was not), which
+//     is what lets N standbys open the one golden rootfs concurrently. That is a
+//     build-pipeline concern; this launcher's argv is still silent on it.
+//   - path IS rewritten, because it is a RESTORER-side concern the golden
+//     snapshot cannot itself resolve: it was recorded relative to a jail
+//     directory structure ($jail as "/") that no longer exists once the snapshot
+//     is copied out and restored somewhere else, unchrooted. Something on the
+//     restore side has to translate it back to a real, absolute, host path —
+//     exactly the same class of problem vsock.socket already had, and exactly why
+//     this function is where the fix belongs. No staging or per-VM copy is
+//     needed: every standby is handed the identical absolute path, on purpose.
+//
+// Audit of other config.json fields that might carry a similar jail-relative
+// path (done this round, so a future reader does not have to re-derive it from
+// scratch — see the task-16 report's fix-round-7 section for the full source
+// citations): walking build-snapshot.sh's CH-arm jail invocation (--kernel
+// /kernel, --disk path=/rootfs, --vsock socket=/vsock.sock, --console
+// file=/console.log) against Cloud Hypervisor v53.0's own vmm/src/vm_config.rs
+// and vmm/src/lib.rs:
+//   - payload.kernel ("/kernel"): NOT re-read on restore. vmm/src/vm.rs only
+//     calls load_payload_async when snapshot.is_none() — a restored VM's kernel
+//     is already resident in the memory snapshot, never re-loaded from disk.
+//     Safe; no rewrite needed.
+//   - console.common.file ("/console.log"): IS re-opened on every restore —
+//     vmm/src/lib.rs's vm_restore unconditionally calls
+//     pre_create_console_devices ("Always re-populate the 'console_info' based on
+//     the new 'vm_config'"), and that function's File::create on the console
+//     path is fatal on error. But File::create, unlike a disk's read-only open of
+//     a file that must already exist, SUCCEEDS against a nonexistent host
+//     "/console.log" (it creates it) — so this does not block restore the way
+//     disks[].path did, which is consistent with it not being the next error the
+//     coordinator saw. It IS a real latent defect of a different kind: every
+//     standby silently creates/truncates the same file at the HOST's real root
+//     instead of somewhere per-VM. Flagged in the task-16 report as a candidate
+//     for a future round or for Task 17's chroot fix; deliberately NOT fixed
+//     here — it was not the failure in front of us, and this round's brief was
+//     disks[].path specifically.
+//   - vsock.socket, fs[].socket: already handled, above.
+//   - serial.common.file: this build passes --serial off, so mode=Off and no
+//     file field is even present in config.json.
+//   - No other VmConfig field (net, pmem, devices, vdpa, numa, etc.) is
+//     configured by build-snapshot.sh's CH arm at all, so none of them appear in
+//     the golden config.json to begin with.
 //
 // UNVERIFIED END TO END: this task has no KVM access, so this rewrite has been
 // exercised only as a pure function against synthetic JSON (see
 // launcher_chv_test.go), never against a real config.json or a real restore.
-func rewriteSnapshotConfig(src []byte, vsockPath, fsSocketPath string) ([]byte, error) {
+func rewriteSnapshotConfig(src []byte, vsockPath, fsSocketPath, rootfsPath string) ([]byte, error) {
 	var doc map[string]any
 	if err := json.Unmarshal(src, &doc); err != nil {
 		return nil, fmt.Errorf("parse config.json: %w", err)
@@ -457,6 +521,17 @@ func rewriteSnapshotConfig(src []byte, vsockPath, fsSocketPath string) ([]byte, 
 				if fs, ok := entry.(map[string]any); ok {
 					fs["socket"] = fsSocketPath
 				}
+			}
+		}
+	}
+	// Fix round 7: every disk entry's path is rewritten to the same absolute
+	// golden-rootfs path, unconditionally — unlike vsock/fs above, this is
+	// deliberately NOT per-VM-unique. readonly is untouched: see this function's
+	// doc comment for why that split is intentional, not an oversight.
+	if diskList, ok := doc["disks"].([]any); ok {
+		for _, entry := range diskList {
+			if disk, ok := entry.(map[string]any); ok {
+				disk["path"] = rootfsPath
 			}
 		}
 	}
@@ -499,7 +574,12 @@ func chvStageSnapshotFiles(snapshotDir, runDir, vsockSock, fsSock string) error 
 	if err != nil {
 		return fmt.Errorf("read golden config.json: %w", err)
 	}
-	rewritten, err := rewriteSnapshotConfig(golden, vsockSock, fsSock)
+	// Fix round 7: rootfsPath is the golden rootfs's own absolute path — every
+	// standby's disks[].path is rewritten to this SAME value, not staged or
+	// hardlinked per-VM (see rewriteSnapshotConfig's doc comment for why that is
+	// safe and deliberate).
+	rootfsPath := filepath.Join(snapshotDir, fileRootfs)
+	rewritten, err := rewriteSnapshotConfig(golden, vsockSock, fsSock, rootfsPath)
 	if err != nil {
 		return fmt.Errorf("rewrite config.json: %w", err)
 	}
@@ -704,8 +784,19 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 		// (This launcher never sets readonly=off; if this fires, the golden
 		// snapshot's own config.json's disks[].readonly is the place to check —
 		// that is a build-pipeline concern, not this launcher's argv.)
+		//
+		// Fix round 7 makes this diagnostic MORE precise, not less: rewriteSnapshotConfig
+		// now points every standby's disks[].path at the exact same file —
+		// filepath.Join(l.opts.SnapshotDir, fileRootfs) — so if this fires, it is not
+		// "some golden rootfs, maybe this one", it is THE literal shared file every
+		// concurrent standby just tried to open. That sharing is exactly what C4/C8's
+		// readonly=on SharedRead lock is FOR (verified on the rig: SharedRead locks
+		// coexist; a writable open is refused while any exist), so naming the path
+		// directly turns "is the golden rootfs not read-only?" from a rhetorical
+		// question into a concrete file to go check.
 		if chvLooksLikeDiskLockError(combined) {
-			return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: disk-lock error (golden rootfs is not read-only? see hardware-corrections C4/C8): %s", req.ID, combined), cleanup())
+			sharedRootfs := filepath.Join(l.opts.SnapshotDir, fileRootfs)
+			return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: disk-lock error (shared golden rootfs %s is not read-only? see hardware-corrections C4/C8): %s", req.ID, sharedRootfs, combined), cleanup())
 		}
 		// hardware-corrections C3: a guest that panics for lack of `root=` on the
 		// cmdline produces exactly this symptom from ch-remote's point of view — a
