@@ -25,26 +25,26 @@ completion against real KVM and a real golden snapshot, and every FAIL is a real
 reproduced failure with a known signature (see "Final round" below). That sentence is
 the reason the rest of this section can be trusted.
 
-| Gate | Firecracker (final round) | Cloud Hypervisor (final round) |
-| --- | --- | --- |
-| `TestGateEmptyKeyIsRefused` | PASS (0.00s) | PASS |
-| `TestGateNoVMReuse` (`fake_launcher_concurrency` subtest) | PASS (0.75s, both subtests) | PASS |
-| `TestGateNoVMReuse` (`real_launcher` subtest) | PASS (0.75s, both subtests) | **FAIL** — 30s timeout in `Restore` |
-| `TestGateWriteDurability` | PASS (0.57s) | **FAIL** — 30s timeout in `Restore` |
-| `TestGateNoCrossRunBleed` | PASS (1.26s) | **FAIL** — 30s timeout in `Restore` |
-| `TestGateSnapshotHoldsNoSecrets` | PASS (0.41s) | **FAIL** — 30s timeout in `Restore` |
-| `TestGateLeakFreeTeardown` | PASS (5.04s) | **FAIL** — 30s timeout in `Restore` |
-| `TestGateParkedThenResumed` | PASS (0.00s) | PASS |
-| `TestGateReclaimThenRedispatch` | PASS (0.00s) | PASS |
-| `TestGateClock` | PASS (0.28s) — **failed first, correctly**; see below | **FAIL** — 30s timeout in `Restore` |
-| `TestGateOutputCapAtSource` | PASS (0.31s) | **FAIL** — 30s timeout in `Restore` |
-| `TestNothingInTheWorkerPathSpawnsAShell` (privilege pin, static) | PASS | n/a (arm-independent) |
-| `TestTheHostFakeCannotServeARealVMMConfig` | PASS | n/a (arm-independent) |
+| Gate                                                             | Firecracker (final round)                             | Cloud Hypervisor (final round)      |
+| ---------------------------------------------------------------- | ----------------------------------------------------- | ----------------------------------- |
+| `TestGateEmptyKeyIsRefused`                                      | PASS (0.00s)                                          | PASS                                |
+| `TestGateNoVMReuse` (`fake_launcher_concurrency` subtest)        | PASS (0.75s, both subtests)                           | PASS                                |
+| `TestGateNoVMReuse` (`real_launcher` subtest)                    | PASS (0.75s, both subtests)                           | **FAIL** — 30s timeout in `Restore` |
+| `TestGateWriteDurability`                                        | PASS (0.57s)                                          | **FAIL** — 30s timeout in `Restore` |
+| `TestGateNoCrossRunBleed`                                        | PASS (1.26s)                                          | **FAIL** — 30s timeout in `Restore` |
+| `TestGateSnapshotHoldsNoSecrets`                                 | PASS (0.41s)                                          | **FAIL** — 30s timeout in `Restore` |
+| `TestGateLeakFreeTeardown`                                       | PASS (5.04s)                                          | **FAIL** — 30s timeout in `Restore` |
+| `TestGateParkedThenResumed`                                      | PASS (0.00s)                                          | PASS                                |
+| `TestGateReclaimThenRedispatch`                                  | PASS (0.00s)                                          | PASS                                |
+| `TestGateClock`                                                  | PASS (0.28s) — **failed first, correctly**; see below | **FAIL** — 30s timeout in `Restore` |
+| `TestGateOutputCapAtSource`                                      | PASS (0.31s)                                          | **FAIL** — 30s timeout in `Restore` |
+| `TestNothingInTheWorkerPathSpawnsAShell` (privilege pin, static) | PASS                                                  | n/a (arm-independent)               |
+| `TestTheHostFakeCannotServeARealVMMConfig`                       | PASS                                                  | n/a (arm-independent)               |
 
 Firecracker: **10/10 on real hardware, with no environment overrides** — the suite
 self-configures now (fix round 2's startup device checks, plus fix round 3's traversal
 fix). Nine of the ten passed on the first properly-configured run; `TestGateClock`
-failed *first*, correctly, catching a real, shipped defect — see "`TestGateClock`
+failed _first_, correctly, catching a real, shipped defect — see "`TestGateClock`
 caught a real defect on its merits" below, which this final round confirms as the gate
 suite's headline result: a subtle bug that nothing but a correctness gate would ever
 have found, caught before it could ship.
@@ -176,7 +176,7 @@ device split the coordinator's own bug report already demonstrated.
 The rig's first run of `TestGateClock` failed — correctly. It caught a `clockOK`
 one-shot latch in the guest agent that had been baked into the golden snapshot's own
 memory image: every VM restored from that snapshot believed its clock had already been
-corrected, because the snapshot was taken *after* the guest agent's real boot-time clock
+corrected, because the snapshot was taken _after_ the guest agent's real boot-time clock
 fix had already run once and set the latch. Fixed upstream in `66fdf86` (remove the
 latch entirely — restoring a paused VM's clock correction must not depend on in-memory
 state captured before the snapshot, since that state is exactly what gets replayed
@@ -195,20 +195,20 @@ each time), and observing the gate PASS again:
   about-to-be-destroyed VM back onto the run's standby pool and skip the real
   `vm.Destroy()` call (simulating a "recycle the handle instead of destroying it"
   regression). Observed failure: `concurrent Exec: spawn-failure: resume "run-a":
-  fakeVM vm-3: Resume twice`. Reverted; gate passed again.
+fakeVM vm-3: Resume twice`. Reverted; gate passed again.
 - **`TestGateEmptyKeyIsRefused`** — mutated `workspace.go`'s `checkKey` to skip the
   empty-key check. Observed failure: `ReasonOf(err) = invalid-workspace-key, want
-  empty-workspace-key` (the empty string fell through to the regex check instead of
+empty-workspace-key` (the empty string fell through to the regex check instead of
   being refused for being empty). Reverted; gate passed again.
 - **`TestGateParkedThenResumed`** — mutated `sweep.go`'s `sweepOnce` so the
   `WorkspaceIdle` branch (drop the workspace) fires at `StandbyIdle` too instead of
   only parking. Observed failure: `ColdAcquires[ColdParked] rose by 0, want 1 — a
-  parked-then-resumed run must be a cold acquire` (the run's map entry was deleted
+parked-then-resumed run must be a cold acquire` (the run's map entry was deleted
   outright, so the next Exec was classified as a first-exec cold acquire, not a
   parked one). Reverted; gate passed again.
 - **`TestGateReclaimThenRedispatch`** — mutated `pool.go`'s `Reclaim` to skip its
   final `removeWorkspace(dir)` call. Observed failure: `workspace .../gate-reclaim
-  survived Reclaim: err=<nil>`. Reverted; gate passed again.
+survived Reclaim: err=<nil>`. Reverted; gate passed again.
 
 ### Resolved: cloud-hypervisor snapshot naming mismatch
 
@@ -283,7 +283,7 @@ defect.
 Added:
 
 - `remote-worker/internal/vmpool/devicecheck.go` — `checkPathsShareDevice(why
-  string, paths ...namedPath) error`, the shared comparison-plus-formatting
+string, paths ...namedPath) error`, the shared comparison-plus-formatting
   logic; `namedPath{name, path}` pairs a host path with the Config/Options field
   it should be reported under, so the error names something an operator can
   actually go edit, not just a bare directory string. `deviceRequirer` is a
@@ -420,7 +420,7 @@ confusing message the coordinator saw for a directory plainly present on disk.
 **Item 1 — `sameDeviceSiblingDir` now chmods its directory to `0711`, not the
 default `0700`.** `0711` — execute-without-read, `rwx--x--x` — was the
 coordinator's deliberate choice over `0755`: it lets an unprivileged process
-traverse *through* to a path it has been told the name of, without letting it
+traverse _through_ to a path it has been told the name of, without letting it
 `readdir` what else lives in there, keeping this jail's other per-run contents
 unlistable by anyone but its root owner — the standard "reachable but not
 listable" posture. The fix carries an explicit comment warning against
@@ -454,7 +454,7 @@ Added:
   ("say so precisely: which path, which uid, and which ancestor's mode is
   blocking").
 - `statOwnerMode` (`device_unix.go`/`device_other.go`) — a `//go:build
-  unix`/`!unix`-split stat helper returning a path's owning uid/gid/mode,
+unix`/`!unix`-split stat helper returning a path's owning uid/gid/mode,
   alongside the existing `deviceNumber` from fix round 2's identical platform
   split, for the identical reason: `GOOS=windows go vet` compiles `_test.go`
   files and `syscall.Stat_t` does not exist there.
@@ -504,7 +504,7 @@ Reverted; test passes again, full suite green.
 
 **Mutation test, Item 2 — reproducible locally, two ways.**
 
-- *Point the shared dir at an unreachable path* (the coordinator's literal
+- _Point the shared dir at an unreachable path_ (the coordinator's literal
   ask): `TestRestoreFailsWhenWorkspaceIsUnreachable` builds a genuine `0700`
   `blocker` directory (owned by this test's own uid, never
   `chvOpts`'s `VirtiofsdUID` 65534) as an ancestor of `WorkspaceDir`, then
@@ -514,14 +514,14 @@ Reverted; test passes again, full suite green.
   (`TestCheckPathTraversableByDetectsBlockingAncestor`) and this end-to-end one
   passing, and by inspecting the assertions directly (both assert
   `strings.Contains` on all three).
-- *Remove the check itself*: temporarily wrapped the `chvCheckWorkspaceReachable`
+- _Remove the check itself_: temporarily wrapped the `chvCheckWorkspaceReachable`
   call site in `Restore` in `if false { ... }` (simulating "call site
   deleted"), rebuilt, and re-ran the suite. Observed failure: exactly
   `TestRestoreChecksWorkspaceReachableBeforeVirtiofsd` and
   `TestRestoreFailsWhenWorkspaceIsUnreachable` FAILed —
   `TestRestoreFailsWhenWorkspaceIsUnreachable` now got as far as `Restore`
   actually attempting to spawn virtiofsd (`fork/exec /usr/libexec/virtiofsd:
-  operation not permitted` — an unrelated, expected failure on this machine),
+operation not permitted` — an unrelated, expected failure on this machine),
   never reporting the blocked ancestor at all — exactly the regression this
   test exists to catch. Every other test, including the two Item 1 tests and
   the three standalone `traversalcheck_test.go` unit tests, stayed green.
@@ -629,5 +629,127 @@ reproduced 30-second `Restore()` timeout, not a flaky or partial result.
 
 ## Performance rungs
 
-Not yet run. E10/E11 depend on the rig and a built golden snapshot, same as the
-correctness gates above; see the rig command sections in those tasks' own briefs.
+### E10 — the lifecycle primitive ladder
+
+Not yet run. Depends on the rig and a built golden snapshot, same as the
+correctness gates above. Driver: `deploy/microvm/e10-lifecycle.sh`; cluster-free
+proof of its structure: `deploy/microvm/tests/e10-lifecycle.test.sh` (46/46
+checks pass standalone). See the rig command section above and task-20's own
+brief for the invocation.
+
+### E11 — density, the replenishment ceiling, and the write-up
+
+**Status: instrument built and locally verified; not yet run.** Per the
+project owner's resequencing of this endgame — build everything, then
+validate hypotheses on a virtualized box, then a reviewed PR, then the metal
+run last (task-21-hardware-corrections.md, F1) — this task built the sweep
+driver and its cluster-free test but did **not** invoke the driver against
+any hardware, nested or metal. Every number and verdict below is a **named
+blank**, not a placeholder value. No `ssh`, no density sweep, and no
+`SH_SUBSTRATE=metal` invocation happened in producing this section.
+
+Driver: `deploy/microvm/e11-density.sh` (requires `SH_SUBSTRATE`,
+`SH_SNAPSHOT_DIR`, `SH_WORKSPACE_ROOT`, `SH_MAX_COMMITTED_MB` — no defaults,
+so a misconfigured invocation refuses rather than mislabels its own
+substrate). Cluster-free proof of its structure:
+`deploy/microvm/tests/e11-density.test.sh`. Analysis: `analyzeLadder` in
+`experiments/src/microvm-density.ts`, which reuses `detectKnee` (spec §7.3)
+and scores predictions pinned in `deploy/microvm/predictions.json`.
+
+#### What a validation run on the nested box can and cannot establish
+
+A nested run (this environment's own `nested-m8i` substrate, never
+`nested-c8i`) can establish, end to end: that a sweep run completes without
+the driver itself faulting; that Σ PSS sampling from `/proc/<pid>/smaps_rollup`
+works and never falls back to RSS; that `analyzeLadder`/`detectKnee` refuse
+cheaply on a malformed or lease-saturated ladder; and _which resource_ a knee
+in that run is bound by. A nested run **cannot** establish the knee's
+location under real concurrency, an absolute p95, or how close that p95 sits
+to the container baseline — nested virtualization taxes exactly the
+VM-exit-heavy work restore consists of (spec §7.2's own per-substrate
+thresholds already assume this). Every number a nested run would produce is
+a validation result, never a measurement, and must not be quoted as one.
+
+#### Per-rung metrics (spec §7.3)
+
+Sweep dimensions: concurrent active runs (`c`) × `D` (standby depth) ×
+`GuestRAMBytes`. The ladder for each (D, GuestRAMBytes) slice must include
+`c = 1` as the baseline `detectKnee` requires.
+
+| c   | Exec/sec (p50/p95) | cold-acquire rate | replenishment lag/queue depth | Σ PSS (VMM + virtiofsd) | host MemAvailable / Mlocked / page cache / swap | process count + sysctl/rlimit values | host CPU (+ fraction attributable to replenishment) | ExecErrors by cause | idle standby residency + reclaim convergence time | lease saturations |
+| --- | ------------------ | ----------------- | ----------------------------- | ----------------------- | ----------------------------------------------- | ------------------------------------ | --------------------------------------------------- | ------------------- | ------------------------------------------------- | ----------------- |
+| 1   | «unrun»            | «unrun»           | «unrun»                       | «unrun»                 | «unrun»                                         | «unrun»                              | «unrun»                                             | «unrun»             | «unrun»                                           | must be 0         |
+| …   | «unrun»            | «unrun»           | «unrun»                       | «unrun»                 | «unrun»                                         | «unrun»                              | «unrun»                                             | «unrun»             | «unrun»                                           | must be 0         |
+
+`StandbyIdle` (90s), `WorkspaceIdle` (1800s), `ReplenishDelay` (0.2s) and
+`ReclaimScanInterval` (22.5s) are held at their spec §4.1 defaults and
+recorded in every rung's JSON output (`e11-density.sh`'s
+`static_settings_json`) — not swept, per spec §7.3's own reasoning.
+
+#### Falsifiable predictions (spec §7.4, pinned in `predictions.json`)
+
+| #   | Claim                                                                                                                                                                                                                                                                                                                                                                                                                                            | Verdict         |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------- |
+| 1   | Replenishment binds on process/memory count before CPU.                                                                                                                                                                                                                                                                                                                                                                                          | pending (metal) |
+| 2   | The warm hot path lands within 2x of the container baseline, because both pay the relay hop and it dominates.                                                                                                                                                                                                                                                                                                                                    | pending (metal) |
+| 3   | The knee is a replenishment knee, not a latency knee: cold-acquire rate stays approximately 0 until replenishment rate meets Exec rate, then rises sharply.                                                                                                                                                                                                                                                                                      | pending (metal) |
+| 4   | Cloud Hypervisor's virtio-fs costs more per metadata op than Firecracker's block, visible in ls/find-heavy commands rather than in cat.                                                                                                                                                                                                                                                                                                          | pending (metal) |
+| 5   | Idle standby residency returns to zero within StandbyIdle + ReclaimScanInterval of a rung's last Exec on an otherwise idle host, while workspace count does not change until WorkspaceIdle; and because a run's final Exec pops a standby and mints its replacement, the run's full complement of D stands idle rather than being reclaimed, so idle standby residency tracks (runs finishing per StandbyIdle) x D x GuestRAMBytes and not zero. | pending (metal) |
+
+`analyzeLadder` scores predictions 1 and 3 structurally from a ladder's
+signals; predictions 2, 4 and 5 need data shapes this ladder does not carry
+(E10's own rungs, a per-command-class breakdown, and a post-rung
+convergence time series respectively) and read `inconclusive` from the
+analyzer regardless of substrate — "pending (metal)" here is this
+document's own accounting of the sweep never having run, not the
+analyzer's output.
+
+#### Arms
+
+- **Firecracker**: driven, block device + mount-at-acquire.
+- **Cloud Hypervisor: absent as an arm.** Not because it is slower — it does
+  not restore. Every CH run in this environment's correctness gates (see
+  above) times out during device restoration with the signature
+  `Restoring virtio-console __console`, presenting as a 30-second hang. An
+  A/B VMM comparison is dropped for E11; see the correctness-gates section
+  above for the full record of that boundary.
+
+Both arms (where CH were present) are driven through the identical
+`run_density_rung` function and the identical `grpc_exec_record` RPC call —
+`e11-density.sh` has no arm-specific Exec-driving code path.
+
+#### The claim (spec §7.7), structure only
+
+> On a single «nested-m8i | bare-metal» host, `microvm-worker` sustained
+> **«N» concurrent in-flight `Exec`s** across **«R» active runs**, at p95
+> within **«X»** of the container baseline, with every `Exec` executing in a
+> microVM created for it and destroyed after it. The bound observed was
+> **«replenishment throughput | host memory | process count»**. Standbys
+> resident at that point: **«S»** — a memory statement, not a throughput
+> claim.
+
+No blank above is filled. Filling it is the metal run's job, not this task's.
+
+#### Open items carried into the metal run
+
+- **Spec §4.5's repo-cache shape remains undecided.** `e11-density.sh`
+  records which of the three named shapes (`two-mounts`, `shared-clone`,
+  `accept-cold-fetch`) a run used (`repoCacheShape` in each rung's JSON
+  record); it does not choose one, and no ADR amendment was written. See
+  task-21-hardware-corrections.md F7.
+- **Model-stub dependency gap.** The driver can take an external
+  `SH_E11_MODEL_STUB_CMD` to drive the relay's `Exec` mix, but absent one it
+  drives the mix itself directly — a disclosed stand-in for P6 §5.4's model
+  stub, not the stub itself.
+- **`coldAcquireRate` is a latency-classification proxy**
+  (`>= SH_E11_COLD_LATENCY_MS`, default 50ms) at the driver level, not a
+  signal read off the pool's own replenishment bookkeeping.
+- **`standbysResident` is a proxy** (`max(processCount - c, 0)`), not a
+  direct pool-internal count.
+- **`leaseSaturations` is always recorded as 0.** The driver bypasses the
+  harness lease layer entirely, so this field cannot show a real lease
+  refusal; `analyzeLadder`'s guard against `leaseSaturations > 0` is
+  exercised only by the unit tests, never by this driver's own output.
+- **`MV_LIVE=1` was not attempted.** Out of scope for this task
+  (task-21-hardware-corrections.md F8); no placeholder resembling a live run
+  was added.

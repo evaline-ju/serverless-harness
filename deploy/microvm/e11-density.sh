@@ -1,0 +1,804 @@
+#!/usr/bin/env bash
+# deploy/microvm/e11-density.sh
+#
+# E11 — density and the replenishment ceiling (spec section 7.3). Unlike E10 (Task
+# 20), this drives THROUGH THE RELAY against a real worker binary, sweeping
+# concurrent active runs x D x GuestRAMBytes, so it is a concurrency sweep, not a
+# ladder of isolated terms.
+#
+# SCOPE (task-21-hardware-corrections.md F1): this task builds the INSTRUMENT and
+# runs it, once, on a shared nested rig to validate the mechanism -- not to produce
+# the headline density number. This script is written to be run on that rig by a
+# human operator; it is NOT invoked by any automated test in this repo, and nothing
+# in deploy/microvm/tests/e11-density.test.sh calls main(). See task-21-report.md
+# for the full disclosure of every proxy/limitation below.
+#
+# Two arms only (hardware-corrections F5): "container" (today's remote-worker, no
+# microVM at all -- the baseline E11 is priced against) and "microvm"
+# (microvm-worker, Firecracker ONLY). Cloud Hypervisor is not a third arm: on this
+# project's rig it dies during device restoration after logging
+# "Restoring virtio-console __console", with no error propagated through its API,
+# and presents as a 30-second hang -- it does not restore, so there is nothing to
+# sweep. Where a CH column would appear in a write-up, that absence is the reason,
+# not "it was slower" (F5).
+#
+# Because the microvm arm is Firecracker-only, and spec section 4.3's Firecracker
+# cross-cut is "+ block with mount-at-acquire" (not virtio-fs), a correctly-running
+# sweep on this arm has ZERO virtiofsd processes -- virtiofsd is a Cloud Hypervisor
+# thing. pss_bytes_for_pids summing 0 bytes for the virtiofsd pattern here is
+# therefore the EXPECTED result of an absent process, not evidence of a bug in the
+# sampler. See discover_pids / host_signals_snapshot below.
+#
+# Spec section 7.5 traps, and how each is handled here:
+#   - closed-loop driver hides queueing:  NOT eliminated. run_density_rung drives
+#     each of the c concurrent "slots" as a tight loop that waits for one Exec to
+#     finish before issuing the next (closed-loop, per slot) rather than a genuine
+#     open-loop / rate-based arrival process. Spec section 7.5 permits either
+#     ("drive open-loop / rate-based, or declare the bias") -- this script takes the
+#     declared-bias branch. drivingModel="closed-loop-per-slot" is written into
+#     every rung's JSON record for exactly this reason: coordinated omission means
+#     this design UNDERSTATES latency at saturation, which is the regime
+#     prediction 3 (cold-acquire shape) lives in. A future revision that swaps this
+#     for a real rate-based driver would only need to change how requests are
+#     scheduled onto the same grpc_exec_record() plumbing.
+#   - page-cache asymmetry between arms: drop_caches (dup of e10-lifecycle.sh's own
+#     function) runs between the container and microvm arms, and shuffle_e11_arms
+#     randomizes which arm goes first, exactly as E10 does for its own arms.
+#   - guest-side timing is garbage: every timestamp in this script is taken on the
+#     HOST around a grpcurl call (date +%s%N); no guest clock is ever read.
+#   - CPU frequency / thermal drift: check_governor (dup of e10-lifecycle.sh's own
+#     function) still refuses a non-"performance" governor before any rung runs.
+#   - converge hides inside the rungs (section 4.5): converge_slot times ONE
+#     Exec running the exact converge script harness/src/converge.ts:
+#     buildConvergeScript() builds (reproduced here verbatim, see build_converge_
+#     script below) BEFORE a slot's timed Exec-mix loop starts, and its wall time
+#     is recorded in a SEPARATE field (convergeMsP50) from the Exec-mix p50/p95, so
+#     a slow fetch cannot misread as a throughput ceiling.
+#
+# Section 4.5's owed decision (hardware-corrections F7: DO NOT decide it here). The
+# spec's own three shapes, verbatim:
+#   1. "Two mounts." A host-shared /workspace/repo (read-mostly) plus a per-run rw
+#      dir for worktrees. Cheapest to reason about; needs the fetch lock to become
+#      host-level rather than per-pod.
+#   2. "Per-run clone with --shared / alternates" against a host-side object store.
+#   3. "Accept the cold fetch" and pre-seed the golden snapshot's workspace image
+#      with the repos in play -- viable for the experiment, not for a general
+#      deployment.
+# SH_E11_REPO_CACHE_SHAPE below RECORDS which one a run claims (spec section 7.5:
+# "record which of section 4.5's three shapes the run used") -- it does NOT decide
+# among them. Its default, "accept-cold-fetch" (shape 3), is chosen here only
+# because it is the one this script can drive with no new mount/clone
+# infrastructure on the Firecracker+block arm (there is no host<->guest shared
+# filesystem to put a "two mounts" or "--shared" object store on without inventing
+# one) -- a narrower, disclosed choice about how THIS INSTRUMENT feeds workload, not
+# a recommendation about what production should adopt. An operator who wants to
+# validate shape 1 or 2 must point SH_E11_CONVERGE_REPO_URL at infrastructure they
+# built themselves; this script does not implement the other two shapes.
+#
+# The four second-order settings held at their spec section 4.1 defaults and
+# RECORDED, NOT SWEPT (spec section 7.3: "adding four dimensions to
+# runs x D x GuestRAMBytes would multiply the rung count for a term the memory
+# arithmetic already bounds"). These match remote-worker/internal/vmpool/config.go's
+# own DefaultStandbyIdle / DefaultWorkspaceIdle / DefaultReplenishDelay constants and
+# that file's own anchor comment ("E11 holds StandbyIdle, WorkspaceIdle,
+# ReplenishDelay and ReclaimScanInterval at these values and RECORDS them rather
+# than sweeping them"). None of the four has an env override in microvm-worker's
+# poolConfig() -- there is nothing to sweep even if this script wanted to:
+#   - StandbyIdle        = 90s   (config.go DefaultStandbyIdle)
+#   - WorkspaceIdle       = 1800s (config.go DefaultWorkspaceIdle, 30m)
+#   - ReplenishDelay      = 0.2s  (config.go DefaultReplenishDelay, 200ms)
+#   - ReclaimScanInterval = 22.5s (StandbyIdle/4, per spec section 7.3's own framing)
+#
+# Disclosed proxies and limitations (see task-21-report.md for the full writeup;
+# summarized here at the point each is produced, not hidden in a report nobody
+# reads before running this):
+#   - leaseSaturations is ALWAYS 0. This driver issues Execs directly against the
+#     relay/worker over grpcurl and never goes through harness/src/sandbox-lease.ts
+#     or KAGENTI_SANDBOX_CAP, so it structurally cannot exercise or observe the
+#     harness-side lease cap spec section 7.3's last metric row asks for. A rung
+#     that would have saturated a lease in the real harness path is invisible here.
+#   - coldAcquireRate is a LATENCY-CLASSIFICATION PROXY, not the real replenishment
+#     signal: microvm-worker exposes no stats/introspection endpoint (confirmed:
+#     none exists in cmd/microvm-worker/main.go), and adding one is a Go change out
+#     of this task's deliverables. An Exec is counted as "cold" if its host-side
+#     latency is >= SH_E11_COLD_LATENCY_MS. execErrorsByCause is real (derived from
+#     the Exec RPC's own error/ExecError signal), coldAcquireRate is not.
+#   - standbysResident is a PROXY: max(processCount - c, 0), not a real pool-side
+#     count (same missing-introspection reason as above).
+#   - The model stub P6 section 5.4 specifies (deploy/knative/model-stub/) does not
+#     exist in this worktree/branch (confirmed via `ls`: only present on the
+#     unmerged feat/p6-experiments branch). SH_E11_MODEL_STUB_CMD lets an operator
+#     point at it once it exists; absent that, this script drives the Exec mix
+#     itself at a fixed, declared rate rather than the model stub's calibrated
+#     tool-call rate -- another reason drivingModel is recorded, not assumed.
+#
+# Usage (never run by this task -- see task-21-report.md):
+#   SH_SUBSTRATE=nested-m8i \
+#   SH_SNAPSHOT_DIR=/srv/snapshots SH_WORKSPACE_ROOT=/srv/workspaces \
+#   SH_MAX_COMMITTED_MB=8192 \
+#     bash deploy/microvm/e11-density.sh
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+RESULTS="${RESULTS:-deploy/microvm/.results}"
+
+# Required, no default -- same reasoning e10-lifecycle.sh gives for SH_SUBSTRATE:
+# an explicit, operator-set label cannot silently mislabel a nested run as metal
+# (hardware-corrections F3: this rig is nested-m8i, an EC2 m8i.xlarge, NOT
+# nested-c8i -- never pass SH_SUBSTRATE=metal on this box).
+SUBSTRATE="${SH_SUBSTRATE:?set SH_SUBSTRATE (e.g. nested-m8i per hardware-corrections F3) - spec section 6 requires the substrate in every run record}"
+SNAPSHOT_DIR="${SH_SNAPSHOT_DIR:?set SH_SNAPSHOT_DIR - the same env var name microvm-worker requires, see cmd/microvm-worker/main.go}"
+WORKSPACE_ROOT="${SH_WORKSPACE_ROOT:?set SH_WORKSPACE_ROOT - the same env var name microvm-worker requires, see cmd/microvm-worker/main.go}"
+# microvm-worker's own required var (poolConfig(): "SH_MAX_COMMITTED_MB is required:
+# without the memory gate, ..."); this script requires it too and passes it straight
+# through, rather than inventing a separate density-sweep memory budget.
+MAX_COMMITTED_MB="${SH_MAX_COMMITTED_MB:?set SH_MAX_COMMITTED_MB - the same required env var microvm-worker refuses to start without}"
+
+GOVERNOR_PATH="${GOVERNOR_PATH:-/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor}"
+PROC_ROOT="${SH_E11_PROC_ROOT:-/proc}" # overridable so tests can fake smaps_rollup without a Linux /proc
+
+# Sweep dimensions (spec section 7.3: "Sweep concurrent active runs x D x
+# GuestRAMBytes"). Defaults are vmpool's own single-point defaults
+# (DefaultStandbyDepth=2, DefaultGuestRAMBytes=256MiB); the active-runs ladder
+# MUST include c=1 -- detectKnee (experiments/src/sharing.ts) throws without a
+# c===1 baseline point, and analyzeLadder relies on that, so this is validated
+# below rather than discovered two hours into a sweep.
+read -r -a D_VALUES <<<"${SH_E11_D_VALUES:-2}"
+read -r -a RAM_MB_VALUES <<<"${SH_E11_GUEST_RAM_MB_VALUES:-256}"
+read -r -a ACTIVE_RUNS <<<"${SH_E11_ACTIVE_RUNS:-1 2 4 8}"
+
+ITERS_PER_SLOT="${SH_E11_ITERS_PER_SLOT:-20}"
+WARMUP_PER_SLOT="${SH_E11_WARMUP_PER_SLOT:-3}"
+
+# Section 4.5's owed shape, RECORDED not decided (hardware-corrections F7). See the
+# header comment above for the exact three verbatim shape names this must be one of.
+REPO_CACHE_SHAPE="${SH_E11_REPO_CACHE_SHAPE:-accept-cold-fetch}"
+CONVERGE_REPO_URL="${SH_E11_CONVERGE_REPO_URL:-file:///workspace/seed-repo}"
+CONVERGE_REF="${SH_E11_CONVERGE_REF:-HEAD}"
+
+# Optional: point at a real P6 section 5.4 model stub once one exists in this repo.
+# Absent, this script drives the Exec mix itself (see header comment's disclosure).
+MODEL_STUB_CMD="${SH_E11_MODEL_STUB_CMD:-}"
+
+# Disclosed latency-classification proxy threshold for coldAcquireRate (see header).
+COLD_LATENCY_MS="${SH_E11_COLD_LATENCY_MS:-50}"
+
+# VMM / virtiofsd host process patterns for PSS sampling (spec section 7.3: "Sigma
+# PSS across VMM + virtiofsd"). Overridable so a test can point these at a fake
+# marker process rather than a real firecracker/virtiofsd binary.
+VMM_PROC_PATTERN="${SH_E11_VMM_PROC_PATTERN:-firecracker}"
+VIRTIOFSD_PROC_PATTERN="${SH_E11_VIRTIOFSD_PROC_PATTERN:-virtiofsd}"
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REMOTE_WORKER_DIR="$REPO_ROOT/remote-worker"
+EXPERIMENTS_DIR="$REPO_ROOT/experiments"
+PROTO_FILE="$REPO_ROOT/proto/sandbox/v1/sandbox.proto"
+
+# Shared relay/redis stack knobs -- only ONE arm's stack is ever up at a time (each
+# arm is fully torn down before the next starts), so both arms reuse the same ports.
+E11_REDIS_PORT="${SH_E11_REDIS_PORT:-6381}"
+E11_RELAY_PORT="${SH_E11_RELAY_PORT:-8444}"
+E11_RELAY_TOKEN="${SH_E11_RELAY_TOKEN:-e11-dev-token}"
+E11_START_STACK="${SH_E11_START_STACK:-1}"
+
+die() { echo "e11: $*" >&2; exit 1; }
+log() { echo "e11: $*" >&2; }
+
+# ---------------------------------------------------------------------------
+# Preflight -- duplicated from e10-lifecycle.sh's own check_kvm/check_cgroups/
+# check_swap/check_governor rather than sourcing that file: sourcing a sibling
+# script that ends in its own unconditional main() call is a fragile cross-script
+# dependency for four ~5-line functions. Kept byte-for-byte equivalent in behavior
+# (not merely in intent) so e11-density.test.sh can extract and test them exactly
+# as e10-lifecycle.test.sh does.
+# ---------------------------------------------------------------------------
+check_kvm() {
+  [ -e /dev/kvm ] || die "no /dev/kvm"
+}
+
+check_cgroups() {
+  local t
+  t="$(stat -fc %T /sys/fs/cgroup 2>/dev/null || echo unknown)"
+  [ "$t" = cgroup2fs ] ||
+    die "cgroups v1: spec section 2.4 records it as a cause of high restore latency, so a rung measured here is not comparable"
+}
+
+check_swap() {
+  [ -z "$(swapon --show 2>/dev/null)" ] ||
+    die "swap is on: swapping guest RAM destroys the latency this design exists for (spec section 2.4)"
+}
+
+check_governor() {
+  if [ ! -e "$GOVERNOR_PATH" ]; then
+    echo "not exposed"
+    return 0
+  fi
+  local g
+  g="$(cat "$GOVERNOR_PATH" 2>/dev/null || echo "")"
+  if [ "$g" != "performance" ]; then
+    die "governor is '$g', not performance: replenishment is a CPU burst (spec section 7.5). This is fixable - set it and rerun."
+  fi
+  echo "performance"
+}
+
+# validate_repo_cache_shape refuses an SH_E11_REPO_CACHE_SHAPE value that is not one
+# of spec section 4.5's three named shapes -- recording an invented fourth shape
+# would be worse than recording none.
+validate_repo_cache_shape() {
+  case "$REPO_CACHE_SHAPE" in
+  two-mounts | shared-clone | accept-cold-fetch) : ;;
+  *)
+    die "SH_E11_REPO_CACHE_SHAPE='$REPO_CACHE_SHAPE' is not one of the spec section 4.5 shapes: two-mounts (shape 1, 'Two mounts.'), shared-clone (shape 2, 'Per-run clone with --shared / alternates'), accept-cold-fetch (shape 3, 'Accept the cold fetch')"
+    ;;
+  esac
+}
+
+preflight() {
+  check_kvm
+  check_cgroups
+  check_swap
+  GOVERNOR_STATE="$(check_governor)"
+  log "governor: $GOVERNOR_STATE"
+  validate_repo_cache_shape
+  mkdir -p "$RESULTS"
+}
+
+# static_settings_json prints the four spec section 4.1 settings this task holds
+# fixed and records rather than sweeps (see header comment). Pure function, no
+# globals read, so it is directly testable in isolation.
+static_settings_json() {
+  printf '{"standbyIdleS":90,"workspaceIdleS":1800,"replenishDelayS":0.2,"reclaimScanIntervalS":22.5}'
+}
+
+# ---------------------------------------------------------------------------
+# PSS sampling (spec section 7.3's boxed warning: "Use PSS, not RSS"). Split into
+# discover_pids (a real pgrep call, testable against a real spawned process with no
+# KVM needed) and pss_bytes_for_pids (a pure reader over $PROC_ROOT, testable
+# against a fabricated proc tree so it runs on any platform, Linux smaps_rollup or
+# not).
+# ---------------------------------------------------------------------------
+discover_pids() {
+  local pattern="$1"
+  pgrep -f -- "$pattern" 2>/dev/null || true
+}
+
+# pss_bytes_for_pids sums the "Pss:" line of $PROC_ROOT/<pid>/smaps_rollup across
+# every pid given. It NEVER reads VmRSS / RSS from /proc/<pid>/status as a
+# fallback: if a pid is still alive (kill -0 succeeds) but its smaps_rollup is
+# missing or unreadable, this dies rather than silently substituting a wrong-by-an-
+# order-of-magnitude number (spec section 7.3: "reporting ~50 GiB where the truth
+# is ~2 GiB ... in the pessimistic direction, so it would cause us to abandon a
+# design that works"). A pid that has already exited between discovery and
+# sampling contributes 0 (that is a race, not an unreadable file).
+pss_bytes_for_pids() {
+  local total_kb=0 pid smaps
+  for pid in "$@"; do
+    [ -n "$pid" ] || continue
+    smaps="$PROC_ROOT/$pid/smaps_rollup"
+    if [ ! -r "$smaps" ]; then
+      if kill -0 "$pid" 2>/dev/null; then
+        die "smaps_rollup unreadable for pid $pid ($smaps) - refusing to fall back to RSS (spec section 7.3's boxed warning)"
+      fi
+      continue # pid exited between discovery and sampling; not an unreadable file
+    fi
+    local pid_kb
+    pid_kb="$(awk '/^Pss:/{sum+=$2} END{print sum+0}' "$smaps")"
+    total_kb=$((total_kb + pid_kb))
+  done
+  echo $((total_kb * 1024))
+}
+
+mem_available_bytes() {
+  awk '/^MemAvailable:/{print $2*1024; exit} END{if (!found) print 0}' "$PROC_ROOT/meminfo" 2>/dev/null || echo 0
+}
+
+# host_cpu_fraction samples /proc/stat twice, SAMPLE_WINDOW_S apart, and returns
+# the busy fraction over that window -- never a single-sample /proc/stat snapshot,
+# which is meaningless (it is a cumulative counter since boot).
+host_cpu_fraction() {
+  local window="${1:-1}" a b idle_a idle_b total_a total_b
+  a="$(awk '/^cpu /{print; exit}' "$PROC_ROOT/stat" 2>/dev/null)"
+  sleep "$window"
+  b="$(awk '/^cpu /{print; exit}' "$PROC_ROOT/stat" 2>/dev/null)"
+  if [ -z "$a" ] || [ -z "$b" ]; then
+    echo 0
+    return 0
+  fi
+  idle_a="$(awk '{print $5+$6}' <<<"$a")"
+  idle_b="$(awk '{print $5+$6}' <<<"$b")"
+  total_a="$(awk '{s=0; for(i=2;i<=NF;i++) s+=$i; print s}' <<<"$a")"
+  total_b="$(awk '{s=0; for(i=2;i<=NF;i++) s+=$i; print s}' <<<"$b")"
+  awk -v ia="$idle_a" -v ib="$idle_b" -v ta="$total_a" -v tb="$total_b" \
+    'BEGIN{ dt=tb-ta; di=ib-ia; if (dt>0) printf "%.4f", 1-(di/dt); else print 0 }'
+}
+
+# host_signals_snapshot prints one JSON object: pssBytes (VMM + virtiofsd, PSS
+# only), memAvailableBytes, hostCpuFraction, processCount.
+host_signals_snapshot() {
+  local vmm_pids virtiofsd_pids all_pids pss mem cpu count
+  vmm_pids="$(discover_pids "$VMM_PROC_PATTERN")"
+  virtiofsd_pids="$(discover_pids "$VIRTIOFSD_PROC_PATTERN")"
+  # shellcheck disable=SC2086 # word-splitting into pss_bytes_for_pids's "$@" is intended
+  all_pids="$vmm_pids $virtiofsd_pids"
+  # shellcheck disable=SC2086
+  pss="$(pss_bytes_for_pids $all_pids)"
+  mem="$(mem_available_bytes)"
+  cpu="$(host_cpu_fraction 1)"
+  count="$(printf '%s\n%s\n' "$vmm_pids" "$virtiofsd_pids" | grep -c '[0-9]' || true)"
+  printf '{"pssBytes":%s,"memAvailableBytes":%s,"hostCpuFraction":%s,"processCount":%s}' \
+    "$pss" "$mem" "$cpu" "$count"
+}
+
+# ---------------------------------------------------------------------------
+# json_escape / percentile -- duplicated from e10-lifecycle.sh verbatim (see that
+# file's own copies); small enough that duplication beats sourcing a sibling
+# script for these two alone.
+# ---------------------------------------------------------------------------
+json_escape() {
+  python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
+}
+
+percentile() {
+  local p="$1" file="$2"
+  sort -n "$file" | awk -v p="$p" '
+    { a[NR] = $1; n = NR }
+    END {
+      if (n == 0) { print 0; exit }
+      rank = int((p / 100.0) * n)
+      if (rank < 1) rank = 1
+      if (rank > n) rank = n
+      print a[rank]
+    }'
+}
+
+# e11_tool_call_mix is IDENTICAL to e10-lifecycle.sh's rung1_tool_call_mix
+# (duplicated rather than sourced, for the same reason as the preflight checks
+# above): spec section 7.3 requires E11 to drive "the Exec mix E10 measured", so
+# reusing a different mix here would violate the spec's own cross-reference.
+e11_tool_call_mix() {
+  echo "true"
+  echo "head -c 1048576 /dev/zero | wc -c"
+  echo "ls -la /tmp"
+  echo "cat /etc/hostname"
+  echo "echo e11-mix > /tmp/e11-mix-$$.tmp"
+  echo "grep -c e11 /tmp/e11-mix-$$.tmp"
+  echo "rm -f /tmp/e11-mix-$$.tmp"
+}
+
+# ---------------------------------------------------------------------------
+# The Exec RPC itself, extended from e10-lifecycle.sh's grpc_exec_ms with a
+# workspace_key (proto/sandbox/v1/sandbox.proto: Exec.workspace_key, field 6,
+# nested inside Exec, NOT a top-level ExecRequest field) and error classification
+# for execErrorsByCause.
+# ---------------------------------------------------------------------------
+grpc_exec_record() {
+  local relay_port="$1" sandbox_id="$2" workspace_key="$3" cmd="$4" req_id="$5" out_file="$6"
+  local t0 t1 ms err_log cause status
+  err_log="$(mktemp)"
+  t0="$(date +%s%N)"
+  if grpcurl -plaintext -proto "$PROTO_FILE" \
+    -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":$req_id,\"command\":$(json_escape "$cmd"),\"timeout_s\":30,\"workspace_key\":$(json_escape "$workspace_key")}}" \
+    "localhost:${relay_port}" sandbox.v1.SandboxExec/Exec >/dev/null 2>"$err_log"; then
+    status="ok"
+    cause="-"
+  else
+    status="err"
+    if grep -qi "workspace_key" "$err_log"; then
+      cause="empty-workspace-key"
+    elif grep -qi "mem" "$err_log"; then
+      cause="memory-gate"
+    elif grep -qi "maxruns\|max-runs\|max_runs" "$err_log"; then
+      cause="max-runs"
+    elif grep -qi "spawn" "$err_log"; then
+      cause="spawn-failure"
+    elif grep -qi "vsock" "$err_log"; then
+      cause="vsock-short-response"
+    else
+      cause="unknown"
+    fi
+  fi
+  t1="$(date +%s%N)"
+  ms=$(((t1 - t0) / 1000000))
+  echo "$ms $status $cause" >>"$out_file"
+  rm -f "$err_log"
+}
+
+# build_converge_script reproduces harness/src/converge.ts:buildConvergeScript()
+# verbatim (see that file), so this driver's converge step is the SAME script the
+# harness actually runs in production, not an invented substitute.
+build_converge_script() {
+  local repo_url="$1" ref="$2" run_id="$3" leaf
+  leaf="/workspace/leaves/${run_id}"
+  cat <<SCRIPT
+set -eu
+REPO=/workspace/repo; LOCK=/workspace/.sh-fetch.lock; LEAF='${leaf}'
+mkdir -p /workspace/leaves
+(
+  flock 9
+  [ -d "\$REPO/.git" ] || { rm -rf "\$REPO"; git init -q "\$REPO"; }
+  git -C "\$REPO" fetch --quiet '${repo_url}' '${ref}' || { rm -rf "\$REPO"; git init -q "\$REPO"; git -C "\$REPO" fetch --quiet '${repo_url}' '${ref}'; }
+) 9>"\$LOCK"
+COMMIT=\$(git -C "\$REPO" rev-parse FETCH_HEAD)
+[ -d "\$LEAF" ] || git -C "\$REPO" worktree add --quiet --detach "\$LEAF" "\$COMMIT"
+printf '%s' "\$LEAF"
+SCRIPT
+}
+
+# converge_slot times ONE Exec running build_converge_script's output, SEPARATELY
+# from the slot's Exec-mix loop (spec section 7.5: "Time converge separately from
+# Exec ... or the cost hides inside the rungs"). Prints elapsed ms.
+converge_slot() {
+  local relay_port="$1" sandbox_id="$2" workspace_key="$3" run_id="$4"
+  local script t0 t1
+  script="$(build_converge_script "$CONVERGE_REPO_URL" "$CONVERGE_REF" "$run_id")"
+  t0="$(date +%s%N)"
+  grpcurl -plaintext -proto "$PROTO_FILE" \
+    -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":0,\"command\":$(json_escape "$script"),\"timeout_s\":300,\"workspace_key\":$(json_escape "$workspace_key")}}" \
+    "localhost:${relay_port}" sandbox.v1.SandboxExec/Exec >/dev/null 2>>"$RESULTS/e11-converge.log"
+  t1="$(date +%s%N)"
+  echo $(((t1 - t0) / 1000000))
+}
+
+# ---------------------------------------------------------------------------
+# Arm stacks
+# ---------------------------------------------------------------------------
+drop_caches() {
+  if [ -w /proc/sys/vm/drop_caches ]; then
+    echo 3 >/proc/sys/vm/drop_caches 2>/dev/null || log "drop_caches: not permitted, continuing (informational only)"
+  else
+    log "drop_caches: /proc/sys/vm/drop_caches not writable here, continuing"
+  fi
+}
+
+# shuffle_e11_arms prints "container" and "microvm" in randomized order (spec
+# section 7.5: page-cache asymmetry between arms), same technique as
+# e10-lifecycle.sh's shuffle_arms.
+shuffle_e11_arms() {
+  printf 'container\nmicrovm\n' | awk -v seed="$(($$ + $(date +%s)))" 'BEGIN{srand(seed)} {print rand()"\t"$0}' | sort -n | cut -f2-
+}
+
+E11_WORKER_PID=""
+E11_RELAY_PID=""
+E11_WORKER_BIN=""
+
+start_container_stack() {
+  [ "$E11_START_STACK" = "1" ] || {
+    log "container stack: SH_E11_START_STACK=0, reusing an already-running stack"
+    return 0
+  }
+  log "container: starting redis on :$E11_REDIS_PORT"
+  docker run --rm -d -p "${E11_REDIS_PORT}:6379" --name "sh-e11-redis-$$" redis:7 >/dev/null
+
+  log "container: starting the relay on :$E11_RELAY_PORT"
+  (
+    cd "$REPO_ROOT" &&
+      SH_RELAY_TOKEN="$E11_RELAY_TOKEN" SH_RELAY_PORT="$E11_RELAY_PORT" \
+        REDIS_URL="redis://127.0.0.1:${E11_REDIS_PORT}" \
+        pnpm --filter @sh/sandbox-relay start >"$RESULTS/e11-container-relay.log" 2>&1 &
+    echo $! >"$RESULTS/.e11-relay.pid"
+  )
+  E11_RELAY_PID="$(cat "$RESULTS/.e11-relay.pid" 2>/dev/null || echo "")"
+
+  E11_WORKER_BIN="$RESULTS/.e11-container-worker-bin"
+  log "container: building the worker binary"
+  (cd "$REMOTE_WORKER_DIR" && go build -o "$E11_WORKER_BIN" ./cmd/worker)
+
+  log "container: starting the worker"
+  SANDBOX_ID="e11-container" RELAY_ADDR="localhost:${E11_RELAY_PORT}" \
+    SANDBOX_TOKEN="$E11_RELAY_TOKEN" \
+    "$E11_WORKER_BIN" >"$RESULTS/e11-container-worker.log" 2>&1 &
+  E11_WORKER_PID="$!"
+  sleep 2
+}
+
+stop_container_stack() {
+  [ "$E11_START_STACK" = "1" ] || return 0
+  [ -n "$E11_WORKER_PID" ] && kill "$E11_WORKER_PID" 2>/dev/null
+  [ -n "$E11_RELAY_PID" ] && kill "$E11_RELAY_PID" 2>/dev/null
+  docker rm -f "sh-e11-redis-$$" >/dev/null 2>&1 || true
+  E11_WORKER_PID=""
+  E11_RELAY_PID=""
+  return 0
+}
+
+# start_microvm_stack starts one fresh microvm-worker process per (D, GuestRAMBytes)
+# slice -- both are startup-fixed config (vmpool.Config), so a new slice needs a new
+# process, not a running one reconfigured. SH_MAX_RUNS is sized to the largest
+# active-runs rung so the sweep's own ladder never trips the MaxRuns backstop and
+# gets misread as a VM-tier ceiling (spec section 7.3's lease-saturation metric row
+# makes the analogous point one tier up).
+start_microvm_stack() {
+  local d="$1" ram_mb="$2" max_c="$3"
+  [ "$E11_START_STACK" = "1" ] || {
+    log "microvm stack: SH_E11_START_STACK=0, reusing an already-running stack"
+    return 0
+  }
+  log "microvm: starting redis on :$E11_REDIS_PORT"
+  docker run --rm -d -p "${E11_REDIS_PORT}:6379" --name "sh-e11-redis-$$" redis:7 >/dev/null
+
+  log "microvm: starting the relay on :$E11_RELAY_PORT"
+  (
+    cd "$REPO_ROOT" &&
+      SH_RELAY_TOKEN="$E11_RELAY_TOKEN" SH_RELAY_PORT="$E11_RELAY_PORT" \
+        REDIS_URL="redis://127.0.0.1:${E11_REDIS_PORT}" \
+        pnpm --filter @sh/sandbox-relay start >"$RESULTS/e11-microvm-relay-d${d}-ram${ram_mb}.log" 2>&1 &
+    echo $! >"$RESULTS/.e11-relay.pid"
+  )
+  E11_RELAY_PID="$(cat "$RESULTS/.e11-relay.pid" 2>/dev/null || echo "")"
+
+  E11_WORKER_BIN="$RESULTS/.e11-microvm-worker-bin"
+  log "microvm: building the worker binary"
+  (cd "$REMOTE_WORKER_DIR" && go build -o "$E11_WORKER_BIN" ./cmd/microvm-worker)
+
+  log "microvm: starting the worker (D=$d guest=${ram_mb}MiB)"
+  SH_VMM=firecracker SH_STANDBY_DEPTH="$d" SH_GUEST_RAM_MB="$ram_mb" \
+    SH_MAX_RUNS=$((max_c + d + 2)) SH_MAX_COMMITTED_MB="$MAX_COMMITTED_MB" \
+    SH_SNAPSHOT_DIR="$SNAPSHOT_DIR" SH_WORKSPACE_ROOT="$WORKSPACE_ROOT" \
+    SANDBOX_ID="e11-microvm-d${d}-ram${ram_mb}" RELAY_ADDR="localhost:${E11_RELAY_PORT}" \
+    SANDBOX_TOKEN="$E11_RELAY_TOKEN" \
+    "$E11_WORKER_BIN" >"$RESULTS/e11-microvm-worker-d${d}-ram${ram_mb}.log" 2>&1 &
+  E11_WORKER_PID="$!"
+  sleep 2
+}
+
+stop_microvm_stack() {
+  [ "$E11_START_STACK" = "1" ] || return 0
+  [ -n "$E11_WORKER_PID" ] && kill "$E11_WORKER_PID" 2>/dev/null
+  [ -n "$E11_RELAY_PID" ] && kill "$E11_RELAY_PID" 2>/dev/null
+  docker rm -f "sh-e11-redis-$$" >/dev/null 2>&1 || true
+  E11_WORKER_PID=""
+  E11_RELAY_PID=""
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# run_density_rung: THE per-rung driver. Called identically for the container arm
+# and the microvm arm (only sandbox_id, relay_port, and whether workspace_key is
+# empty differ at the CALL SITE, in main() below) -- this is what makes "both arms
+# driven by the same code path" true structurally rather than by claim.
+#
+# Writes one RungSample-shaped JSON object (matching
+# experiments/src/microvm-density.ts's RungSample interface field-for-field) to
+# out_json_path.
+# ---------------------------------------------------------------------------
+run_density_rung() {
+  local arm="$1" d="$2" ram_mb="$3" c="$4" sandbox_id="$5" relay_port="$6" out_json_path="$7"
+  log "rung: arm=$arm D=$d guest=${ram_mb}MiB c=$c"
+
+  local slot_dir converge_file
+  slot_dir="$(mktemp -d)"
+  converge_file="$RESULTS/.e11-converge-times"
+  : >"$converge_file"
+
+  local wall_t0 wall_t1 pids=()
+  wall_t0="$(date +%s%N)"
+  local i
+  for i in $(seq 1 "$c"); do
+    (
+      local wskey="" run_id="e11-${arm}-d${d}-ram${ram_mb}-c${c}-slot${i}"
+      if [ "$arm" = "microvm" ]; then
+        wskey="$run_id" # microvm arm REFUSES an empty workspace_key (proto doc comment)
+      fi               # container arm may omit/empty it (today's single shared workspace)
+
+      local cms
+      cms="$(converge_slot "$relay_port" "$sandbox_id" "$wskey" "$run_id")"
+      echo "$cms" >>"$converge_file"
+
+      local times_file="$slot_dir/slot-$i.times" req=0
+      local want=$((ITERS_PER_SLOT + WARMUP_PER_SLOT))
+      while [ "$(wc -l <"$times_file" 2>/dev/null || echo 0)" -lt "$want" ]; do
+        while IFS= read -r cmd; do
+          req=$((req + 1))
+          grpc_exec_record "$relay_port" "$sandbox_id" "$wskey" "$cmd" "$req" "$times_file"
+          [ "$(wc -l <"$times_file" 2>/dev/null || echo 0)" -ge "$want" ] && break
+        done < <(e11_tool_call_mix)
+      done
+    ) &
+    pids+=("$!")
+  done
+  local pid
+  for pid in "${pids[@]}"; do
+    wait "$pid"
+  done
+  wall_t1="$(date +%s%N)"
+  local wall_s
+  wall_s="$(awk -v ns=$((wall_t1 - wall_t0)) 'BEGIN{printf "%.4f", ns/1000000000.0}')"
+
+  # Aggregate every slot's steady-state (post-warmup) samples together.
+  local all_times all_ok=0 all_total=0
+  all_times="$(mktemp)"
+  declare -A cause_counts
+  local f
+  for f in "$slot_dir"/slot-*.times; do
+    [ -e "$f" ] || continue
+    tail -n "+$((WARMUP_PER_SLOT + 1))" "$f" | head -n "$ITERS_PER_SLOT" >>"$all_times"
+  done
+  while read -r ms status cause; do
+    [ -n "$ms" ] || continue
+    all_total=$((all_total + 1))
+    if [ "$status" = "ok" ]; then
+      all_ok=$((all_ok + 1))
+      echo "$ms" >>"${all_times}.ok"
+    else
+      cause_counts["$cause"]=$(( ${cause_counts["$cause"]:-0} + 1 ))
+    fi
+  done <"$all_times"
+
+  local p95 throughput cold_count=0
+  p95="$(percentile 95 "${all_times}.ok" 2>/dev/null || echo 0)"
+  throughput="$(awk -v n="$all_ok" -v s="$wall_s" 'BEGIN{ if (s>0) printf "%.4f", n/s; else print 0 }')"
+  if [ -e "${all_times}.ok" ]; then
+    cold_count="$(awk -v t="$COLD_LATENCY_MS" '$1>=t{c++} END{print c+0}' "${all_times}.ok")"
+  fi
+  local cold_rate
+  cold_rate="$(awk -v c="$cold_count" -v n="$all_total" 'BEGIN{ if (n>0) printf "%.4f", c/n; else print 0 }')"
+
+  local converge_p50
+  converge_p50="$(percentile 50 "$converge_file")"
+
+  local signals pss_bytes mem_bytes cpu_frac proc_count
+  signals="$(host_signals_snapshot)"
+  pss_bytes="$(python3 -c "import json,sys; print(json.load(sys.stdin)['pssBytes'])" <<<"$signals")"
+  mem_bytes="$(python3 -c "import json,sys; print(json.load(sys.stdin)['memAvailableBytes'])" <<<"$signals")"
+  cpu_frac="$(python3 -c "import json,sys; print(json.load(sys.stdin)['hostCpuFraction'])" <<<"$signals")"
+  proc_count="$(python3 -c "import json,sys; print(json.load(sys.stdin)['processCount'])" <<<"$signals")"
+
+  # standbysResident: disclosed proxy (see header). idleStandbyResidency + reclaim
+  # convergence: poll the same process-count proxy after every slot has finished,
+  # up to StandbyIdle + 2*ReclaimScanInterval (spec section 7.4 prediction 5),
+  # sampling at ReclaimScanInterval. Skipped for the container arm, which has no
+  # standby concept at all -- recorded as 0 rather than waited-for.
+  local standbys_resident=0 idle_residency=0 reclaim_converge_s=0
+  standbys_resident=$((proc_count > c ? proc_count - c : 0))
+  if [ "$arm" = "microvm" ]; then
+    local waited=0 budget=135 interval=23 last_count="$proc_count"
+    while [ "$waited" -lt "$budget" ]; do
+      sleep "$interval"
+      waited=$((waited + interval))
+      last_count="$(python3 -c "import json,sys; print(json.load(sys.stdin)['processCount'])" <<<"$(host_signals_snapshot)")"
+    done
+    idle_residency="$last_count"
+    reclaim_converge_s="$waited"
+  fi
+
+  local errors_json="{}"
+  if [ "${#cause_counts[@]}" -gt 0 ]; then
+    local parts=()
+    local cause
+    for cause in "${!cause_counts[@]}"; do
+      parts+=("$(json_escape "$cause"):${cause_counts[$cause]}")
+    done
+    errors_json="{$(
+      IFS=,
+      echo "${parts[*]}"
+    )}"
+  fi
+
+  python3 -c "
+import json
+rec = {
+  'c': $c,
+  'throughput': $throughput,
+  'p95Ms': $p95,
+  'coldAcquireRate': $cold_rate,
+  'pssBytes': $pss_bytes,
+  'memAvailableBytes': $mem_bytes,
+  'hostCpuFraction': $cpu_frac,
+  'processCount': $proc_count,
+  'standbysResident': $standbys_resident,
+  'idleStandbyResidency': $idle_residency,
+  'leaseSaturations': 0,
+  'execErrorsByCause': json.loads('''$errors_json'''),
+  # Recorded, not part of the RungSample contract consumed by analyzeLadder, but
+  # written alongside it so no context is lost between the raw JSON and the report.
+  'arm': '$arm',
+  'standbyDepth': $d,
+  'guestRamMb': $ram_mb,
+  'substrate': '$SUBSTRATE',
+  'repoCacheShape': '$REPO_CACHE_SHAPE',
+  'convergeMsP50': $converge_p50,
+  'reclaimConvergenceS': $reclaim_converge_s,
+  'drivingModel': 'closed-loop-per-slot',
+  'staticSettings': json.loads('$(static_settings_json)'),
+  'proxyLimitations': {
+    'leaseSaturations': 'always 0 - driver bypasses the harness lease layer entirely',
+    'coldAcquireRate': 'latency-classification proxy (>= ${COLD_LATENCY_MS}ms), not the real replenishment signal - no stats endpoint exists',
+    'standbysResident': 'proxy: max(processCount - c, 0) - no pool introspection endpoint exists',
+  },
+}
+open('$out_json_path', 'w').write(json.dumps(rec, indent=2))
+"
+  rm -rf "$slot_dir" "$all_times" "${all_times}.ok" "$converge_file"
+}
+
+# assemble_ladder collects every per-rung JSON file for one (arm, D, guest RAM)
+# slice into a single JSON array, ascending by c, ready for analyzeLadder.
+assemble_ladder() {
+  local pattern="$1" out_path="$2"
+  python3 -c "
+import glob, json
+files = sorted(glob.glob('$pattern'))
+recs = [json.load(open(f)) for f in files]
+recs.sort(key=lambda r: r['c'])
+open('$out_path', 'w').write(json.dumps(recs, indent=2))
+"
+}
+
+# analyze_slice invokes experiments/src/microvm-density.ts's analyzeLadder against
+# one assembled ladder file and prints the report. Informational only -- this
+# script never writes numbers into deploy/microvm/EXPERIMENTS.md itself (task-21
+# scope: step 6 is structure-only, hardware-corrections F1).
+analyze_slice() {
+  local ladder_path="$1"
+  (
+    cd "$EXPERIMENTS_DIR" &&
+      pnpm exec tsx -e "
+        import { readFileSync } from 'node:fs';
+        import { analyzeLadder } from './src/microvm-density.js';
+        const samples = JSON.parse(readFileSync(process.argv[1], 'utf8'));
+        console.log(JSON.stringify(analyzeLadder(samples), null, 2));
+      " "$ladder_path"
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+  preflight
+  log "arms: container, microvm (Firecracker only - hardware-corrections F5)"
+  log "D values: ${D_VALUES[*]}   guest RAM (MiB): ${RAM_MB_VALUES[*]}   active runs: ${ACTIVE_RUNS[*]}"
+  [ -n "$MODEL_STUB_CMD" ] || log "no SH_E11_MODEL_STUB_CMD set - driving the Exec mix directly (disclosed limitation, see header)"
+
+  local max_c=1 c
+  for c in "${ACTIVE_RUNS[@]}"; do
+    [ "$c" -gt "$max_c" ] && max_c="$c"
+  done
+
+  local order first=1 arm
+  order="$(shuffle_e11_arms)"
+  while IFS= read -r arm; do
+    [ -n "$arm" ] || continue
+    if [ "$first" -eq 0 ]; then
+      drop_caches
+    fi
+    first=0
+
+    if [ "$arm" = "container" ]; then
+      start_container_stack
+      for c in "${ACTIVE_RUNS[@]}"; do
+        run_density_rung container - - "$c" "e11-container" "$E11_RELAY_PORT" \
+          "$RESULTS/e11-rung-container-c${c}.json"
+      done
+      stop_container_stack
+      assemble_ladder "$RESULTS/e11-rung-container-c*.json" "$RESULTS/e11-ladder-container.json"
+      analyze_slice "$RESULTS/e11-ladder-container.json" || log "analyze_slice(container) failed - see output above"
+    else
+      local d ram_mb
+      for d in "${D_VALUES[@]}"; do
+        for ram_mb in "${RAM_MB_VALUES[@]}"; do
+          start_microvm_stack "$d" "$ram_mb" "$max_c"
+          for c in "${ACTIVE_RUNS[@]}"; do
+            run_density_rung microvm "$d" "$ram_mb" "$c" "e11-microvm-d${d}-ram${ram_mb}" "$E11_RELAY_PORT" \
+              "$RESULTS/e11-rung-microvm-d${d}-ram${ram_mb}-c${c}.json"
+          done
+          stop_microvm_stack
+          assemble_ladder "$RESULTS/e11-rung-microvm-d${d}-ram${ram_mb}-c*.json" \
+            "$RESULTS/e11-ladder-microvm-d${d}-ram${ram_mb}.json"
+          analyze_slice "$RESULTS/e11-ladder-microvm-d${d}-ram${ram_mb}.json" ||
+            log "analyze_slice(microvm d=$d ram=$ram_mb) failed - see output above"
+        done
+      done
+    fi
+  done <<<"$order"
+
+  log "done. Per-slice ladders and analyses are in $RESULTS/e11-ladder-*.json"
+}
+
+# Allow this file to be sourced (for tests that extract individual functions)
+# without invoking main.
+if [ "${E11_DENSITY_SOURCE_ONLY:-0}" != "1" ]; then
+  main "$@"
+fi
