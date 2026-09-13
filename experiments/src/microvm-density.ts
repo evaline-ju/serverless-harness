@@ -82,7 +82,9 @@ interface PinnedPrediction {
  * actually committed to before any rung ran.
  */
 function pinnedPredictionIds(): number[] {
-  const doc = JSON.parse(readFileSync(PREDICTIONS_FILE, 'utf8')) as { predictions: PinnedPrediction[] };
+  const doc = JSON.parse(readFileSync(PREDICTIONS_FILE, 'utf8')) as {
+    predictions: PinnedPrediction[];
+  };
   return doc.predictions.map((p) => p.id);
 }
 
@@ -107,7 +109,9 @@ function crosses(signal: Bound, baseline: RungSample, cur: RungSample): boolean 
       const curRatio = cur.processCount / cur.c;
       return (
         curRatio > baselineRatio * PROCESS_COUNT_BLOWUP ||
-        Object.entries(cur.execErrorsByCause).some(([cause, n]) => n > 0 && /pid|process|nofile/i.test(cause))
+        Object.entries(cur.execErrorsByCause).some(
+          ([cause, n]) => n > 0 && /pid|process|nofile/i.test(cause),
+        )
       );
     }
     case 'cpu':
