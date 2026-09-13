@@ -904,9 +904,18 @@ check "hardlink_or_copy_bin fails loudly if the resolved path is not executable"
 # `main` call that would immediately demand real CLI flags and root), so the
 # helper's own source is extracted into an isolated snippet and sourced by
 # itself instead.
+# GNU `realpath -e` is what the helper itself calls. BSD/macOS realpath has no -e at
+# all ("illegal option -- e"), so on such a host the helper cannot resolve anything and
+# this behavioral block would report a defect that does not exist in the code under
+# test -- misattributing a property of the test RUNNER to the script. build-snapshot.sh
+# only ever runs as root on the Linux rig, and CI runs this suite on ubuntu-latest, so
+# the assertions below are exercised where they mean something. Probe for -e rather
+# than for `uname`, because the capability is the thing that matters.
+if realpath -e . >/dev/null 2>&1; then hocb_gnu_realpath=yes; else hocb_gnu_realpath=no; fi
+
 hocb_ok=no
 hocb_ok_resolved_content=no
-if [ -n "$hocb_body" ]; then
+if [ -n "$hocb_body" ] && [ "$hocb_gnu_realpath" = yes ]; then
   hocb_tmpdir="$(mktemp -d)"
   hocb_real_bin="$hocb_tmpdir/real-vmm-binary"
   printf '#!/bin/sh\necho hi\n' >"$hocb_real_bin"
@@ -933,10 +942,16 @@ if [ -n "$hocb_body" ]; then
   fi
   rm -rf "$hocb_tmpdir"
 fi
-check "hardlink_or_copy_bin, actually run against a symlinked PATH entry, produces a regular file (not a symlink)" \
-  "$hocb_ok" "yes"
-check "...and that regular file's content matches the real binary the symlink pointed to" \
-  "$hocb_ok_resolved_content" "yes"
+if [ "$hocb_gnu_realpath" = yes ]; then
+  check "hardlink_or_copy_bin, actually run against a symlinked PATH entry, produces a regular file (not a symlink)" \
+    "$hocb_ok" "yes"
+  check "...and that regular file's content matches the real binary the symlink pointed to" \
+    "$hocb_ok_resolved_content" "yes"
+else
+  echo "  (skip: this host's realpath has no -e (BSD/macOS), which is the call the helper"
+  echo "   itself makes, so the two behavioral symlink assertions cannot run here --"
+  echo "   not run, not claimed verified. CI exercises them on ubuntu-latest.)"
+fi
 
 echo "== fix-round-12: cloud-hypervisor snapshot bakes a virtio-fs device (workspace shared, not empty)"
 # Real gap: TestGateWriteDurability and TestGateNoCrossRunBleed both failed on

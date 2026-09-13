@@ -14,10 +14,18 @@ test:
 
 # Cluster-free unit tests for the deploy/ shell scripts: kubectl, kind and docker are
 # mocked on PATH and only the call log is asserted. Run in CI by the `deploy-scripts` job.
-# `set -e` so one failing test file fails the target instead of being scrolled past.
+# Every suite runs, and any failure still fails the target. `set -e` used to abort the
+# loop on the first failing file, which met the "not scrolled past" goal but silently
+# skipped every later suite: one red file made the rest look green by never running them.
+# Failures are collected instead, so the target's verdict is unchanged while the output
+# says which suites failed AND proves the others actually ran.
 # deploy/claude/tests covers the /promote slash-command asset, which nothing else type-checks.
 test-deploy:
-	@set -e; for t in deploy/knative/tests/*.test.sh deploy/claude/tests/*.test.sh deploy/microvm/tests/*.test.sh; do echo "== $$t"; bash "$$t"; done
+	@failed=''; for t in deploy/knative/tests/*.test.sh deploy/claude/tests/*.test.sh deploy/microvm/tests/*.test.sh; do \
+		echo "== $$t"; \
+		bash "$$t" || failed="$$failed $$t"; \
+	done; \
+	if [ -n "$$failed" ]; then echo; echo "test-deploy FAILED:$$failed"; exit 1; fi
 
 # One recursive run, so this target and CI cannot drift apart by editing a list in one of
 # them -- which they had, in both directions (#191): config-bundle was checked only here,
