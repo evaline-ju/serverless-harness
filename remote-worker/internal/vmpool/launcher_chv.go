@@ -139,6 +139,30 @@ const (
 	chvGoldenVMState    = "vmstate"
 	chvGoldenMemFile    = "memfile"
 	chvGoldenConfigFile = "ch-config.json"
+
+	// chvGuestConsoleLog is the per-VM file this launcher points the GUEST's own
+	// serial console at (config.json's console.file — see rewriteSnapshotConfig's
+	// doc comment for the full field-by-field audit). This is the GUEST's console,
+	// a wholly different thing from either of Restore's two HOST-side VMM-output
+	// files (round 12's "vmm-stdio.log" and "cloud-hypervisor.log" — see the
+	// package-level D3 comment's "TWO SEPARATE OUTPUT FILES" section) — three
+	// distinct files, never conflated.
+	//
+	// Fix round 13: before this round, config.json's console.file was left exactly
+	// as the golden snapshot recorded it — the jail-relative literal
+	// "/console.log" build-snapshot.sh's CH arm passed via --console
+	// file=/console.log — so every single restore was silently creating/
+	// truncating a file at the HOST's real filesystem root, unchrooted. The
+	// coordinator's captured CH log confirmed this is live on every restore (CH's
+	// own "Booting VM from config" dump: `console: { file: Some("/console.log"),
+	// mode: File }`), though — per that same log and per vmm/src/lib.rs's
+	// pre_create_console_devices, cited in rewriteSnapshotConfig's doc comment —
+	// File::create succeeds against a nonexistent "/console.log", so this was
+	// never the failure that hung Restore; it was flagged in round 7 as a real
+	// but non-blocking latent defect and is fixed now, in the same function,
+	// because it is cheap to fix while already there and it stops the guest
+	// console being written somewhere nobody looks.
+	chvGuestConsoleLog = "guest-console.log"
 )
 
 // CHVOptions configures the Cloud Hypervisor launcher.
@@ -586,41 +610,66 @@ var chvCheckSocketDirWritable = checkPathWritableBy
 //     needed: every standby is handed the identical absolute path, on purpose.
 //
 // Audit of other config.json fields that might carry a similar jail-relative
-// path (done this round, so a future reader does not have to re-derive it from
-// scratch — see the task-16 report's fix-round-7 section for the full source
-// citations): walking build-snapshot.sh's CH-arm jail invocation (--kernel
-// /kernel, --disk path=/rootfs, --vsock socket=/vsock.sock, --console
+// path — walking build-snapshot.sh's CH-arm jail invocation (--kernel /kernel,
+// --disk path=/rootfs, --vsock socket=/vsock.sock, --console
 // file=/console.log) against Cloud Hypervisor v53.0's own vmm/src/vm_config.rs
-// and vmm/src/lib.rs:
-//   - payload.kernel ("/kernel"): NOT re-read on restore. vmm/src/vm.rs only
-//     calls load_payload_async when snapshot.is_none() — a restored VM's kernel
-//     is already resident in the memory snapshot, never re-loaded from disk.
-//     Safe; no rewrite needed.
-//   - console.common.file ("/console.log"): IS re-opened on every restore —
-//     vmm/src/lib.rs's vm_restore unconditionally calls
-//     pre_create_console_devices ("Always re-populate the 'console_info' based on
-//     the new 'vm_config'"), and that function's File::create on the console
-//     path is fatal on error. But File::create, unlike a disk's read-only open of
-//     a file that must already exist, SUCCEEDS against a nonexistent host
-//     "/console.log" (it creates it) — so this does not block restore the way
-//     disks[].path did, which is consistent with it not being the next error the
-//     coordinator saw. It IS a real latent defect of a different kind: every
-//     standby silently creates/truncates the same file at the HOST's real root
-//     instead of somewhere per-VM. Flagged in the task-16 report as a candidate
-//     for a future round or for Task 17's chroot fix; deliberately NOT fixed
-//     here — it was not the failure in front of us, and this round's brief was
-//     disks[].path specifically.
-//   - vsock.socket, fs[].socket: already handled, above.
-//   - serial.common.file: this build passes --serial off, so mode=Off and no
-//     file field is even present in config.json.
+// and vmm/src/lib.rs. THIS SECTION WAS WRONG ONCE (round 7) AND HAS BEEN
+// CORRECTED (round 13) — see the task-16 report's fix-round-13 section for the
+// full story of how, and why the correction rests on the daemon's own log
+// rather than on source reading a second time:
+//
+//   - payload.kernel ("/kernel"): round 7 concluded this was "safe (never
+//     re-read on restore — snapshot.is_none() gate)", reasoning from
+//     vmm/src/vm.rs's load_payload_async call site. THIS WAS WRONG. The
+//     coordinator's captured CH log, mid-hang, showed CH logging "Booting VM
+//     from config" — with payload.kernel: Some("/kernel") still present — while
+//     servicing a VmRestore API call, i.e. the code path that reconstructs a
+//     restored VM's config DOES carry this field forward and does act on it
+//     though. It does not exist on the host, because this launcher deliberately
+//     does not chroot (this file's package comment, hardware-corrections C5).
+//     THE lesson (stated because it generalizes beyond this one field): source
+//     reading told round 7 which code path SHOULD run; the daemon's own log
+//     told round 13 which code path DID run. When those disagree, the log
+//     wins. Now rewritten to the golden kernel's absolute host path,
+//     filepath.Join(SnapshotDir, fileKernel) — exactly the same treatment as
+//     disks[].path already got in round 7, for the identical reason: every
+//     standby shares the one golden kernel file, unconditionally, so this is
+//     not per-VM-unique the way vsock/fs sockets are.
+//   - console.file ("/console.log"): round 7's read of this field's BLOCKING
+//     behavior was correct (File::create succeeds against a nonexistent host
+//     "/console.log", so this was never what hung Restore) and remains
+//     correct — the coordinator's round-13 log confirms CH got well past this
+//     point. Round 7 also correctly flagged it as "a real but separate
+//     non-blocking latent defect (host-root pollution)" and left it unfixed on
+//     purpose, as out of that round's scope. Round 13 fixes it now, while
+//     already in this function for payload.kernel: rewritten into the per-VM
+//     run directory (chvGuestConsoleLog) instead of the host's real root.
+//   - vsock.socket, fs[].socket, disks[].path: already handled, above.
+//
+// THE SET IS NOW CLOSED, as of round 13, verified against the coordinator's
+// OWN real config dump (not against source inference — the round-7 approach
+// this round is explicitly correcting): every field in that dump that could
+// possibly hold a host path has been enumerated and disposed of.
+//   - memory, disks[].readonly/image_type, fs[].tag/num_queues/queue_size,
+//     vsock.cid: not paths.
+//   - rng.src ("/dev/urandom"): IS a host path, and is left untouched
+//     deliberately, not by omission — unlike every path this function does
+//     rewrite, "/dev/urandom" is not jail-relative and not per-VM: it resolves
+//     to the same real host device inside or outside any chroot, so there is
+//     nothing here for a restore-side rewrite to fix.
+//   - serial: mode is "Off" in this build (--serial off), so no file field is
+//     even present in config.json to rewrite.
+//   - initramfs: None in this build; not present in config.json at all.
 //   - No other VmConfig field (net, pmem, devices, vdpa, numa, etc.) is
-//     configured by build-snapshot.sh's CH arm at all, so none of them appear in
-//     the golden config.json to begin with.
+//     configured by build-snapshot.sh's CH arm at all, so none of them appear
+//     in the golden config.json to begin with.
 //
 // UNVERIFIED END TO END: this task has no KVM access, so this rewrite has been
 // exercised only as a pure function against synthetic JSON (see
 // launcher_chv_test.go), never against a real config.json or a real restore.
-func rewriteSnapshotConfig(src []byte, vsockPath, fsSocketPath, rootfsPath string) ([]byte, error) {
+// Round 12's capture fix is what will tell the coordinator, from the daemon's
+// own words, whether this round's two rewrites actually clear the hang.
+func rewriteSnapshotConfig(src []byte, vsockPath, fsSocketPath, rootfsPath, kernelPath, consolePath string) ([]byte, error) {
 	var doc map[string]any
 	if err := json.Unmarshal(src, &doc); err != nil {
 		return nil, fmt.Errorf("parse config.json: %w", err)
@@ -647,6 +696,23 @@ func rewriteSnapshotConfig(src []byte, vsockPath, fsSocketPath, rootfsPath strin
 				disk["path"] = rootfsPath
 			}
 		}
+	}
+	// Fix round 13: payload.kernel, like disks[].path, is rewritten to the SAME
+	// absolute golden path for every standby — the coordinator's captured CH log
+	// proved this field IS carried forward and acted on during VmRestore,
+	// contradicting round 7's source-reading-only conclusion that it was safe
+	// left alone. See this function's doc comment for the full correction.
+	if payload, ok := doc["payload"].(map[string]any); ok {
+		payload["kernel"] = kernelPath
+	}
+	// Fix round 13: console.file is redirected into the per-VM run directory,
+	// unlike disks[].path/payload.kernel above — this one legitimately IS
+	// per-VM (each standby's guest console belongs in ITS OWN run dir, not
+	// shared), the same per-VM-unique treatment vsock.socket/fs[].socket
+	// already get, for the same reason: two standbys sharing one file here
+	// would each silently truncate the other's guest console output.
+	if console, ok := doc["console"].(map[string]any); ok {
+		console["file"] = consolePath
 	}
 	out, err := json.Marshal(doc)
 	if err != nil {
@@ -692,7 +758,15 @@ func chvStageSnapshotFiles(snapshotDir, runDir, vsockSock, fsSock string) error 
 	// hardlinked per-VM (see rewriteSnapshotConfig's doc comment for why that is
 	// safe and deliberate).
 	rootfsPath := filepath.Join(snapshotDir, fileRootfs)
-	rewritten, err := rewriteSnapshotConfig(golden, vsockSock, fsSock, rootfsPath)
+	// Fix round 13: kernelPath mirrors rootfsPath exactly -- one golden kernel
+	// file, one absolute path, shared unrewritten by every standby.
+	// consolePath, by contrast, is per-VM: it lives under THIS restore's own
+	// runDir, not under the shared snapshotDir, so two standbys never fight
+	// over the same guest-console file (see rewriteSnapshotConfig's doc
+	// comment for the full contrast between the two).
+	kernelPath := filepath.Join(snapshotDir, fileKernel)
+	consolePath := filepath.Join(runDir, chvGuestConsoleLog)
+	rewritten, err := rewriteSnapshotConfig(golden, vsockSock, fsSock, rootfsPath, kernelPath, consolePath)
 	if err != nil {
 		return fmt.Errorf("rewrite config.json: %w", err)
 	}

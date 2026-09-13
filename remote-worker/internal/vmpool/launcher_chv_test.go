@@ -1074,12 +1074,16 @@ func TestRestoreFoldsCloudHypervisorsOwnLogIntoTimeoutError(t *testing.T) {
 // synthetic input shaped like the reference tutorial's documented config.json.
 func TestRewriteSnapshotConfigGivesEachVMItsOwnSockets(t *testing.T) {
 	golden := `{
+		"payload": {"kernel": "/kernel", "cmdline": "console=hvc0"},
+		"console": {"file": "/console.log", "mode": "File"},
 		"vsock": {"cid": 3, "socket": "/golden/vsock.sock"},
 		"fs": [{"tag": "workspace", "socket": "/golden/vfsd.sock", "num_queues": 1, "queue_size": 1024}],
 		"disks": [{"path": "/rootfs", "readonly": true}]
 	}`
 	rootfsPath := "/srv/snapshots/swebench-py311-chv/rootfs"
-	out, err := rewriteSnapshotConfig([]byte(golden), "/run/vm-a/vsock.sock", "/run/vm-a/vfsd.sock", rootfsPath)
+	kernelPath := "/srv/snapshots/swebench-py311-chv/kernel"
+	consolePath := "/run/vm-a/guest-console.log"
+	out, err := rewriteSnapshotConfig([]byte(golden), "/run/vm-a/vsock.sock", "/run/vm-a/vfsd.sock", rootfsPath, kernelPath, consolePath)
 	if err != nil {
 		t.Fatalf("rewriteSnapshotConfig: %v", err)
 	}
@@ -1098,6 +1102,26 @@ func TestRewriteSnapshotConfigGivesEachVMItsOwnSockets(t *testing.T) {
 	fs, _ := fsList[0].(map[string]any)
 	if got := fs["socket"]; got != "/run/vm-a/vfsd.sock" {
 		t.Fatalf("fs[0].socket = %v, want /run/vm-a/vfsd.sock", got)
+	}
+	// Fix round 13: payload.kernel MUST now be rewritten to the given absolute
+	// kernelPath — CH's own log during a real restore proved this field IS
+	// carried forward and acted on (see rewriteSnapshotConfig's doc comment for
+	// the full correction of round 7's wrong "safe" conclusion).
+	payload, _ := doc["payload"].(map[string]any)
+	if got := payload["kernel"]; got != kernelPath {
+		t.Fatalf("payload.kernel = %v, want rewritten to %v", got, kernelPath)
+	}
+	if got := payload["cmdline"]; got != "console=hvc0" {
+		t.Fatalf("payload.cmdline = %v, want unchanged", got)
+	}
+	// Fix round 13: console.file MUST now be rewritten to the given per-VM
+	// consolePath, not left at the golden jail-relative host-root value.
+	console, _ := doc["console"].(map[string]any)
+	if got := console["file"]; got != consolePath {
+		t.Fatalf("console.file = %v, want rewritten to %v", got, consolePath)
+	}
+	if got := console["mode"]; got != "File" {
+		t.Fatalf("console.mode = %v, want unchanged", got)
 	}
 	// Fix round 7: disks[].path MUST now be rewritten to the given absolute
 	// rootfsPath — the golden snapshot's own jail-relative "/rootfs" resolves
@@ -1134,7 +1158,9 @@ func TestRewriteSnapshotConfigRewritesEveryDiskToTheSharedGoldenPath(t *testing.
 		]
 	}`
 	rootfsPath := "/srv/snapshots/swebench-py311-chv/rootfs"
-	out, err := rewriteSnapshotConfig([]byte(golden), "/run/vm-a/vsock.sock", "", rootfsPath)
+	kernelPath := "/srv/snapshots/swebench-py311-chv/kernel"
+	consolePath := "/run/vm-a/guest-console.log"
+	out, err := rewriteSnapshotConfig([]byte(golden), "/run/vm-a/vsock.sock", "", rootfsPath, kernelPath, consolePath)
 	if err != nil {
 		t.Fatalf("rewriteSnapshotConfig: %v", err)
 	}
@@ -1169,7 +1195,8 @@ func TestRewriteSnapshotConfigRewritesEveryDiskToTheSharedGoldenPath(t *testing.
 // fail or invent an "fs" key that was not there.
 func TestRewriteSnapshotConfigToleratesNoFsSection(t *testing.T) {
 	golden := `{"vsock": {"cid": 3, "socket": "/golden/vsock.sock"}}`
-	out, err := rewriteSnapshotConfig([]byte(golden), "/run/vm-a/vsock.sock", "", "/srv/snapshots/swebench-py311-chv/rootfs")
+	out, err := rewriteSnapshotConfig([]byte(golden), "/run/vm-a/vsock.sock", "", "/srv/snapshots/swebench-py311-chv/rootfs",
+		"/srv/snapshots/swebench-py311-chv/kernel", "/run/vm-a/guest-console.log")
 	if err != nil {
 		t.Fatalf("rewriteSnapshotConfig: %v", err)
 	}
@@ -1182,6 +1209,68 @@ func TestRewriteSnapshotConfigToleratesNoFsSection(t *testing.T) {
 	}
 	if _, present := doc["disks"]; present {
 		t.Fatalf("disks key should not have been invented: %v", doc["disks"])
+	}
+	// Fix round 13: payload/console keys must likewise not be invented when
+	// absent from the golden config — this fixture has neither, mirroring the
+	// existing fs/disks tolerance above.
+	if _, present := doc["payload"]; present {
+		t.Fatalf("payload key should not have been invented: %v", doc["payload"])
+	}
+	if _, present := doc["console"]; present {
+		t.Fatalf("console key should not have been invented: %v", doc["console"])
+	}
+}
+
+// TestRewriteSnapshotConfigRewritesKernelAndConsoleToHostPaths is fix round
+// 13's required assertion pair: payload.kernel must be rewritten to an
+// absolute path INSIDE the snapshot directory (the coordinator's captured CH
+// log proved this field is read back during VmRestore, contradicting round
+// 7's source-reading-only conclusion that it was safe to leave at its
+// jail-relative golden value), and console.file must be rewritten to a path
+// INSIDE the per-VM run directory — specifically NOT the golden jail-relative
+// "/console.log", which resolves to the HOST's real root once this launcher's
+// unchrooted cloud-hypervisor opens it.
+func TestRewriteSnapshotConfigRewritesKernelAndConsoleToHostPaths(t *testing.T) {
+	golden := `{
+		"payload": {"kernel": "/kernel"},
+		"console": {"file": "/console.log", "mode": "File"},
+		"vsock": {"cid": 3, "socket": "/golden/vsock.sock"}
+	}`
+	snapshotDir := "/srv/snapshots/swebench-py311-chv"
+	runDir := "/run/vm-a"
+	kernelPath := filepath.Join(snapshotDir, "kernel")
+	consolePath := filepath.Join(runDir, "guest-console.log")
+	out, err := rewriteSnapshotConfig([]byte(golden), filepath.Join(runDir, "vsock.sock"), "", filepath.Join(snapshotDir, "rootfs"), kernelPath, consolePath)
+	if err != nil {
+		t.Fatalf("rewriteSnapshotConfig: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("result is not valid JSON: %v", err)
+	}
+
+	payload, _ := doc["payload"].(map[string]any)
+	gotKernel, _ := payload["kernel"].(string)
+	if !filepath.IsAbs(gotKernel) {
+		t.Fatalf("payload.kernel = %q, want an absolute path", gotKernel)
+	}
+	if gotKernel == "/kernel" {
+		t.Fatalf("payload.kernel is still the jail-relative golden value %q — not rewritten", gotKernel)
+	}
+	if !strings.HasPrefix(gotKernel, snapshotDir+string(filepath.Separator)) {
+		t.Fatalf("payload.kernel = %q, want it to point INTO the snapshot directory %q", gotKernel, snapshotDir)
+	}
+
+	console, _ := doc["console"].(map[string]any)
+	gotConsole, _ := console["file"].(string)
+	if gotConsole == "/console.log" {
+		t.Fatalf("console.file is still the golden host-root value %q — not rewritten", gotConsole)
+	}
+	if !filepath.IsAbs(gotConsole) {
+		t.Fatalf("console.file = %q, want an absolute path", gotConsole)
+	}
+	if !strings.HasPrefix(gotConsole, runDir+string(filepath.Separator)) {
+		t.Fatalf("console.file = %q, want it to point INTO the per-VM run directory %q, not host root", gotConsole, runDir)
 	}
 }
 
@@ -1206,6 +1295,8 @@ func TestRestoreStagesCHNativeNamesFromGoldenNames(t *testing.T) {
 	// rewriteSnapshotConfig — the point of this test is the file-name translation
 	// around it, not re-litigating the JSON rewrite itself.
 	goldenConfig := `{
+		"payload": {"kernel": "/kernel"},
+		"console": {"file": "/console.log", "mode": "File"},
 		"vsock": {"cid": 3, "socket": "/golden/vsock.sock"},
 		"fs": [{"tag": "workspace", "socket": "/golden/vfsd.sock", "num_queues": 1, "queue_size": 1024}],
 		"disks": [{"path": "/golden/rootfs.ext4", "readonly": true}]
@@ -1284,6 +1375,37 @@ func TestRestoreStagesCHNativeNamesFromGoldenNames(t *testing.T) {
 	}
 	if got, ok := disk["readonly"].(bool); !ok || !got {
 		t.Fatalf("runDir/%s disks[0].readonly = %v, want unchanged true", chvSnapshotConfigFile, disk["readonly"])
+	}
+
+	// Fix round 13's required end-to-end assertions: chvStageSnapshotFiles must
+	// compute payload.kernel and console.file itself (via fileKernel and
+	// chvGuestConsoleLog) and pass them through rewriteSnapshotConfig, exactly
+	// mirroring rootfsPath's existing treatment above — this is the integration
+	// point neither TestRewriteSnapshotConfigRewritesKernelAndConsoleToHostPaths
+	// nor any other pure-function test can exercise, since only
+	// chvStageSnapshotFiles knows goldenDir/runDir and derives these two paths
+	// internally rather than accepting them as parameters.
+	wantKernelPath := filepath.Join(goldenDir, fileKernel)
+	payload, _ := doc["payload"].(map[string]any)
+	gotKernel, _ := payload["kernel"].(string)
+	if gotKernel != wantKernelPath {
+		t.Fatalf("runDir/%s payload.kernel = %q, want %q", chvSnapshotConfigFile, gotKernel, wantKernelPath)
+	}
+	if gotKernel == "/kernel" {
+		t.Fatalf("runDir/%s payload.kernel is still the jail-relative golden value %q — not rewritten", chvSnapshotConfigFile, gotKernel)
+	}
+
+	wantConsolePath := filepath.Join(runDir, chvGuestConsoleLog)
+	console, _ := doc["console"].(map[string]any)
+	gotConsole, _ := console["file"].(string)
+	if gotConsole != wantConsolePath {
+		t.Fatalf("runDir/%s console.file = %q, want %q", chvSnapshotConfigFile, gotConsole, wantConsolePath)
+	}
+	if gotConsole == "/console.log" {
+		t.Fatalf("runDir/%s console.file is still the golden host-root value %q — not rewritten", chvSnapshotConfigFile, gotConsole)
+	}
+	if !strings.HasPrefix(gotConsole, runDir) {
+		t.Fatalf("runDir/%s console.file = %q, want it to point INTO runDir, not host root", chvSnapshotConfigFile, gotConsole)
 	}
 
 	// And the golden names themselves must NOT be the names runDir exposes to CH —
