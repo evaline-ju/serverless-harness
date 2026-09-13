@@ -12,34 +12,50 @@ Four of the ten gates exercise the Pool's own bookkeeping against the **fake**
 launcher/clock (`internal/vmpool`'s existing test double) and need no KVM, and were
 run and verified directly by this task (mutation evidence below). The remaining six
 (plus the `real_launcher` half of `TestGateNoVMReuse`) require `/dev/kvm` and a built
-golden snapshot; this task's own environment is a darwin workstation with neither, so
+golden snapshot. That 4/6 split is about **which gates need KVM**, not about which
+passed — do not read it as a tally; the pass/fail counts are stated and explained
+below. This task's own environment is a darwin workstation with neither, so
 they were run on the rig across the fix rounds below, each round fixing exactly what
 the previous rig run found broken. **Both arms have now actually been run on real
 hardware against real KVM and a real golden snapshot** — the final round below is the
 last of these runs, and its numbers are the ones that stand.
 
-**Measured result, final round: Firecracker 10/10 PASS. Cloud Hypervisor 4/10 PASS,
-6 FAIL — a documented stopping point, not a bug still being chased.** No gate was
+**Measured result, final round: Firecracker 10/10 PASS. Cloud Hypervisor 3/10 PASS,
+7 FAIL — a documented stopping point, not a bug still being chased.** No gate was
 weakened, skipped, or reinterpreted to produce either number: every PASS ran to
 completion against real KVM and a real golden snapshot, and every FAIL is a real,
 reproduced failure with a known signature (see "Final round" below). That sentence is
 the reason the rest of this section can be trusted.
 
-| Gate                                                             | Firecracker (final round)                             | Cloud Hypervisor (final round)      |
-| ---------------------------------------------------------------- | ----------------------------------------------------- | ----------------------------------- |
-| `TestGateEmptyKeyIsRefused`                                      | PASS (0.00s)                                          | PASS                                |
-| `TestGateNoVMReuse` (`fake_launcher_concurrency` subtest)        | PASS (0.75s, both subtests)                           | PASS                                |
-| `TestGateNoVMReuse` (`real_launcher` subtest)                    | PASS (0.75s, both subtests)                           | **FAIL** — 30s timeout in `Restore` |
-| `TestGateWriteDurability`                                        | PASS (0.57s)                                          | **FAIL** — 30s timeout in `Restore` |
-| `TestGateNoCrossRunBleed`                                        | PASS (1.26s)                                          | **FAIL** — 30s timeout in `Restore` |
-| `TestGateSnapshotHoldsNoSecrets`                                 | PASS (0.41s)                                          | **FAIL** — 30s timeout in `Restore` |
-| `TestGateLeakFreeTeardown`                                       | PASS (5.04s)                                          | **FAIL** — 30s timeout in `Restore` |
-| `TestGateParkedThenResumed`                                      | PASS (0.00s)                                          | PASS                                |
-| `TestGateReclaimThenRedispatch`                                  | PASS (0.00s)                                          | PASS                                |
-| `TestGateClock`                                                  | PASS (0.28s) — **failed first, correctly**; see below | **FAIL** — 30s timeout in `Restore` |
-| `TestGateOutputCapAtSource`                                      | PASS (0.31s)                                          | **FAIL** — 30s timeout in `Restore` |
-| `TestNothingInTheWorkerPathSpawnsAShell` (privilege pin, static) | PASS                                                  | n/a (arm-independent)               |
-| `TestTheHostFakeCannotServeARealVMMConfig`                       | PASS                                                  | n/a (arm-independent)               |
+**How the tally is counted, so the arithmetic is checkable rather than reconstructed:
+a gate with ANY failing subtest counts as FAILED.** There are ten gates and the table
+below has eleven rows, because `TestGateNoVMReuse`'s two subtests are listed
+separately; the gate is scored once, on its worse half. Every Cloud Hypervisor number
+in this document is `3/10 PASS, 7 FAIL` on that rule. **This was previously recorded
+as `4/10 PASS, 6 FAIL`, which was wrong twice over:** it scored
+`TestGateNoVMReuse` a PASS for its `fake_launcher_concurrency` subtest while its
+`real_launcher` subtest is a documented FAIL, and 4 + 7 named failures does not
+reconcile to ten gates at all. Corrected per the final whole-branch review's L1. The
+underlying rig results are unchanged — no gate's outcome moved, only the sum — and the
+error originated in this task's own dispatch, not in the rig run. Rounding a
+half-failed gate up to a pass is a mild instance of exactly the thing the paragraph
+above disclaims, which is why the rule is now stated instead of implied.
+
+| Gate                                                             | Firecracker (final round)                             | Cloud Hypervisor (final round)                       |
+| ---------------------------------------------------------------- | ----------------------------------------------------- | ---------------------------------------------------- |
+| `TestGateEmptyKeyIsRefused`                                      | PASS (0.00s)                                          | PASS                                                 |
+| `TestGateNoVMReuse` (`fake_launcher_concurrency` subtest)        | PASS (0.75s, both subtests)                           | PASS (subtest only — gate scores **FAIL**, next row) |
+| `TestGateNoVMReuse` (`real_launcher` subtest)                    | PASS (0.75s, both subtests)                           | **FAIL** — 30s timeout in `Restore`                  |
+| `TestGateWriteDurability`                                        | PASS (0.57s)                                          | **FAIL** — 30s timeout in `Restore`                  |
+| `TestGateNoCrossRunBleed`                                        | PASS (1.26s)                                          | **FAIL** — 30s timeout in `Restore`                  |
+| `TestGateSnapshotHoldsNoSecrets`                                 | PASS (0.41s)                                          | **FAIL** — 30s timeout in `Restore`                  |
+| `TestGateLeakFreeTeardown`                                       | PASS (5.04s)                                          | **FAIL** — 30s timeout in `Restore`                  |
+| `TestGateParkedThenResumed`                                      | PASS (0.00s)                                          | PASS                                                 |
+| `TestGateReclaimThenRedispatch`                                  | PASS (0.00s)                                          | PASS                                                 |
+| `TestGateClock`                                                  | PASS (0.28s) — **failed first, correctly**; see below | **FAIL** — 30s timeout in `Restore`                  |
+| `TestGateOutputCapAtSource`                                      | PASS (0.31s)                                          | **FAIL** — 30s timeout in `Restore`                  |
+| `TestNothingInTheWorkerPathSpawnsAShell` (privilege pin, static) | PASS                                                  | n/a (arm-independent)                                |
+| `TestTheHostFakeCannotServeARealVMMConfig`                       | PASS                                                  | n/a (arm-independent)                                |
 
 Firecracker: **10/10 on real hardware, with no environment overrides** — the suite
 self-configures now (fix round 2's startup device checks, plus fix round 3's traversal
@@ -49,14 +65,18 @@ caught a real defect on its merits" below, which this final round confirms as th
 suite's headline result: a subtle bug that nothing but a correctness gate would ever
 have found, caught before it could ship.
 
-Cloud Hypervisor: **4/10 PASS** (`TestGateEmptyKeyIsRefused`, `TestGateNoVMReuse`'s
-`fake_launcher_concurrency` subtest, `TestGateParkedThenResumed`,
-`TestGateReclaimThenRedispatch` — none of which reach a real `Restore()` against a
-live guest), **6 FAIL** (`TestGateWriteDurability`, `TestGateNoCrossRunBleed`,
-`TestGateNoVMReuse`'s `real_launcher` subtest, `TestGateSnapshotHoldsNoSecrets`,
+Cloud Hypervisor: **3/10 PASS** (`TestGateEmptyKeyIsRefused`,
+`TestGateParkedThenResumed`, `TestGateReclaimThenRedispatch` — none of which reach a
+real `Restore()` against a live guest), **7 FAIL** (`TestGateWriteDurability`,
+`TestGateNoCrossRunBleed`, `TestGateNoVMReuse`, `TestGateSnapshotHoldsNoSecrets`,
 `TestGateLeakFreeTeardown`, `TestGateClock`, `TestGateOutputCapAtSource` — every gate
-that actually restores a paused VM and runs a command in it). See "Final round" below
-for the failure signature and the decision this project has made about it.
+that actually restores a paused VM and runs a command in it). `TestGateNoVMReuse` is
+counted as a FAIL: its `fake_launcher_concurrency` subtest passes but its
+`real_launcher` subtest does not, and per the counting rule stated above a gate with
+any failing subtest counts as failed. Its stated assertion is that "the
+`workspace_key` assertion holds under concurrency" against a real VMM, and on Cloud
+Hypervisor it did not run to completion. See "Final round" below for the failure
+signature and the decision this project has made about it.
 
 ### Rig command for the six KVM-only gates (both arms)
 
@@ -93,8 +113,8 @@ done
 ```
 
 **Measured, not merely expected** (see the results table above and "Final round"
-below): Firecracker is green end-to-end, 10/10. Cloud Hypervisor reaches 4/10, with
-the remaining 6 failing at `Restore()` for reasons this project has decided are a
+below): Firecracker is green end-to-end, 10/10. Cloud Hypervisor reaches 3/10, with
+the remaining 7 failing at `Restore()` for reasons this project has decided are a
 documented stopping point, not something this command will fix by being run again.
 
 ### Fix round 1: chroot base / run dir must share a device with the snapshot
@@ -225,7 +245,7 @@ convention.
 Restore"), which landed after this task's initial commit and before fix round 1.
 **Update, final round:** this fix has since been confirmed against real
 cloud-hypervisor hardware — the naming mismatch it fixed is not among the failure
-signatures in the CH arm's 4/10 result below, and CH now gets as far as
+signatures in the CH arm's 3/10 result below, and CH now gets as far as
 `Restore()` reading its own files correctly and reaching device restoration before
 failing, which would not happen if this naming bug were still present. It is
 genuinely resolved, not merely resolved-on-paper; what remains is a different,
@@ -573,14 +593,15 @@ suite's headline result:** a subtle, real defect, caught before it could reach
 production, by exactly the class of test spec §8 asked for. After the upstream fix
 (`66fdf86`, removing the latch), `TestGateClock` passed in 0.28s, as shown above.
 
-**Cloud Hypervisor: 4/10 PASS, 6 FAIL — a documented stopping point, not a bug still
-being chased.** Passing: `TestGateEmptyKeyIsRefused`, `TestGateNoVMReuse`'s
-`fake_launcher_concurrency` subtest, `TestGateParkedThenResumed`,
+**Cloud Hypervisor: 3/10 PASS, 7 FAIL — a documented stopping point, not a bug still
+being chased.** Passing: `TestGateEmptyKeyIsRefused`, `TestGateParkedThenResumed`,
 `TestGateReclaimThenRedispatch` — none of these reach a real `Restore()` against a
 live guest. Failing: `TestGateWriteDurability`, `TestGateNoCrossRunBleed`,
-`TestGateNoVMReuse`'s `real_launcher` subtest, `TestGateSnapshotHoldsNoSecrets`,
-`TestGateLeakFreeTeardown`, `TestGateClock`, `TestGateOutputCapAtSource` — every gate
-that actually restores a paused VM and runs a command in it. All six of these fail
+`TestGateNoVMReuse` (its `real_launcher` subtest; a gate with any failing subtest
+counts as failed — see the counting rule at the top of this section),
+`TestGateSnapshotHoldsNoSecrets`, `TestGateLeakFreeTeardown`, `TestGateClock`,
+`TestGateOutputCapAtSource` — every gate
+that actually restores a paused VM and runs a command in it. All seven of these fail
 the same way: a 30-second timeout inside `Restore`, during device restoration, right
 after cloud-hypervisor's own log shows `Restoring virtio-console __console`.
 virtiofsd connects and then immediately disconnects; no error is propagated through
@@ -591,7 +612,7 @@ than a diagnosable failure — there is nothing to catch and re-report.
 and to keep the arm's code as it stands.** This is a decision, not an omission, and
 the reasoning is recorded here in full:
 
-- Thirteen fix rounds and roughly eleven rig cycles on this arm reached 4/10, with
+- Thirteen fix rounds and roughly eleven rig cycles on this arm reached 3/10, with
   at least one further layer of the same class of problem confirmed to exist beyond
   the virtio-console/virtiofsd disconnect above. There is no evidence this is the
   last layer.
