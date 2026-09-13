@@ -167,6 +167,176 @@ if [ -n "$pss_body" ]; then
   rm -rf "$pss_tmpdir"
 fi
 
+# ---------------------------------------------------------------------------
+# 1b. The PSS helper's ONLY integration point: the JSON assembly that consumes it.
+#
+# Final-review H2. mem_available_bytes' awk was
+#   /^MemAvailable:/{print $2*1024; exit} END{if (!found) print 0}
+# with `found` never assigned; awk's `exit` in a main rule RUNS the END block, so on any
+# Linux host this printed TWO lines. Interpolated into host_signals_snapshot's printf it
+# put a newline inside a JSON numeric value, all four json.load calls in the rung-record
+# writer failed, the writer died on a SyntaxError from the resulting empty interpolations,
+# and because this driver runs `set -uo pipefail` WITHOUT `set -e` nothing aborted: E11
+# completed its whole sweep having written zero rung records, and exited 0.
+#
+# It never showed up here because darwin has no /proc/meminfo, so the `|| echo 0` fallback
+# yielded a clean single "0". Every case below therefore drives a LINUX-SHAPED fixture
+# through the SH_E11_PROC_ROOT seam that already existed for the PSS helper -- it only ever
+# needed a meminfo in it.
+# ---------------------------------------------------------------------------
+echo "== host signal assembly against a Linux-shaped /proc (final review H2)"
+
+signals_body="$(extract_fns die require_numeric mem_available_bytes discover_pids pss_bytes_for_pids host_cpu_fraction host_signals_snapshot || true)"
+check "die/require_numeric/mem_available_bytes/host_signals_snapshot all extractable" \
+  "$([ -n "$signals_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$signals_body" ]; then
+  sig_tmpdir="$(mktemp -d)"
+  sig_snippet="$sig_tmpdir/signals.sh"
+  printf '%s\n' "$signals_body" >"$sig_snippet"
+
+  # A Linux-shaped /proc: meminfo with a real MemAvailable line, a /proc/stat cpu line,
+  # and a smaps_rollup for one live pid.
+  sig_proc="$sig_tmpdir/proc"
+  mkdir -p "$sig_proc"
+  printf 'MemTotal:       16384000 kB\nMemFree:            1000 kB\nMemAvailable:    8192000 kB\n' >"$sig_proc/meminfo"
+  printf 'cpu  100 0 100 800 0 0 0 0 0 0\ncpu0 100 0 100 800 0 0 0 0 0 0\n' >"$sig_proc/stat"
+
+  # --- NON-VACUOUSNESS, first: prove the pathology is REAL and REACHABLE against this
+  # exact fixture, before asserting it is absent. The pre-fix awk form is run here
+  # verbatim; if it did not emit two lines against this meminfo, every assertion below
+  # would be passing for the wrong reason.
+  buggy_lines="$(awk '/^MemAvailable:/{print $2*1024; exit} END{if (!found) print 0}' "$sig_proc/meminfo" | wc -l | tr -d ' ')"
+  check "non-vacuousness: the PRE-FIX awk form really does emit 2 lines on this fixture" \
+    "$buggy_lines" "2"
+  # ...and that a two-line value really does break the consumer, not merely look odd.
+  buggy_json="$(printf '{"memAvailableBytes":%s}' "$(awk '/^MemAvailable:/{print $2*1024; exit} END{if (!found) print 0}' "$sig_proc/meminfo")")"
+  buggy_rc=0
+  printf '%s' "$buggy_json" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null || buggy_rc=$?
+  check "non-vacuousness: a two-line value really does make json.load fail" \
+    "$([ "$buggy_rc" -ne 0 ] && echo yes || echo no)" "yes"
+
+  # --- The fix: exactly one line, and the right number (8192000 kB * 1024).
+  mem_out=$(
+    PROC_ROOT="$sig_proc"
+    export PROC_ROOT
+    # shellcheck disable=SC1090
+    . "$sig_snippet"
+    mem_available_bytes
+  )
+  check "mem_available_bytes emits exactly ONE line on a Linux-shaped meminfo" \
+    "$(printf '%s\n' "$mem_out" | wc -l | tr -d ' ')" "1"
+  check "mem_available_bytes converts kB to bytes correctly" "$mem_out" "8388608000"
+
+  # A meminfo with no MemAvailable line at all: the END fallback, still one line.
+  printf 'MemTotal:       16384000 kB\n' >"$sig_proc/meminfo-noavail"
+  mem_none=$(
+    PROC_ROOT="$sig_proc"
+    export PROC_ROOT
+    # shellcheck disable=SC1090
+    . "$sig_snippet"
+    awk '/^MemAvailable:/{found=1; print $2*1024; exit} END{if (!found) print 0}' "$sig_proc/meminfo-noavail"
+  )
+  check "no MemAvailable line -> a single 0 (the END fallback still fires)" "$mem_none" "0"
+  printf 'MemTotal:       16384000 kB\nMemFree:            1000 kB\nMemAvailable:    8192000 kB\n' >"$sig_proc/meminfo"
+
+  # --- require_numeric: the guard that keeps this class from recurring. Refuses a
+  # multi-line value even though EVERY line of it is numeric, which is precisely the
+  # shape H2 had.
+  rn_rc=0
+  rn_out=$(
+    # shellcheck disable=SC1090
+    . "$sig_snippet"
+    require_numeric memAvailableBytes "$(printf '8388608000\n0')" 2>&1
+  ) || rn_rc=$?
+  check "require_numeric REFUSES a two-line all-numeric value (nonzero)" \
+    "$([ "$rn_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$rn_out" in *memAvailableBytes*) rn_named=yes ;; *) rn_named=no ;; esac
+  check "the refusal names the offending FIELD, not just 'bad input'" "$rn_named" "yes"
+  rn_ok_rc=0
+  rn_ok=$(
+    # shellcheck disable=SC1090
+    . "$sig_snippet"
+    require_numeric memAvailableBytes "8388608000"
+  ) || rn_ok_rc=$?
+  check "require_numeric accepts a single integer (does not refuse everything)" "$rn_ok" "8388608000"
+  check "  ...with exit 0" "$rn_ok_rc" "0"
+  rn_frac=$(
+    # shellcheck disable=SC1090
+    . "$sig_snippet"
+    require_numeric hostCpuFraction "0.5000"
+  )
+  check "require_numeric accepts a decimal (hostCpuFraction is printf %.4f)" "$rn_frac" "0.5000"
+
+  # --- The whole assembly, end to end, parsed by its REAL consumer (json.load), with a
+  # live pid whose smaps_rollup exists so no other field can fail for its own reasons.
+  sh -c 'sleep 5' &
+  sig_live=$!
+  mkdir -p "$sig_proc/$sig_live"
+  printf 'Pss:                 512 kB\n' >"$sig_proc/$sig_live/smaps_rollup"
+  sig_json=$(
+    PROC_ROOT="$sig_proc"
+    export PROC_ROOT
+    VMM_PROC_PATTERN="__e11_no_such_process__"
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sig_snippet"
+    host_signals_snapshot
+  )
+  sig_json_rc=0
+  sig_mem="$(printf '%s' "$sig_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["memAvailableBytes"])' 2>&1)" || sig_json_rc=$?
+  check "host_signals_snapshot's output parses as JSON (all four json.load calls' premise)" \
+    "$sig_json_rc" "0"
+  check "  ...and memAvailableBytes survives the round trip intact" "$sig_mem" "8388608000"
+
+  # --- And the failure direction: a bad field makes the WHOLE snapshot fail loudly and
+  # print nothing, rather than emit a malformed object for a consumer to choke on 350
+  # lines later. Provoked with an unreadable smaps_rollup for a LIVE pid, the one
+  # refusal spec section 7.3's boxed warning makes non-negotiable -- which previously
+  # could not stop anything, because a `die` inside `x="$(helper)"` exits only the
+  # command substitution's subshell and `set -e` is not in force.
+  chmod 000 "$sig_proc/$sig_live/smaps_rollup" 2>/dev/null || true
+  sig_fail_rc=0
+  sig_fail_out=$(
+    PROC_ROOT="$sig_proc"
+    export PROC_ROOT
+    # shellcheck disable=SC2034 # read by host_signals_snapshot, sourced below
+    VMM_PROC_PATTERN="sleep 5"
+    # shellcheck disable=SC2034
+    VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+    # shellcheck disable=SC1090
+    . "$sig_snippet"
+    host_signals_snapshot
+  ) || sig_fail_rc=$?
+  if [ -r "$sig_proc/$sig_live/smaps_rollup" ]; then
+    echo "  (skip: running as root or on a filesystem ignoring chmod 000 -- the unreadable-rollup case was not exercised, not claimed verified)"
+  else
+    check "an unsampleable signal makes host_signals_snapshot exit NONZERO" \
+      "$([ "$sig_fail_rc" -ne 0 ] && echo yes || echo no)" "yes"
+    check "  ...and print no JSON at all, rather than a malformed object" "$sig_fail_out" ""
+  fi
+  chmod 644 "$sig_proc/$sig_live/smaps_rollup" 2>/dev/null || true
+
+  kill "$sig_live" 2>/dev/null
+  wait "$sig_live" 2>/dev/null
+  rm -rf "$sig_tmpdir"
+fi
+
+echo "== a rung that writes no record fails loudly (final review H2)"
+# The driver runs `set -uo pipefail` without `set -e`, deliberately (see the assertion's
+# own comment in the script). That makes an explicit check for the record the only thing
+# standing between a failed writer and a sweep that exits 0 having recorded nothing.
+# The DRIVER's own shell options are the first `set` line in the file. Matched that way
+# rather than by grepping the whole script for `set -e`, because build_converge_script's
+# heredoc legitimately contains `set -eu` for the GUEST script it emits -- a whole-file
+# grep would conflate the two and go red on correct code.
+check "the driver's own shell options are exactly 'set -uo pipefail'" \
+  "$(grep -m1 -E '^set ' "$SCRIPT")" "set -uo pipefail"
+check "run_density_rung dies when out_json_path is empty or missing" \
+  "$([ "$(grep -c 'wrote no record to' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "the record assertion tests the file, not the writer's exit status" \
+  "$([ "$(grep -c '\[ -s "\$out_json_path" \]' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
 echo "== RSS is never read as a fallback anywhere pss_bytes_for_pids or its callers run"
 # Comment lines (the header's own disclosure that RSS/VmRSS is deliberately
 # avoided) are stripped first, so this targets actual code, not prose that

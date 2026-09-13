@@ -663,12 +663,27 @@ A nested run (this environment's own `nested-m8i` substrate, never
 the driver itself faulting; that Σ PSS sampling from `/proc/<pid>/smaps_rollup`
 works and never falls back to RSS; that `analyzeLadder`/`detectKnee` refuse
 cheaply on a malformed or lease-saturated ladder; and _which resource_ a knee
-in that run is bound by. A nested run **cannot** establish the knee's
-location under real concurrency, an absolute p95, or how close that p95 sits
-to the container baseline — nested virtualization taxes exactly the
-VM-exit-heavy work restore consists of (spec §7.2's own per-substrate
-thresholds already assume this). Every number a nested run would produce is
-a validation result, never a measurement, and must not be quoted as one.
+in that run is bound by.
+
+> **This paragraph was false when written, and the correction is the point.** The
+> final whole-branch review's H2 found that `mem_available_bytes`' awk emitted
+> **two** lines on any Linux host (`exit` in a main rule runs the `END` block, and
+> the `found` flag its guard tested was never assigned), which put a newline inside
+> a JSON numeric value, failed all four `json.load` calls in the rung-record writer,
+> and — because the driver runs `set -uo pipefail` **without** `set -e` — lost
+> **every rung record** while exiting 0. So the first Linux invocation could not have
+> established any of the above: it would have completed the whole sweep having
+> recorded nothing, and looked like success. Invisible on darwin, which has no
+> `/proc/meminfo` and so took the `|| echo 0` fallback. Fixed, with a Linux-shaped
+> `/proc` fixture driven through the existing `SH_E11_PROC_ROOT` seam, a
+> `require_numeric` guard on every field of the JSON assembly, and an explicit
+> per-rung `die` when a rung writes no record. The claim above holds for the fixed
+> driver; it did not hold for the one this section originally described. A nested run **cannot** establish the knee's
+> location under real concurrency, an absolute p95, or how close that p95 sits
+> to the container baseline — nested virtualization taxes exactly the
+> VM-exit-heavy work restore consists of (spec §7.2's own per-substrate
+> thresholds already assume this). Every number a nested run would produce is
+> a validation result, never a measurement, and must not be quoted as one.
 
 #### Per-rung metrics (spec §7.3)
 

@@ -290,8 +290,44 @@ pss_bytes_for_pids() {
   echo $((total_kb * 1024))
 }
 
+# mem_available_bytes prints MemAvailable in bytes, or a single 0 when /proc/meminfo is
+# absent or has no MemAvailable line.
+#
+# `found=1` in the match action is load-bearing, not tidying (final review H2). In awk,
+# `exit` in a main rule RUNS the END block, so without it the guard `if (!found)` was
+# always true and this printed the value AND a second line "0" on every Linux host. That
+# two-line value was interpolated into host_signals_snapshot's JSON, which made all four
+# json.load calls that consume it fail, which left the rung-record writer with empty
+# Python expressions and a SyntaxError -- and because this driver runs `set -uo pipefail`
+# without `set -e`, nothing aborted: E11 completed its entire sweep having written ZERO
+# rung records, on the only platform it can run on. Invisible on darwin, which has no
+# /proc/meminfo at all and so takes the `|| echo 0` fallback.
+#
+# The whole class was audited, not just this line: `grep -rn 'END *{'` over every
+# non-test script under deploy/ finds nine other awk END blocks, and the only other
+# `exit` reachable from one is inside percentile()'s own END block (both here and in
+# e10-lifecycle.sh), where `exit` merely terminates and cannot re-enter END. This was
+# the single instance of the shape. require_numeric below is the guard that keeps it
+# from being the last one.
 mem_available_bytes() {
-  awk '/^MemAvailable:/{print $2*1024; exit} END{if (!found) print 0}' "$PROC_ROOT/meminfo" 2>/dev/null || echo 0
+  awk '/^MemAvailable:/{found=1; print $2*1024; exit} END{if (!found) print 0}' "$PROC_ROOT/meminfo" 2>/dev/null || echo 0
+}
+
+# require_numeric echoes value unchanged when it is exactly ONE line holding one bare
+# number, and dies naming the field otherwise.
+#
+# Both halves matter and the first is the one H2 needed: every line of that broken value
+# was individually numeric -- there were simply two of them. A field that is not a single
+# bare number cannot be interpolated into JSON, so failing here, naming the field, is
+# strictly better than assembling a record that four json.load calls will reject 350 lines
+# later with a message about a column number.
+require_numeric() {
+  local field="$1" value="$2"
+  if [ "$(printf '%s\n' "$value" | wc -l | tr -d ' ')" != "1" ] ||
+    [ "$(printf '%s\n' "$value" | grep -cxE '\-?[0-9]+(\.[0-9]+)?')" != "1" ]; then
+    die "host signal $field is not a single bare number (got '$(printf '%s' "$value" | tr '\n' '|')') - refusing to assemble JSON that would silently cost this rung its record (final review H2)"
+  fi
+  printf '%s' "$value"
 }
 
 # host_cpu_fraction samples /proc/stat twice, SAMPLE_WINDOW_S apart, and returns
@@ -316,6 +352,20 @@ host_cpu_fraction() {
 
 # host_signals_snapshot prints one JSON object: pssBytes (VMM + virtiofsd, PSS
 # only), memAvailableBytes, hostCpuFraction, processCount.
+#
+# Every field is validated before it reaches the printf, and the function RETURNS
+# NON-ZERO (printing nothing) rather than emitting a malformed object. This is the
+# integration point final-review H2 exposed: pss_bytes_for_pids had its own extracted
+# test and a real non-vacuousness proof, while the JSON assembly that consumes it -- the
+# only place any of these values is used -- had no test at all, so a malformed SIBLING
+# field took the whole rung record down with it.
+#
+# Each `|| return 1` is also what makes `die` inside these helpers effective at all. A
+# `die` in `x="$(helper)"` exits only the command substitution's SUBSHELL; with no
+# `set -e` the assignment simply lands empty and the script sails on. That silently
+# defanged even pss_bytes_for_pids's "refusing to fall back to RSS" refusal, which spec
+# section 7.3's boxed warning makes the single most important failure in this file.
+# Checking the status here is what turns those refusals back into stops.
 host_signals_snapshot() {
   local vmm_pids virtiofsd_pids all_pids pss mem cpu count
   vmm_pids="$(discover_pids "$VMM_PROC_PATTERN")"
@@ -323,10 +373,11 @@ host_signals_snapshot() {
   # shellcheck disable=SC2086 # word-splitting into pss_bytes_for_pids's "$@" is intended
   all_pids="$vmm_pids $virtiofsd_pids"
   # shellcheck disable=SC2086
-  pss="$(pss_bytes_for_pids $all_pids)"
-  mem="$(mem_available_bytes)"
-  cpu="$(host_cpu_fraction 1)"
-  count="$(printf '%s\n%s\n' "$vmm_pids" "$virtiofsd_pids" | grep -c '[0-9]' || true)"
+  pss="$(pss_bytes_for_pids $all_pids)" || return 1
+  pss="$(require_numeric pssBytes "$pss")" || return 1
+  mem="$(require_numeric memAvailableBytes "$(mem_available_bytes)")" || return 1
+  cpu="$(require_numeric hostCpuFraction "$(host_cpu_fraction 1)")" || return 1
+  count="$(require_numeric processCount "$(printf '%s\n%s\n' "$vmm_pids" "$virtiofsd_pids" | grep -c '[0-9]' || true)")" || return 1
   printf '{"pssBytes":%s,"memAvailableBytes":%s,"hostCpuFraction":%s,"processCount":%s}' \
     "$pss" "$mem" "$cpu" "$count"
 }
@@ -639,7 +690,13 @@ run_density_rung() {
   converge_p50="$(percentile 50 "$converge_file")"
 
   local signals pss_bytes mem_bytes cpu_frac proc_count
-  signals="$(host_signals_snapshot)"
+  # `|| die`, in run_density_rung's OWN shell (main calls it directly, not in a
+  # subshell), so a bad snapshot stops the sweep here instead of producing a rung with no
+  # record. Section 7.3's whole point is that a wrong density number is worse than none;
+  # a sweep that completes having recorded nothing is worse still, because it looks
+  # exactly like success (final review H2).
+  signals="$(host_signals_snapshot)" ||
+    die "host signal snapshot failed for rung arm=$arm c=$c (see the refusal above) - refusing to write a rung record from signals that could not be sampled"
   pss_bytes="$(python3 -c "import json,sys; print(json.load(sys.stdin)['pssBytes'])" <<<"$signals")"
   mem_bytes="$(python3 -c "import json,sys; print(json.load(sys.stdin)['memAvailableBytes'])" <<<"$signals")"
   cpu_frac="$(python3 -c "import json,sys; print(json.load(sys.stdin)['hostCpuFraction'])" <<<"$signals")"
@@ -653,11 +710,16 @@ run_density_rung() {
   local standbys_resident=0 idle_residency=0 reclaim_converge_s=0
   standbys_resident=$((proc_count > c ? proc_count - c : 0))
   if [ "$arm" = "microvm" ]; then
-    local waited=0 budget=135 interval=23 last_count="$proc_count"
+    local waited=0 budget=135 interval=23 last_count="$proc_count" idle_snapshot
     while [ "$waited" -lt "$budget" ]; do
       sleep "$interval"
       waited=$((waited + interval))
-      last_count="$(python3 -c "import json,sys; print(json.load(sys.stdin)['processCount'])" <<<"$(host_signals_snapshot)")"
+      # Captured to its own variable first: nesting host_signals_snapshot inside the
+      # python command substitution would discard its exit status along with any
+      # refusal it made, which is the same subshell-swallows-die shape as above.
+      idle_snapshot="$(host_signals_snapshot)" ||
+        die "host signal snapshot failed while polling idle standby residency for rung arm=$arm c=$c (see the refusal above)"
+      last_count="$(python3 -c "import json,sys; print(json.load(sys.stdin)['processCount'])" <<<"$idle_snapshot")"
     done
     idle_residency="$last_count"
     reclaim_converge_s="$waited"
@@ -710,6 +772,22 @@ rec = {
 }
 open('$out_json_path', 'w').write(json.dumps(rec, indent=2))
 "
+  # A rung that wrote no record FAILS LOUDLY (final review H2). This driver runs
+  # `set -uo pipefail` without `set -e`, so the writer above dying -- of a SyntaxError
+  # from an empty interpolation, a KeyError, anything -- did not abort or even warn: the
+  # sweep continued to the next rung and did it again, and E11 could complete an entire
+  # sweep having recorded nothing while exiting 0.
+  #
+  # `set -e` was considered and deliberately NOT adopted for this script: it has never
+  # been run end to end, and it contains many intentional non-zero statuses (`grep -c`
+  # with no match, `|| true`, `|| log`), so turning every one of them into an abort
+  # mid-sweep would trade a silent no-data outcome for a loud partial-data one with no
+  # test able to tell which statuses were load-bearing. This assertion is the targeted
+  # form: it fires exactly when the thing that matters -- the record -- is missing, and
+  # names the rung so the operator does not have to diff a directory listing to find out
+  # which one.
+  [ -s "$out_json_path" ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c wrote no record to $out_json_path - the record writer failed (its Python traceback is above). A sweep that completes having recorded nothing is the worst outcome for a benchmark, because it looks like success."
   rm -rf "$slot_dir" "$all_times" "${all_times}.ok" "$converge_file"
 }
 
