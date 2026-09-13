@@ -134,64 +134,16 @@ func poolConfig(get func(string) string) (vmpool.Config, error) {
 // not re-derived per arm.
 func launcherFor(kind vmpool.VMMKind, get func(string) string, snapDir string, perVMBytes int64) (vmpool.Launcher, error) {
 	switch kind {
-	case vmpool.Firecracker:
-		wsImageMB, err := envInt64(get, "SH_WORKSPACE_IMAGE_MB", 2048)
-		if err != nil {
-			return nil, err
-		}
-		return vmpool.NewFirecrackerLauncher(vmpool.FirecrackerOptions{
-			SnapshotDir:          snapDir,
-			JailerBin:            env(get, "SH_JAILER_BIN", "/usr/bin/jailer"),
-			FirecrackerBin:       env(get, "SH_FIRECRACKER_BIN", "/usr/bin/firecracker"),
-			ChrootBase:           env(get, "SH_CHROOT_BASE", "/srv/jail"),
-			UID:                  os.Getuid(),
-			GID:                  os.Getgid(),
-			ParentCgroup:         env(get, "SH_PARENT_CGROUP", "microvm-vms.slice"),
-			CgroupMemoryMaxBytes: perVMBytes,
-			WorkspaceImageBytes:  wsImageMB << 20,
-			VsockPort:            1024,
-		})
-	case vmpool.CloudHypervisor:
-		// VirtiofsdUID/VirtiofsdGID deliberately do NOT mirror the Firecracker case's
-		// os.Getuid()/os.Getgid() above: this process itself runs privileged (it needs
-		// /dev/kvm and jailer), so os.Getuid() here would be 0, and CHVOptions.validate
-		// correctly refuses that — virtiofsd resolves guest paths on the host and is
-		// spec §3.5's confinement boundary, so it must drop to an unprivileged user of
-		// its own, independent of the worker's own privilege. 65534 (nobody) matches
-		// launcher_chv_test.go's chvOpts default.
-		uid, err := envInt64(get, "SH_VIRTIOFSD_UID", 65534)
-		if err != nil {
-			return nil, err
-		}
-		gid, err := envInt64(get, "SH_VIRTIOFSD_GID", 65534)
-		if err != nil {
-			return nil, err
-		}
-		// RunDir default is under /run, not /srv or /tmp: it holds only per-VM sockets
-		// and rewritten config for the CURRENT boot's live cloud-hypervisor/virtiofsd
-		// processes (spec §4.3, §7.3), the same "runtime state of currently running
-		// services" convention /run/*.pid and /run/docker.sock follow — never data
-		// meant to outlive the processes that own it. That matters for Task 17's
-		// orphan sweep: /run is tmpfs and wiped on reboot, so the sweep only ever has
-		// to reconcile entries against live PIDs within the SAME boot, where a PID
-		// still names the process that created it. A persistent location like /srv
-		// would let entries survive a reboot, and PIDs get reused across reboots, so a
-		// PID-keyed sweep over /srv could misidentify an unrelated process as the
-		// owner of a stale entry — a hazard /run's own reboot-clears-it-for-free
-		// removes structurally, matching this file's existing "no code path that
-		// could do otherwise" preference over a documentation-only guarantee.
-		return vmpool.NewCloudHypervisorLauncher(vmpool.CHVOptions{
-			SnapshotDir:          snapDir,
-			CHVBin:               env(get, "SH_CHV_BIN", "/usr/bin/cloud-hypervisor"),
-			ChRemoteBin:          env(get, "SH_CH_REMOTE_BIN", "/usr/bin/ch-remote"),
-			VirtiofsdBin:         env(get, "SH_VIRTIOFSD_BIN", "/usr/libexec/virtiofsd"),
-			RunDir:               env(get, "SH_CHV_RUN_DIR", "/run/microvm-worker/chv"),
-			VirtiofsdUID:         int(uid),
-			VirtiofsdGID:         int(gid),
-			ParentCgroup:         env(get, "SH_PARENT_CGROUP", "microvm-vms.slice"),
-			CgroupMemoryMaxBytes: perVMBytes,
-			VsockPort:            1024,
-		})
+	case vmpool.Firecracker, vmpool.CloudHypervisor:
+		// Fix round 9: the actual Firecracker/CloudHypervisor option construction
+		// used to be hand-rolled here AND, separately, in cmd/vmpoolctl/main.go's
+		// launcher() — two copies that already drifted once (round 3's CloudHypervisor
+		// fix landed here but not there). vmpool.LauncherFromEnv is now the one place
+		// that builds either arm's options; this function's own job shrinks to what
+		// only it should decide — that "fake" and anything else are refused, so
+		// microvm-worker structurally has no host-execution fallback (spec §3.5), the
+		// one thing this file must NOT delegate to a helper vmpoolctl also calls.
+		return vmpool.LauncherFromEnv(kind, get, snapDir, perVMBytes, "/run/microvm-worker/chv")
 	default:
 		return nil, fmt.Errorf("SH_VMM=%q must be %q or %q; there is no host-execution fallback (spec §3.5)",
 			kind, vmpool.Firecracker, vmpool.CloudHypervisor)

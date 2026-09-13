@@ -7,7 +7,39 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kagenti/serverless-harness/remote-worker/internal/vmpool"
 )
+
+// testPerVMBytes stands in for the real vmpool.PerVMBytes(cfg) figure realMain
+// computes — any positive value works here, since this test does not assert the
+// SPECIFIC memory bound reaches the launcher (that agreement is asserted at the
+// vmpool package level). What matters is only that it is > 0, so
+// CHVOptions.validate() does not refuse the ParentCgroup default
+// vmpool.LauncherFromEnv always sets (hardware-corrections D1). Mirrors
+// cmd/microvm-worker/main_test.go's testPerVMBytes exactly.
+const testPerVMBytes = int64(256 << 20)
+
+// Fix round 9: launcher's CloudHypervisor case must actually route to
+// vmpool.LauncherFromEnv / NewCloudHypervisorLauncher. Before this, the case was a
+// hardcoded "not wired yet (Phase D)" error — the second occurrence of the exact
+// defect round 3 fixed in cmd/microvm-worker/main.go's launcherFor, because that
+// fix never propagated into this file's own copy of the switch. Mirrors
+// TestLauncherForWiresCloudHypervisor's shape exactly.
+func TestLauncherWiresCloudHypervisor(t *testing.T) {
+	lc, err := launcher(string(vmpool.CloudHypervisor), t.TempDir(), testPerVMBytes)
+	if err != nil {
+		t.Fatalf("launcher(cloud-hypervisor): %v", err)
+	}
+	if lc.Kind() != vmpool.CloudHypervisor {
+		t.Fatalf("Kind() = %v, want %v", lc.Kind(), vmpool.CloudHypervisor)
+	}
+	if lc.SerializesExecsPerRun() {
+		t.Fatal("the Cloud Hypervisor arm must not serialize execs per run (spec §4.3): " +
+			"virtio-fs makes the host filesystem, not a guest-owned block device, the " +
+			"concurrency authority")
+	}
+}
 
 // run invokes the CLI's real entry point in-process, so the test exercises flag
 // parsing and the JSON contract E10's shell driver depends on — not a re-implementation

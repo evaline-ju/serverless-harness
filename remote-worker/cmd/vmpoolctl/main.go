@@ -12,7 +12,6 @@ import (
 	"io"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -88,7 +87,15 @@ func realMain(args []string, stdout io.Writer) error {
 		return fmt.Errorf("--iterations and --concurrency must be >= 1")
 	}
 
-	lc, err := launcher(*vmm, *snapshotDir)
+	// perVMBytes is vmpool.PerVMBytes(cfg) (hardware-corrections D1) computed before
+	// cfg itself exists below: cfg.VMM is derived from lc.Kind() once lc is built, so
+	// building the whole Config first would be circular. Only GuestRAMBytes is needed
+	// for the figure — VMOverheadBytes is left at its zero value here exactly as
+	// cmd/microvm-worker/main.go's own launcherFor call does (poolConfig there never
+	// sets it either), so both binaries compute the identical figure from the
+	// identical inputs.
+	perVMBytes := vmpool.PerVMBytes(vmpool.Config{GuestRAMBytes: *guestMB << 20})
+	lc, err := launcher(*vmm, *snapshotDir, perVMBytes)
 	if err != nil {
 		return err
 	}
@@ -185,54 +192,35 @@ func realMain(args []string, stdout io.Writer) error {
 	return firstErr
 }
 
-// envInt64 mirrors cmd/microvm-worker/main.go's helper of the same name — duplicated
-// rather than shared, since vmpoolctl and microvm-worker are separate binaries with no
-// third package either would otherwise depend on just for this.
-func envInt64(k string, def int64) (int64, error) {
-	v := os.Getenv(k)
-	if v == "" {
-		return def, nil
-	}
-	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil || n <= 0 {
-		return 0, fmt.Errorf("%s=%q must be a positive integer", k, v)
-	}
-	return n, nil
-}
-
-func envOrDefault(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
-func launcher(kind string, snapshotDir string) (vmpool.Launcher, error) {
+// launcher maps --vmm to a Launcher. "fake" is handled here and ONLY here — it must
+// never be reachable from cmd/microvm-worker/main.go's launcherFor (spec §3.3, §3.5:
+// nothing agent-influenced may execute outside a VM, and microvm-worker runs
+// privileged). Firecracker and CloudHypervisor both delegate to
+// vmpool.LauncherFromEnv, reading the SAME env vars cmd/microvm-worker/main.go's
+// launcherFor does, so E10's driver measures the production configuration rather
+// than a CLI-only variant, and so a fix to one arm's wiring (e.g. round 3's
+// CloudHypervisor fix) cannot land in one binary's copy of this switch and not the
+// other's — see LauncherFromEnv's doc comment for why round 9 exists at all.
+//
+// Fix round 9 (Task 16): the CloudHypervisor case below used to be a hardcoded
+// "--vmm=%s is not wired yet (Phase D)" error — the exact defect round 3 had already
+// fixed in cmd/microvm-worker/main.go's launcherFor, recurring here because this
+// file's copy of the switch was never updated when that fix landed. Grepping the repo
+// for "Phase D" and for any other --vmm/SH_VMM switch turned up exactly one other
+// production call site (main.go's launcherFor, already correct) and one test-only
+// helper (internal/vmpool/gates_kvm_test.go's launcherForArm, which already called
+// NewCloudHypervisorLauncher directly and never carried this placeholder) — no third
+// site is left uninspected.
+func launcher(kind string, snapshotDir string, perVMBytes int64) (vmpool.Launcher, error) {
 	switch kind {
 	case "fake":
 		return vmpool.NewFakeLauncher(), nil
-	case string(vmpool.Firecracker):
-		// Reads the SAME env vars as cmd/microvm-worker/main.go's launcherFor, so E10's
-		// driver measures the production configuration rather than a CLI-only variant.
-		wsImageMB, err := envInt64("SH_WORKSPACE_IMAGE_MB", 2048)
-		if err != nil {
-			return nil, err
-		}
-		return vmpool.NewFirecrackerLauncher(vmpool.FirecrackerOptions{
-			SnapshotDir:         snapshotDir,
-			JailerBin:           envOrDefault("SH_JAILER_BIN", "/usr/bin/jailer"),
-			FirecrackerBin:      envOrDefault("SH_FIRECRACKER_BIN", "/usr/bin/firecracker"),
-			ChrootBase:          envOrDefault("SH_CHROOT_BASE", "/srv/jail"),
-			UID:                 os.Getuid(),
-			GID:                 os.Getgid(),
-			ParentCgroup:        envOrDefault("SH_PARENT_CGROUP", "microvm-vms.slice"),
-			WorkspaceImageBytes: wsImageMB << 20,
-			VsockPort:           1024,
-		})
-	case string(vmpool.CloudHypervisor):
-		// Task 16 replaces this with the real constructor; until then the CLI is
-		// honest about what it cannot do rather than silently running host bash.
-		return nil, fmt.Errorf("--vmm=%s is not wired yet (Phase D); use --vmm=fake off a KVM host", kind)
+	case string(vmpool.Firecracker), string(vmpool.CloudHypervisor):
+		// chvRunDirDefault differs from main.go's /run/microvm-worker/chv so this CLI,
+		// if ever run for diagnostics on the same host as a live microvm-worker, does
+		// not collide on the same per-VM socket/config directory naming; SH_CHV_RUN_DIR
+		// still overrides either the same way.
+		return vmpool.LauncherFromEnv(vmpool.VMMKind(kind), os.Getenv, snapshotDir, perVMBytes, "/run/vmpoolctl/chv")
 	default:
 		return nil, fmt.Errorf("--vmm=%q is not one of cloud-hypervisor, firecracker, fake", kind)
 	}
