@@ -58,7 +58,21 @@ import (
 // vmmCmd.Process.Pid, fcKillProcessGroup(pid), and vmmCmd.Wait() below all keep
 // working unmodified — the single most safety-critical property this whole file
 // has (Destroy must always be able to kill and reap what Restore started) is
-// preserved exactly, not merely assumed.
+// intended to be preserved exactly, on the strength of that documented
+// exec-in-place behaviour. Round 12 (task-16 report) went looking for ground
+// truth beyond the man page and could not get it: a captured hang showed
+// cloud-hypervisor and virtiofsd both alive under `systemd-run --scope`, which
+// is CONSISTENT with this claim but is not PROOF of it — the same observation is
+// equally consistent with systemd-run remaining a distinct, still-alive parent
+// that relocated the child into the scope's cgroup by some other means (e.g.
+// clone()+cgroup-migrate, then blocking as a supervisor) rather than execve(2)
+// in place. This file still has no host with systemd + KVM to tell the two
+// apart, so this claim remains unverified end to end, not merely "unverified" as
+// a formality. The round 12 fix (chvLogPath below) was deliberately designed to
+// NOT depend on it being true: cloud-hypervisor is told its own --log-file path
+// directly in its own argv, so its own words land in a file CH itself opens and
+// writes, regardless of which process Go's exec.Cmd directly spawned or whether
+// that process's stdout/stderr fds are the ones CH ends up inheriting.
 //
 // D4 — the chroot/filesystem-isolation half — is DELIBERATELY NOT closed here,
 // and this is a reasoned finding, not a silent gap. The one mechanism that could
@@ -359,6 +373,30 @@ func chvSystemdRunScopeArgv(opts CHVOptions, unitName string) []string {
 		args = append(args, "-p", fmt.Sprintf("MemoryMax=%d", opts.CgroupMemoryMaxBytes))
 	}
 	return args
+}
+
+// chvVMMArgv builds cloud-hypervisor's own argv (--api-socket, and — round 12,
+// task-16 report — --log-file plus -v so CH's own words land in a file it opens
+// and writes itself) and, when opts.ParentCgroup is set, wraps that argv behind
+// chvSystemdRunScopeArgv's systemd-run --scope prefix, returning the binary to
+// exec and its full argv. Split out of Restore's own construction, like
+// virtiofsdArgv and chvSystemdRunScopeArgv above, specifically so a test can
+// assert --log-file's path SURVIVES the systemd-run wrap (i.e. remains part of
+// CH's own args, after l.opts.CHVBin in the wrapped argv, not swallowed by or
+// confused with systemd-run's own flags) without spawning anything.
+//
+// unitName is only used when wrapping; callers pass "" when opts.ParentCgroup is
+// empty (chvSystemdRunScopeArgv itself already no-ops on that, but threading it
+// through here keeps this function's signature independent of that internal
+// short-circuit).
+func chvVMMArgv(opts CHVOptions, unitName, apiSock, logPath string) (bin string, argv []string) {
+	argv = []string{"--api-socket", apiSock, "--log-file", logPath, "-v"}
+	bin = opts.CHVBin
+	if opts.ParentCgroup != "" {
+		bin = opts.SystemdRunBin
+		argv = append(chvSystemdRunScopeArgv(opts, unitName), append([]string{opts.CHVBin}, argv...)...)
+	}
+	return bin, argv
 }
 
 // chvChown is os.Chown, indirected so tests can verify Restore's ownership
@@ -823,29 +861,43 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 	// disposition of it just below that): the per-VM CGROUP half of that gap IS
 	// closed here, via chvSystemdRunScopeArgv, when l.opts.ParentCgroup is set; the
 	// filesystem-confinement half is a documented, reasoned non-closure, not a
-	// silent one. Console output is captured to a file (not discarded, unlike
-	// Firecracker's jailed stdout/stderr) specifically so a guest panic — e.g.
-	// hardware-corrections C3's missing-`root=`-on-cmdline panic — surfaces in the
-	// returned error instead of degrading into an opaque waitForUnixSocket/
-	// ch-remote timeout indistinguishable from a wedged VMM. ---
+	// silent one.
+	//
+	// TWO SEPARATE OUTPUT FILES, on purpose (task-16 report, round 12), because they
+	// can carry different things and neither may be trusted alone:
+	//
+	//   - vmmStdio ("vmm-stdio.log"): vmmCmd.Stdout/Stderr — the stdout/stderr of
+	//     whatever process Go's exec.Cmd directly spawned. When l.opts.ParentCgroup
+	//     is set that process is systemd-run, not cloud-hypervisor (see the D3
+	//     comment above, now updated): systemd-run's own pre-exec announcement
+	//     ("Running scope as unit: ...") lands here for certain; whether
+	//     cloud-hypervisor's later writes ALSO land here depends on the still-
+	//     unverified claim that --scope execs in place preserving inherited fds.
+	//     This file was previously named "console.log", which round 12 renamed
+	//     specifically so it stops reading as the same thing as the GUEST's own
+	//     console (config.json's console.common.file — see this function's other
+	//     doc comment on rewriteSnapshotConfig, a wholly separate, already-disclosed
+	//     latent defect, not touched here).
+	//
+	//   - chvLogPath ("cloud-hypervisor.log"): passed to cloud-hypervisor itself via
+	//     its own --log-file flag (confirmed against cloudhypervisor.org's CLI
+	//     reference: "--log-file <log-file> Log file. Standard error is used if not
+	//     specified"), plus -v for verbosity. Cloud-hypervisor opens and writes this
+	//     file ITSELF, by its own path argument, independent of which process Go
+	//     directly spawned and independent of whether that process's stdio fds are
+	//     the ones CH inherits. This is what makes CH's own words legible in a
+	//     failure regardless of how the still-unverified systemd-run --scope
+	//     exec-in-place claim turns out — round 12 was explicitly about making the
+	//     failure legible rather than guessing at the vhost-user disconnect that
+	//     provoked it (task-16 report, round 12; that disconnect itself is NOT
+	//     addressed by this change — no speculative fix for it was made).
 	apiSock := filepath.Join(runDir, "api.sock")
-	console, err = os.Create(filepath.Join(runDir, "console.log"))
+	chvLogPath := filepath.Join(runDir, "cloud-hypervisor.log")
+	console, err = os.Create(filepath.Join(runDir, "vmm-stdio.log"))
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: create console log: %w", req.ID, err), cleanup())
+		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: create vmm stdio log: %w", req.ID, err), cleanup())
 	}
-	vmmArgv := []string{"--api-socket", apiSock}
-	vmmBin := l.opts.CHVBin
-	if l.opts.ParentCgroup != "" {
-		// D3: wrap the real binary+args behind systemd-run --scope so this VM gets
-		// its own cgroup under the same slice Firecracker's jailer targets, bounded
-		// to the same PerVMBytes(cfg) figure. --scope execs cloud-hypervisor IN
-		// PLACE of the systemd-run client (see chvSystemdRunScopeArgv's doc
-		// comment), so vmmCmd.Process.Pid below is cloud-hypervisor's own pid, not
-		// a detached systemd-managed process this handle can no longer kill —
-		// Destroy's kill-and-reap contract is unchanged by this wrapping.
-		vmmBin = l.opts.SystemdRunBin
-		vmmArgv = append(chvSystemdRunScopeArgv(l.opts, "vm-"+req.ID), append([]string{l.opts.CHVBin}, vmmArgv...)...)
-	}
+	vmmBin, vmmArgv := chvVMMArgv(l.opts, "vm-"+req.ID, apiSock, chvLogPath)
 	vmmCmd = exec.Command(vmmBin, vmmArgv...)
 	vmmCmd.Stdout = console
 	vmmCmd.Stderr = console
@@ -854,7 +906,7 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: start cloud-hypervisor: %w", req.ID, err), cleanup())
 	}
 	if err := waitForUnixSocket(ctx, apiSock, 5*time.Second); err != nil {
-		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: API socket never appeared: %s: %w", req.ID, chvReadConsole(console.Name()), err), cleanup())
+		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: API socket never appeared: vmm stdio: %s cloud-hypervisor log: %s: %w", req.ID, chvReadConsole(console.Name()), chvReadConsole(chvLogPath), err), cleanup())
 	}
 
 	// ch-remote restore <restore_config>, where restore_config is the single
@@ -896,8 +948,11 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 		// hardware-corrections C3: a guest that panics for lack of `root=` on the
 		// cmdline produces exactly this symptom from ch-remote's point of view — a
 		// failed restore/resume with no further detail — so console output is
-		// included here rather than only in the API-socket-timeout path above.
-		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: ch-remote restore: %w: %s (console: %s)", req.ID, err, combined, chvReadConsole(console.Name())), cleanup())
+		// included here rather than only in the API-socket-timeout path above. Round
+		// 12: both output files are included, not just vmmStdio's — see the CH-spawn
+		// block's doc comment above for why neither one alone can be trusted to
+		// carry cloud-hypervisor's own words.
+		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: ch-remote restore: %w: %s (vmm stdio: %s) (cloud-hypervisor log: %s)", req.ID, err, combined, chvReadConsole(console.Name()), chvReadConsole(chvLogPath)), cleanup())
 	}
 
 	return &chvVM{
@@ -911,6 +966,7 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 		vsockPort: l.opts.VsockPort,
 		chRemote:  l.opts.ChRemoteBin,
 		console:   console,
+		chvLog:    chvLogPath,
 		fsConsole: fsConsole,
 	}, nil
 }
@@ -950,9 +1006,12 @@ func chvRestoreConfigArg(runDir string) string {
 	return "source_url=file://" + runDir + ",resume=false"
 }
 
-// chvReadConsole best-effort reads back the console log for inclusion in an error
-// message. Never itself a source of a new failure: on any error it returns a
-// placeholder string rather than propagating.
+// chvReadConsole best-effort reads back a captured-output log file for inclusion
+// in an error message — generic over which one: the wrapper-stdio file
+// (vmmCmd.Stdout/Stderr's own "vmm-stdio.log") and cloud-hypervisor's own
+// --log-file ("cloud-hypervisor.log") are both plain paths on disk, so this one
+// helper serves both (task-16 report, round 12). Never itself a source of a new
+// failure: on any error it returns a placeholder string rather than propagating.
 func chvReadConsole(path string) string {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -992,7 +1051,8 @@ type chvVM struct {
 	vsockSock string
 	vsockPort uint32
 	chRemote  string
-	console   *os.File // cloud-hypervisor's stdout/stderr
+	console   *os.File // the directly-spawned process's stdout/stderr (systemd-run's, when ParentCgroup wraps CH — see the Restore CH-spawn block's doc comment)
+	chvLog    string   // path cloud-hypervisor was told via --log-file to write ITS OWN log to; not an *os.File because this process never opens it, CH does (round 12, task-16 report)
 	fsConsole *os.File // virtiofsd's stdout/stderr
 
 	mu        sync.Mutex
@@ -1024,7 +1084,10 @@ func (v *chvVM) Resume(ctx context.Context) error {
 	}
 	out, err := exec.CommandContext(ctx, v.chRemote, "--api-socket", v.apiSock, "resume").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("cloud-hypervisor: resume %s: %w: %s (console: %s)", v.id, err, out, chvReadConsole(v.console.Name()))
+		// Round 12 (task-16 report): both output files are folded in, for the same
+		// reason Restore's own failure paths fold both in — see the CH-spawn block's
+		// doc comment in Restore.
+		return fmt.Errorf("cloud-hypervisor: resume %s: %w: %s (vmm stdio: %s) (cloud-hypervisor log: %s)", v.id, err, out, chvReadConsole(v.console.Name()), chvReadConsole(v.chvLog))
 	}
 	return nil
 }

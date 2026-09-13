@@ -208,6 +208,98 @@ func TestChvCgroupSliceNameStripsTheCgroupfsPrefix(t *testing.T) {
 	}
 }
 
+// TestChvVMMArgvCarriesItsOwnLogFile is fix round 12's (task-16 report) test
+// deliverable: the coordinator captured a real hang where cloud-hypervisor's
+// and virtiofsd's own words were both alive-but-invisible — virtiofsd's
+// because nothing read virtiofsd.log back (already fixed, fix round 1, item
+// 2), cloud-hypervisor's because vmmCmd.Stdout/Stderr only ever captured
+// whatever process Go's exec.Cmd directly spawned, which — when
+// l.opts.ParentCgroup wraps CH in `systemd-run --scope` — is systemd-run
+// itself, not cloud-hypervisor (this file's package-level D3 comment). The
+// captured console.log proved it: one line, systemd-run's own pre-exec
+// "Running scope as unit: ..." announcement, never anything CH itself wrote.
+//
+// The fix does not depend on guessing how systemd-run --scope treats stdio:
+// cloud-hypervisor is told its own --log-file path directly in ITS OWN argv,
+// so it opens and writes that file itself regardless of which process was
+// directly exec'd or what that process's inherited fds turn out to be. This
+// test is a pure assertion on chvVMMArgv, split out of Restore's own
+// construction for exactly this purpose (see that function's doc comment) —
+// no process is spawned, so it needs neither KVM nor root and runs anywhere.
+//
+// Two cases, and the wrapped one is the one that matters: --log-file must
+// SURVIVE being wrapped behind systemd-run's own prefix, remaining part of
+// cloud-hypervisor's own trailing args (after l.opts.CHVBin in the wrapped
+// argv) rather than being swallowed by, or confused with, systemd-run's own
+// flags — a mutation that dropped it only in the wrapped branch would
+// otherwise still pass an unwrapped-only test.
+func TestChvVMMArgvCarriesItsOwnLogFile(t *testing.T) {
+	const apiSock = "/run/vm-test/api.sock"
+	const logPath = "/run/vm-test/cloud-hypervisor.log"
+
+	t.Run("unwrapped (no ParentCgroup)", func(t *testing.T) {
+		opts := chvOpts(t)
+		opts.setDefaults()
+		bin, argv := chvVMMArgv(opts, "", apiSock, logPath)
+		if bin != opts.CHVBin {
+			t.Fatalf("bin = %q, want opts.CHVBin %q — unwrapped, cloud-hypervisor is exec'd directly", bin, opts.CHVBin)
+		}
+		joined := strings.Join(argv, " ")
+		for _, want := range []string{"--log-file", logPath, "-v", "--api-socket", apiSock} {
+			if !strings.Contains(joined, want) {
+				t.Errorf("unwrapped argv %q is missing %q", joined, want)
+			}
+		}
+		if strings.Contains(joined, "--scope") {
+			t.Errorf("unwrapped argv %q must not contain systemd-run's --scope — ParentCgroup is empty", joined)
+		}
+	})
+
+	t.Run("wrapped (ParentCgroup set)", func(t *testing.T) {
+		opts := chvOpts(t)
+		opts.ParentCgroup = "/sys/fs/cgroup/microvm-vms.slice"
+		opts.CgroupMemoryMaxBytes = 256 << 20
+		opts.setDefaults()
+		bin, argv := chvVMMArgv(opts, "vm-test", apiSock, logPath)
+		if bin != opts.SystemdRunBin {
+			t.Fatalf("bin = %q, want opts.SystemdRunBin %q — wrapped, systemd-run is exec'd directly and CH is its argument", bin, opts.SystemdRunBin)
+		}
+		joined := strings.Join(argv, " ")
+		for _, want := range []string{"--scope", "vm-test", "microvm-vms.slice", opts.CHVBin, "--log-file", logPath, "-v", "--api-socket", apiSock} {
+			if !strings.Contains(joined, want) {
+				t.Errorf("wrapped argv %q is missing %q", joined, want)
+			}
+		}
+
+		// The load-bearing assertion: --log-file must appear AFTER opts.CHVBin in the
+		// argv, i.e. as one of cloud-hypervisor's OWN trailing args, not spliced into
+		// or lost among systemd-run's own prefix flags. Index-based, not
+		// strings.Contains, specifically to catch a mutation that moved or dropped it
+		// only on this branch.
+		chvIdx, logIdx := -1, -1
+		for i, a := range argv {
+			if a == opts.CHVBin {
+				chvIdx = i
+			}
+			if a == "--log-file" {
+				logIdx = i
+			}
+		}
+		if chvIdx == -1 {
+			t.Fatalf("wrapped argv %v does not contain opts.CHVBin %q at all", argv, opts.CHVBin)
+		}
+		if logIdx == -1 {
+			t.Fatalf("wrapped argv %v does not contain --log-file at all", argv)
+		}
+		if logIdx <= chvIdx {
+			t.Fatalf("wrapped argv %v: --log-file at index %d must come AFTER opts.CHVBin at index %d — it must be one of cloud-hypervisor's own args, not part of systemd-run's own prefix", argv, logIdx, chvIdx)
+		}
+		if logIdx+1 >= len(argv) || argv[logIdx+1] != logPath {
+			t.Fatalf("wrapped argv %v: --log-file at index %d is not immediately followed by the log path %q", argv, logIdx, logPath)
+		}
+	})
+}
+
 // TestRestorePreparesVirtiofsdOwnership covers fix round 1, item 1: Restore
 // must chown both paths virtiofsd needs (the run dir it binds its own socket
 // inside, and the workspace it must traverse into and serve) to the uid/gid
@@ -777,6 +869,197 @@ func TestCloudHypervisorSupportsTwoStandbysForOneRun(t *testing.T) {
 		if _, err := os.Stat(dir + "/" + n); err != nil {
 			t.Fatalf("%s missing: %v", n, err)
 		}
+	}
+}
+
+// chvFakeVMMScript writes a tiny python3 script to dir/name that argv-parses
+// "--log-file <path>" out of its own command line (chvVMMArgv's own shape:
+// "--log-file" and the path are two SEPARATE argv elements, not
+// "--log-file=<path>" — this script must match that, not virtiofsd's "=" style
+// below), writes marker into that path itself, then sleeps — standing in for
+// cloud-hypervisor in TestRestoreFoldsCloudHypervisorsOwnLogIntoTimeoutError. It
+// deliberately never creates the api.sock cloud-hypervisor would normally expose,
+// so Restore's own waitForUnixSocket(ctx, apiSock, ...) times out for real and
+// exercises Restore's actual error-formatting code, not a stand-in for it.
+func chvFakeVMMScript(t *testing.T, dir, name, marker string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	script := "#!/usr/bin/env python3\n" +
+		"import sys, time\n" +
+		"argv = sys.argv[1:]\n" +
+		"log_path = None\n" +
+		"for i, a in enumerate(argv):\n" +
+		"    if a == '--log-file' and i + 1 < len(argv):\n" +
+		"        log_path = argv[i + 1]\n" +
+		"if log_path:\n" +
+		"    with open(log_path, 'w') as f:\n" +
+		"        f.write(" + strconv.Quote(marker) + " + chr(10))\n" +
+		"time.sleep(60)\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake vmm script %s: %v", path, err)
+	}
+	return path
+}
+
+// chvFakeVirtiofsdScript writes a tiny python3 script to dir/name that
+// argv-parses "--socket-path=<path>" (virtiofsd's own "=" style, per
+// virtiofsdArgv — NOT chvFakeVMMScript's two-separate-args style above), binds
+// and listens a real AF_UNIX socket there so Restore's own
+// waitForUnixSocket(ctx, fsSock, ...) succeeds exactly as it would against the
+// real virtiofsd, then sleeps. It never has to speak vhost-user for real: this
+// test's fake cloud-hypervisor (chvFakeVMMScript) never gets far enough to try
+// — it fails its OWN api.sock wait first.
+func chvFakeVirtiofsdScript(t *testing.T, dir, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	script := "#!/usr/bin/env python3\n" +
+		"import socket, sys, time\n" +
+		"sock_path = None\n" +
+		"for a in sys.argv[1:]:\n" +
+		"    if a.startswith('--socket-path='):\n" +
+		"        sock_path = a.split('=', 1)[1]\n" +
+		"if not sock_path:\n" +
+		"    sys.exit(1)\n" +
+		"s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n" +
+		"s.bind(sock_path)\n" +
+		"s.listen(1)\n" +
+		"time.sleep(60)\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake virtiofsd script %s: %v", path, err)
+	}
+	return path
+}
+
+// TestRestoreFoldsCloudHypervisorsOwnLogIntoTimeoutError is fix round 12's
+// (task-16 report) end-to-end half of the test deliverable: TestChvVMMArgvCarriesItsOwnLogFile
+// above proves chvVMMArgv itself hands cloud-hypervisor a --log-file argument
+// that survives the systemd-run wrap; THIS test proves the other half of the
+// same claim through the real Restore() entry point — that whatever
+// cloud-hypervisor writes to that file actually lands inside a real error
+// Restore returns, not just inside the argv it was given.
+//
+// Real cloud-hypervisor and real virtiofsd binaries are replaced with tiny
+// python3 scripts (chvFakeVirtiofsdScript, chvFakeVMMScript) rather than the
+// genuine articles, for a reason specific to THIS test, not a general
+// convenience: the point here is Restore's own output-capture and
+// error-formatting code, which needs a process that behaves like cloud-hypervisor
+// just enough to reach and then fail the api.sock wait — it does not need a
+// process that can actually restore a VM. TestCloudHypervisorRestoresPausedAndRunsOneCommand
+// and its neighbours below already cover the real binaries end to end, gated on
+// requireKVM.
+//
+// THIS test's own gate is deliberately NOT requireKVM: it never touches
+// /dev/kvm (neither fake script is a hypervisor), so gating it on SH_KVM would
+// be gating it on the wrong resource and would report the wrong reason if it
+// were ever skipped. Its real, and only, unmet local dependency is ROOT:
+// chvIsolateAndDropPrivilegesPlatform (launcher_chv_unix.go) sets
+// SysProcAttr.Credential UNCONDITIONALLY whenever both uid and gid it is given
+// are nonzero, and Restore always calls it for the virtiofsd process with
+// VirtiofsdUID/VirtiofsdGID — 65534 here, same as chvOpts(t) elsewhere in this
+// file — so starting even this fake virtiofsd script requires CAP_SETUID/root
+// on this test binary's own process, exactly as the real virtiofsd would. The
+// coordinator's rig has this (it already needs root for jailer and for
+// virtiofsd's real privileged operations); this task's own dev environment does
+// not, and does not have KVM either — but this is the one test in this file
+// whose specific missing capability is root, not KVM, and it is named that way
+// here and in the task-16 report specifically so the two are not conflated.
+//
+// chvPrepareOwnership, chvCheckWorkspaceReachable, and chvCheckSocketDirWritable
+// are all stubbed to a no-op success, mirroring TestRestoreFailsWhenSocketDirNotWritable's
+// and TestRestoreCallsCheckSocketDirWritable's own documented reason for doing
+// the same: this test is about the cloud-hypervisor output-capture path
+// downstream of them, not about re-litigating checks three other tests already
+// cover, and their REAL implementations would need root of their own kind (a
+// real chown to uid 65534) that has nothing to do with the claim under test
+// here.
+func TestRestoreFoldsCloudHypervisorsOwnLogIntoTimeoutError(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root: chvIsolateAndDropPrivilegesPlatform sets SysProcAttr.Credential " +
+			"unconditionally for virtiofsd's fake stand-in (uid/gid 65534), which requires " +
+			"CAP_SETUID/root — NOT /dev/kvm, which this test never touches")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skipf("python3 not installed: %v", err)
+	}
+
+	origPrepare := chvPrepareOwnership
+	origReachable := chvCheckWorkspaceReachable
+	origWritable := chvCheckSocketDirWritable
+	defer func() {
+		chvPrepareOwnership = origPrepare
+		chvCheckWorkspaceReachable = origReachable
+		chvCheckSocketDirWritable = origWritable
+	}()
+	chvPrepareOwnership = func(runDir, workspaceDir string, uid, gid int) error { return nil }
+	chvCheckWorkspaceReachable = func(path string, uid, gid uint32) error { return nil }
+	chvCheckSocketDirWritable = func(path string, uid, gid uint32) error { return nil }
+
+	const marker = "ROUND12-FAKE-CLOUD-HYPERVISOR-SAYS-THIS-DISTINCTIVE-MARKER"
+
+	scriptDir := t.TempDir()
+	fakeVirtiofsd := chvFakeVirtiofsdScript(t, scriptDir, "fake-virtiofsd.py")
+	fakeCHV := chvFakeVMMScript(t, scriptDir, "fake-cloud-hypervisor.py", marker)
+
+	// A fresh, self-contained golden snapshot dir — deliberately NOT chvOpts(t)'s
+	// (which may point at a real rig SH_SNAPSHOT_IMAGE_DIR): this test writes its
+	// own golden files under the exact golden names chvStageSnapshotFiles reads
+	// (chvGoldenVMState/chvGoldenMemFile/chvGoldenConfigFile), the same synthetic
+	// shape TestRestoreStagesCHNativeNamesFromGoldenNames already uses, and must
+	// never risk writing into a real shared snapshot directory.
+	snapshotDir := t.TempDir()
+	goldenConfig := `{
+		"vsock": {"cid": 3, "socket": "/golden/vsock.sock"},
+		"fs": [{"tag": "workspace", "socket": "/golden/vfsd.sock", "num_queues": 1, "queue_size": 1024}],
+		"disks": [{"path": "/golden/rootfs.ext4", "readonly": true}]
+	}`
+	golden := map[string]string{
+		chvGoldenVMState:    "fake vmstate bytes",
+		chvGoldenMemFile:    "fake memfile bytes",
+		chvGoldenConfigFile: goldenConfig,
+	}
+	for name, content := range golden {
+		if err := os.WriteFile(filepath.Join(snapshotDir, name), []byte(content), 0o600); err != nil {
+			t.Fatalf("seed golden %s: %v", name, err)
+		}
+	}
+
+	opts := CHVOptions{
+		SnapshotDir:  snapshotDir,
+		CHVBin:       fakeCHV,
+		ChRemoteBin:  "/usr/bin/ch-remote", // never reached: Restore fails at the api.sock wait first
+		VirtiofsdBin: fakeVirtiofsd,
+		RunDir:       sameDeviceSiblingDir(t, snapshotDir),
+		VirtiofsdUID: 65534,
+		VirtiofsdGID: 65534,
+		VsockPort:    1024,
+	}
+
+	lc, err := NewCloudHypervisorLauncher(opts)
+	if err != nil {
+		t.Fatalf("NewCloudHypervisorLauncher: %v", err)
+	}
+
+	vm, err := lc.Restore(context.Background(), RestoreRequest{
+		ID: "vm-chv-fake-log", Key: "run-a", WorkspaceDir: t.TempDir(), GuestRAMBytes: 256 << 20,
+	})
+	if err == nil {
+		defer func() { _ = vm.Destroy() }()
+		t.Fatal("Restore with a fake cloud-hypervisor that never creates api.sock: want error, got nil")
+	}
+	if vm != nil {
+		t.Fatalf("Restore returned a non-nil VM alongside an error: %v", vm)
+	}
+
+	// The decisive assertion: this is the whole point of round 12. Before the fix,
+	// this marker had nowhere to go — vmmCmd.Stdout/Stderr (the OLD, sole capture)
+	// only ever captured whatever process exec.Cmd directly spawned, and even
+	// unwrapped (no ParentCgroup here) that file would hold nothing cloud-hypervisor
+	// itself wrote via --log-file. Now chvLogPath is opened and written by the fake
+	// VMM itself, and Restore's own timeout-error formatting
+	// (chvReadConsole(chvLogPath)) must fold that content into the error this test
+	// receives.
+	if !strings.Contains(err.Error(), marker) {
+		t.Fatalf("Restore error does not contain cloud-hypervisor's own --log-file words:\n%v", err)
 	}
 }
 
