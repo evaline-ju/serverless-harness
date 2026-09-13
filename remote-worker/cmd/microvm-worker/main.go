@@ -384,10 +384,19 @@ func main() {
 	// VMM's cgroup-creation mechanism left under the slice, keyed on cgroup.procs pids
 	// rather than process names (D8: cloud-hypervisor's comm is truncated to 15 chars by
 	// the kernel, so a name-based sweep would silently miss that arm's orphans).
-	if n, err := vmpool.SweepOrphans(env(get, "SH_PARENT_CGROUP", "/sys/fs/cgroup/microvm-vms.slice")); err != nil {
+	//
+	// The sweep is fail-closed (final review H1): it touches only cgroup directories
+	// this pool itself named, and never its own. What it declined is logged as well as
+	// what it swept, because a filter that has narrowed to nothing and a slice that
+	// genuinely has no orphans are otherwise indistinguishable from the outside — and
+	// the shipped unit's own Slice=microvm-vms.slice guarantees at least one skip
+	// (microvm-worker.service, this process's own cgroup), so an EMPTY skip list on a
+	// systemd-started worker is itself the anomaly worth seeing.
+	if res, err := vmpool.SweepOrphans(env(get, "SH_PARENT_CGROUP", "/sys/fs/cgroup/microvm-vms.slice")); err != nil {
 		log.Printf("microvm-worker: orphan sweep: %v", err)
-	} else if n > 0 {
-		log.Printf("microvm-worker: swept %d orphaned VM cgroups from a previous incarnation", n)
+	} else {
+		log.Printf("microvm-worker: orphan sweep: swept %d VM cgroup(s) from a previous incarnation; left alone %d non-VM cgroup(s) %v",
+			res.Swept, len(res.Skipped), res.Skipped)
 	}
 
 	if err := pool.Probe(context.Background()); err != nil {

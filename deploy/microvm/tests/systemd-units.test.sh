@@ -8,14 +8,26 @@
 # contract reintroduces spec §6's #1 practical failure (a worker crash leaks VMs)
 # without any test ever going red:
 #
-#   - KillMode=control-group is the half of the crash-leak mitigation systemd itself
-#     provides: on stop/crash it kills every process left in the unit's cgroup, VM
-#     processes included, not just the worker's own pid.
-#   - Slice=microvm-vms.slice is what makes that cgroup the SAME one SweepOrphans
-#     walks on the next start, and the same one both launcher arms' per-VM cgroups
-#     (jailer --parent-cgroup / systemd-run --scope --slice=) nest under
+#   - KillMode=control-group kills every process left in THIS UNIT's own cgroup on
+#     stop/crash. It does NOT reach the VM cgroups: those are siblings of the unit's
+#     cgroup under the slice, not children of it (see microvm-worker.service's own
+#     header for the tree). An earlier version of this comment claimed otherwise --
+#     the false premise behind the final review's H1 -- and correcting it is why the
+#     start-up sweep is the load-bearing half of the mitigation, not an extra.
+#   - Slice=microvm-vms.slice puts the worker in the SAME slice SweepOrphans walks on
+#     the next start, and the same one both launcher arms' per-VM cgroups (jailer
+#     --parent-cgroup / systemd-run --scope --slice=) nest under
 #     (hardware-corrections D1/D3: "configured consistently ... or the two
 #     mechanisms fight and the leak we are preventing returns").
+#
+# WHAT THIS SUITE STRUCTURALLY CANNOT CHECK, stated so the gap is not rediscovered:
+# it greps unit-file TEXT and cannot evaluate the Go code those files configure, which
+# is exactly how H1 -- an interaction between Slice= here and SweepOrphans there --
+# stayed invisible to it. That interaction is pinned instead by
+# remote-worker/internal/vmpool/cgroup_unitfile_test.go, which reads THESE files and
+# runs the real sweep predicate against the cgroup name systemd derives from them.
+# Anything asserted here about how the units meet the code is a cross-reference to
+# that test, not an independent check.
 #   - AssertPathExists=/dev/kvm fails the unit before ExecStart even runs -- spec §6:
 #     "fail the unit at start ... never fall back to running commands on the host."
 #   - LimitMEMLOCK=infinity keeps the unit's own ceiling from being the thing that
@@ -90,8 +102,20 @@ check "no pkill/pgrep -x cloud-hypervisor in the slice unit" \
   "$(grep -cE 'p(kill|grep) .*-x cloud-hypervisor' "$SLICE")" "0"
 
 echo "== the slice and unit agree on the SAME slice name (hardware-corrections D1/D3)"
-check "SH_PARENT_CGROUP path ends in the slice this service is placed in" \
-  "$([ "$(grep -oE 'SH_PARENT_CGROUP=.*' "$SERVICE" | grep -cF 'microvm-vms.slice')" -ge 1 ] && echo yes || echo no)" "yes"
+# Compared as VALUES rather than by grepping both for one hardcoded literal: renaming the
+# slice in one place and not the other is the drift this is here to catch, and a test that
+# looks for 'microvm-vms.slice' in both would go green on a file where neither was renamed
+# and red on a correctly renamed pair.
+unit_slice="$(grep -oE '^Slice=.*' "$SERVICE" | head -n1 | cut -d= -f2-)"
+parent_cgroup="$(grep -oE '^Environment=SH_PARENT_CGROUP=.*' "$SERVICE" | head -n1 | sed 's/^Environment=SH_PARENT_CGROUP=//')"
+check "Slice= is set on the service" "$([ -n "$unit_slice" ] && echo yes || echo no)" "yes"
+check "Environment=SH_PARENT_CGROUP is set on the service" "$([ -n "$parent_cgroup" ] && echo yes || echo no)" "yes"
+check "SH_PARENT_CGROUP's last path segment IS the slice this service is placed in" \
+  "$(basename "$parent_cgroup")" "$unit_slice"
+# The corollary an operator has to know, and the reason H1 was possible: because the
+# service is IN that slice, the worker's own cgroup is one of the directories the sweep
+# enumerates. That the sweep refuses it is asserted in Go, against these same files --
+# see cgroup_unitfile_test.go, cross-referenced in this file's header.
 
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"

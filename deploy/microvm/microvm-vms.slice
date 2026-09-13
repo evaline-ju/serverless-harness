@@ -13,9 +13,20 @@
 # exactly the "ballooning guest is bounded by the whole slice, not by its own VM"
 # failure mode spec §6 mitigation #3 exists to avoid (hardware-corrections D1).
 # microvm-worker's own admission control (SH_MAX_COMMITTED_MB) is the real
-# density ceiling; this slice only needs to exist so systemd's KillMode=
-# control-group on microvm-worker.service can tear down every VM cgroup under it
-# on worker stop/crash, and so SweepOrphans has a slice to walk on the next start.
+# density ceiling.
+#
+# What this slice is FOR, corrected after the final whole-branch review's H1 (the
+# previous wording here was wrong and the error was consequential): it is one
+# cgroup subtree holding microvm-worker.service AND every VM cgroup, so that
+# (a) the worker's own memory is accounted alongside the VMs it admits, (b)
+# `systemctl stop microvm-vms.slice` tears the whole tier down in one operation,
+# and (c) SweepOrphans has one slice to walk on the next start. It is NOT true
+# that KillMode=control-group on microvm-worker.service reaches the VM cgroups:
+# those are SIBLINGS of that unit's cgroup under this slice, not children of it,
+# so KillMode kills the worker's cgroup only. That is precisely why the start-up
+# sweep is the load-bearing half of spec §6's mitigation rather than a
+# belt-and-braces extra -- and why the sweep must never mistake
+# microvm-worker.service's own cgroup for a VM's (see cgroup.go's H1 block).
 
 [Unit]
 Description=Parent slice for ephemeral microVM sandboxes (serverless-harness P4)

@@ -1,13 +1,43 @@
 # deploy/microvm/microvm-worker.service
 #
-# Runs cmd/microvm-worker (see remote-worker/cmd/microvm-worker/main.go) as the unit
-# that owns every VM's cgroup for the lifetime of the process (Task 17, spec §6's #1
-# practical failure: "Worker crash leaks VMs"). KillMode=control-group below is the
-# half of that mitigation systemd itself provides -- on stop or crash, systemd kills
-# every process left in this unit's control group, VMs included, rather than only the
-# worker's own pid. SweepOrphans (called from main(), before Probe) is the OTHER half:
-# it reconciles whatever survived a kill-9/OOM/power-loss that KillMode=control-group
-# never got a chance to run for.
+# Runs cmd/microvm-worker (see remote-worker/cmd/microvm-worker/main.go), the process
+# that creates every VM's cgroup under microvm-vms.slice for the lifetime of the
+# process (Task 17, spec §6's #1 practical failure: "Worker crash leaks VMs").
+#
+# WHERE EACH CGROUP ACTUALLY LANDS, because the final whole-branch review's H1 was a
+# false premise about exactly this. Slice=microvm-vms.slice below makes systemd nest
+# THIS UNIT's cgroup under that slice (systemd.slice(5): a unit assigned to a slice is
+# placed beneath it in the cgroup tree -- the same shape as system.slice/sshd.service),
+# while both launcher arms place each VM's cgroup under the same slice as a SIBLING of
+# this unit, not as a child of it:
+#
+#   /sys/fs/cgroup/microvm-vms.slice/
+#   |-- microvm-worker.service/   <-- this unit; cgroup.procs holds the worker's own pid
+#   |-- vm-9/                     <-- Firecracker: jailer --parent-cgroup + --cgroup
+#   `-- vm-vm-9.scope/            <-- Cloud Hypervisor: systemd-run --scope --slice=
+#
+# Two consequences follow, and both are load-bearing:
+#
+#  1. KillMode=control-group below kills what is in THIS UNIT's control group, which is
+#     the worker (and any process it left in its own cgroup) -- NOT the sibling VM
+#     cgroups. Tearing those down on a clean stop is `systemctl stop
+#     microvm-vms.slice`, which stops the whole slice subtree. An earlier version of
+#     this comment claimed KillMode=control-group reached the VM cgroups; it does not,
+#     and stating it did is what made the crash-recovery sweep look optional.
+#  2. Because the worker is a sibling of the VM cgroups rather than their parent,
+#     SweepOrphans (called from main(), before Probe) must be able to tell them apart.
+#     It does: it sweeps only directory names this pool itself created and never its
+#     own cgroup (see cgroup.go's H1 block). It is the crash-recovery half of the
+#     mitigation regardless -- a kill-9/OOM/power-loss leaves VM cgroups behind no
+#     matter which cgroup the worker occupied.
+#
+# Slice=microvm-vms.slice is KEPT deliberately, not left in place by inertia: it puts
+# the worker's own memory in the same accounting scope as the VMs it admits (which is
+# what SH_MAX_COMMITTED_MB is reasoning about), and it makes the slice one unit an
+# operator can stop or inspect to reach the whole tier. Moving the worker out would
+# make "every child of the slice is a VM" true, but it would NOT remove the need for
+# the sweep, and it would split the tier across two accounting scopes to buy a
+# simplification the sweep no longer needs.
 
 [Unit]
 Description=microvm-worker: ephemeral microVM sandbox tier (serverless-harness P4)

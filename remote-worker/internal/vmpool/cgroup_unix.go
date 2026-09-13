@@ -23,3 +23,23 @@ func killPidIgnoringAbsent(pid int) error {
 	}
 	return nil
 }
+
+// pidSharesCallersProcessGroup reports whether pid is in the same process group as the
+// calling process — the third of SweepOrphans' three guards (see cgroup.go's H1 block).
+//
+// A pid whose group cannot be read (it exited between readdir and here) is reported as
+// NOT sharing: the subsequent SIGKILL then ESRCHes harmlessly, which is the existing
+// already-swept path, rather than the guard widening to refuse every orphan.
+//
+// Correct BECAUSE both launchers Setpgid their VMM into its own process group
+// (fcIsolateProcessGroup in launcher_firecracker_unix.go,
+// chvIsolateAndDropPrivilegesPlatform in launcher_chv_unix.go), and an orphan left by a
+// PREVIOUS worker incarnation cannot be in this process's group at all — so this refuses
+// the sweeping process and its group leader without ever refusing a real target.
+func pidSharesCallersProcessGroup(pid int) bool {
+	pgid, err := syscall.Getpgid(pid)
+	if err != nil {
+		return false
+	}
+	return pgid == syscall.Getpgrp()
+}

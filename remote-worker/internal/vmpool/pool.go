@@ -394,9 +394,14 @@ func (p *pool) runLocked(key string) (*runPool, bool, error) {
 	return rp, true, nil
 }
 
+// nextIDLocked mints the next VM id. The prefix is vmIDPrefix (cgroup.go), not a literal:
+// this id becomes the Firecracker arm's cgroup DIRECTORY name verbatim (jailer --id) and
+// the stem of the Cloud Hypervisor arm's scope name, both of which SweepOrphans'
+// fail-closed filter must recognise. Sharing the constant is what stops that filter from
+// silently narrowing to nothing if the id shape ever changes (final review H1).
 func (p *pool) nextIDLocked() string {
 	p.seq++
-	return "vm-" + strconv.FormatUint(p.seq, 10)
+	return vmIDPrefix + strconv.FormatUint(p.seq, 10)
 }
 
 // Reclaim drops a run's standbys AND its workspace directory. Safe to fire early:

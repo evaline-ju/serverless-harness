@@ -971,7 +971,11 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: create vmm stdio log: %w", req.ID, err), cleanup())
 	}
-	vmmBin, vmmArgv := chvVMMArgv(l.opts, "vm-"+req.ID, apiSock, chvLogPath)
+	// chvScopeUnitName, not a "vm-"+req.ID literal: systemd turns this unit name into a
+	// "<unit>.scope" cgroup directory under --slice, and SweepOrphans' fail-closed
+	// filter has to recognise that exact directory name. One function, so the launcher
+	// and the sweep cannot drift apart (final review H1; cgroup.go's naming block).
+	vmmBin, vmmArgv := chvVMMArgv(l.opts, chvScopeUnitName(req.ID), apiSock, chvLogPath)
 	vmmCmd = exec.Command(vmmBin, vmmArgv...)
 	vmmCmd.Stdout = console
 	vmmCmd.Stderr = console

@@ -18,3 +18,10 @@ import "errors"
 func killPidIgnoringAbsent(pid int) error {
 	return errors.New("vmpool: killing an orphaned VM process is not supported on windows")
 }
+
+// pidSharesCallersProcessGroup has no Windows implementation for the same reason
+// killPidIgnoringAbsent does not: syscall.Getpgid/Getpgrp are unix-only names. Returning
+// false is safe here and is not a weakened guard, because the only thing it gates is
+// killPidIgnoringAbsent, which refuses outright on this platform — nothing can be
+// signalled for the check to have failed to protect.
+func pidSharesCallersProcessGroup(pid int) bool { return false }
