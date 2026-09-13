@@ -88,3 +88,59 @@ func canTraverse(mode os.FileMode, ownerUID, ownerGID, uid, gid uint32) bool {
 		return perm&0o001 != 0
 	}
 }
+
+// checkPathWritableBy is checkPathTraversableBy's sibling for a different
+// question and a different single directory, not an extension of it: fix
+// round 11's rig repro is "Error creating pid file '<socket>.pid': Permission
+// denied" from virtiofsd itself, AFTER it has already reached its socket's
+// directory (traversal was never the problem there — chvCheckWorkspaceReachable
+// and the chown in chvPrepareVirtiofsdOwnership both already succeed). virtiofsd
+// does not just bind(2) a socket inside that directory; before it does, it
+// also creates a "<socket-path>.pid" sidecar FILE next to the socket, which
+// requires WRITE permission on that directory, not merely execute (traversal).
+// checkPathTraversableBy cannot catch this even in principle: it only ever
+// inspects a path's ANCESTORS (starting at filepath.Dir(path)) and only ever
+// checks the execute bit on each of them — it deliberately never inspects the
+// LEAF directory itself, because the leaf's own mode was never fix round 3's
+// concern (that was req.WorkspaceDir's ancestors, owned by the pool/
+// orchestration layer, not this launcher). Here the leaf IS this launcher's
+// own concern (runDir, which it created itself via os.MkdirAll — see
+// launcher_chv.go's Restore), and the property that matters is write, not
+// execute. Hence a new function rather than a parameter added to the old one.
+func checkPathWritableBy(dir string, uid, gid uint32) error {
+	ownerUID, ownerGID, mode, err := statOwnerModeFunc(dir)
+	if err != nil {
+		return fmt.Errorf("vmpool: checking whether uid %d:gid %d can write to %s: %w", uid, gid, dir, err)
+	}
+	if !mode.IsDir() {
+		return fmt.Errorf("vmpool: %s is not a directory (mode %v); cannot be written into", dir, mode)
+	}
+	if !canWrite(mode, ownerUID, ownerGID, uid, gid) {
+		return fmt.Errorf("vmpool: %s (mode %04o, owned by uid %d:gid %d) is not writable by uid %d:gid %d "+
+			"-- virtiofsd must create its vhost-user socket (and the <socket>.pid file it writes beside it) "+
+			"in this directory; chown/chmod it so that uid/gid owns it with write+execute permission",
+			dir, mode.Perm(), ownerUID, ownerGID, uid, gid)
+	}
+	return nil
+}
+
+// canWrite mirrors canTraverse's permission-class ordering exactly (owner,
+// then group, then other), but checks the write bit together with execute
+// (0o3 per class) rather than execute alone: a directory needs execute to be
+// entered/searched AND write to have entries created inside it (virtiofsd's
+// socket bind and its ".pid" sidecar file both create a new directory entry).
+// Checking write alone without execute would accept a directory the kernel
+// would still refuse a mknod/creat(2) in for lack of search permission, so
+// both bits are required together, matching what open(2)/bind(2) actually
+// enforce.
+func canWrite(mode os.FileMode, ownerUID, ownerGID, uid, gid uint32) bool {
+	perm := mode.Perm()
+	switch {
+	case uid == ownerUID:
+		return perm&0o300 == 0o300
+	case gid == ownerGID:
+		return perm&0o030 == 0o030
+	default:
+		return perm&0o003 == 0o003
+	}
+}

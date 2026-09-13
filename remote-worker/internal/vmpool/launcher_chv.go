@@ -367,8 +367,19 @@ func chvSystemdRunScopeArgv(opts CHVOptions, unitName string) []string {
 // TestRestorePreparesVirtiofsdOwnership.
 var chvChown = os.Chown
 
-// chvPrepareVirtiofsdOwnership chowns runDir and workspaceDir to uid:gid before
-// virtiofsd is spawned.
+// chvChmod is os.Chmod, indirected for the same reason chvChown is: tests
+// verify Restore's/chvPrepareVirtiofsdOwnership's chmod call site without
+// depending on the real filesystem state a fake uid:gid chown leaves behind.
+//
+// Review finding (fix round 11): unlike chvChown, this needs no elevated
+// privilege to succeed for real (chmod only requires owning the file, which
+// the test process does, having just created runDir itself) — the seam
+// exists purely so a test can observe the CALL, not because the real syscall
+// is unusable in a test process the way root-only chown is.
+var chvChmod = os.Chmod
+
+// chvPrepareVirtiofsdOwnership chowns runDir and workspaceDir to uid:gid, and
+// chmods runDir to ensure it is owner-writable, before virtiofsd is spawned.
 //
 // Review finding (fix round 1, item 1): Restore creates runDir via
 // os.MkdirAll — owned by whatever this launcher process runs as — and then
@@ -391,9 +402,35 @@ var chvChown = os.Chown
 // whatever created WorkspaceDir (the pool/orchestration layer), the same class
 // of assumption this file already makes about RunDir's and SnapshotDir's own
 // parents being reachable.
+//
+// Review finding (fix round 11): the chown above was, on its own, an
+// INCOMPLETE guarantee for runDir specifically. Chown changes ownership only —
+// it says nothing about the mode bits, which up to this fix rested entirely on
+// the mode argument Restore's own os.MkdirAll(runDir, 0o700) call passed when
+// it FIRST created runDir. That argument is a no-op the moment runDir already
+// exists (MkdirAll never chmods a pre-existing directory), and nothing after
+// creation ever independently re-asserted or verified it — unlike
+// workspaceDir, which already had BOTH an active fix (this chown) AND an
+// independent verification (chvCheckWorkspaceReachable, fix round 3) before
+// this round. runDir had only the active half of that pattern. The hardware
+// repro this fix round starts from — virtiofsd's "Error creating pid file
+// '<socket>.pid': Permission denied" — is exactly what an owner-writable
+// assumption silently failing looks like: virtiofsd needs to WRITE a new
+// directory entry (the socket, and the .pid file it creates beside it) into
+// runDir, not merely traverse it, so this chmod closes the same kind of gap
+// for runDir's own mode that fix round 1 already closed for its ownership.
+// chmod, deliberately, only ever targets runDir here, never workspaceDir:
+// workspaceDir is the pool/orchestration layer's directory, not this
+// launcher's own, and this file already treats it as off-limits for anything
+// beyond chown (see the "does NOT reach workspaceDir's ANCESTORS" paragraph
+// above) — actively rewriting its mode bits would be the same overreach one
+// level down.
 func chvPrepareVirtiofsdOwnership(runDir, workspaceDir string, uid, gid int) error {
 	if err := chvChown(runDir, uid, gid); err != nil {
 		return fmt.Errorf("chown run dir %s to %d:%d: %w", runDir, uid, gid, err)
+	}
+	if err := chvChmod(runDir, 0o700); err != nil {
+		return fmt.Errorf("chmod run dir %s to 0700: %w", runDir, err)
 	}
 	if err := chvChown(workspaceDir, uid, gid); err != nil {
 		return fmt.Errorf("chown workspace dir %s to %d:%d: %w", workspaceDir, uid, gid, err)
@@ -421,6 +458,40 @@ var chvPrepareOwnership = chvPrepareVirtiofsdOwnership
 // spawned — not just the underlying check in isolation. See
 // TestRestoreChecksWorkspaceReachableBeforeVirtiofsd.
 var chvCheckWorkspaceReachable = checkPathTraversableBy
+
+// chvCheckSocketDirWritable is checkPathWritableBy (traversalcheck.go) through
+// a seam, for the same reason chvCheckWorkspaceReachable is one: a test can
+// observe the CALL SITE inside Restore rather than just the helper in
+// isolation.
+//
+// Review finding (fix round 11): this is deliberately independent of, not a
+// replacement for, the chvChmod call inside chvPrepareVirtiofsdOwnership.
+// chmod is the ACTIVE fix (make runDir owner-writable); this is the PASSIVE
+// verification that it actually took effect, mirroring exactly how
+// workspaceDir already gets both an active chown (chvPrepareOwnership) and an
+// independent check (chvCheckWorkspaceReachable) rather than trusting the
+// active half alone. Without this, a chmod that silently failed to have the
+// intended effect (e.g. a filesystem that clamps permissions, or a future
+// regression that reorders/removes the chmod call) would still let Restore
+// proceed to spawn virtiofsd, reproducing the exact diagnostically-opaque
+// 20-30s Restore hang this fix round starts from — virtiofsd dying with EACCES
+// before it ever binds its socket, cloud-hypervisor waiting on a backend that
+// will never appear, until the pool's own timeout fires. This check turns
+// that into an immediate, precise error naming runDir, its mode, and the
+// uid/gid that cannot write to it, raised BEFORE fsCmd.Start() rather than
+// discovered 20-30s later as a timeout with no causal thread back to this.
+//
+// Where chvCheckWorkspaceReachable checks req.WorkspaceDir's ANCESTORS for
+// TRAVERSAL (execute only — see checkPathTraversableBy's own doc comment),
+// this checks runDir ITSELF (the leaf virtiofsd's socket and .pid file are
+// created in) for WRITE (write+execute — see checkPathWritableBy's own doc
+// comment). The two checks cover disjoint paths and disjoint properties by
+// design, not by oversight: WorkspaceDir's ancestors belong to the pool/
+// orchestration layer and this launcher can only verify them, never fix them;
+// runDir is this launcher's own directory, created by its own os.MkdirAll,
+// so it is the one place this file both actively fixes AND independently
+// verifies the same property.
+var chvCheckSocketDirWritable = checkPathWritableBy
 
 // rewriteSnapshotConfig returns a copy of the golden snapshot's config.json with
 // its embedded vsock socket path, (if present) virtio-fs socket path, and every
@@ -687,6 +758,26 @@ func (l *chvLauncher) Restore(ctx context.Context, req RestoreRequest) (VM, erro
 	// directory to fix.
 	if err := chvCheckWorkspaceReachable(req.WorkspaceDir, uint32(l.opts.VirtiofsdUID), uint32(l.opts.VirtiofsdGID)); err != nil {
 		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: workspace unreachable by virtiofsd: %w", req.ID, err), cleanup())
+	}
+
+	// Review finding (fix round 11): the coordinator's rig reproduced a
+	// DIFFERENT failure than fix round 3's — not "workspace unreachable" but
+	// virtiofsd's own "Error creating pid file '<socket>.pid': Permission
+	// denied", surfacing only as a Restore hang until the pool's ~20s timeout,
+	// because cloud-hypervisor has no way to know virtiofsd died before ever
+	// binding its backend socket. chvPrepareOwnership above (via chvChmod, see
+	// its own doc comment) now actively makes runDir owner-writable, but that
+	// chmod's success is unverified from here on — exactly the asymmetry
+	// runDir had relative to workspaceDir before this fix round (an active fix
+	// with no independent check). Verify it actually took, for the same
+	// "precise error now, not an opaque timeout later" reason
+	// chvCheckWorkspaceReachable exists: this checks runDir itself (the leaf
+	// virtiofsd's socket and .pid sidecar file are created in) for WRITE, not
+	// req.WorkspaceDir's ancestors for traversal — see
+	// chvCheckSocketDirWritable's own doc comment for why these are disjoint
+	// checks over disjoint paths, not a duplicate of the check just above.
+	if err := chvCheckSocketDirWritable(runDir, uint32(l.opts.VirtiofsdUID), uint32(l.opts.VirtiofsdGID)); err != nil {
+		return nil, errors.Join(fmt.Errorf("cloud-hypervisor: restore %s: virtiofsd socket directory not writable: %w", req.ID, err), cleanup())
 	}
 
 	// --- virtiofsd, privileges dropped before exec (never run as root: see

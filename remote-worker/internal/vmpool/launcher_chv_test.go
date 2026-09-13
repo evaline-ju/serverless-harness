@@ -482,6 +482,224 @@ func TestRestoreFailsWhenWorkspaceIsUnreachable(t *testing.T) {
 	}
 }
 
+// TestChvPrepareVirtiofsdOwnershipChmodsRunDir covers fix round 11's active
+// fix: chvPrepareVirtiofsdOwnership must chmod runDir to 0700 (owner
+// write+execute) in addition to chowning it, and must NOT chmod workspaceDir
+// (that directory belongs to the pool/orchestration layer, not this
+// launcher — see chvPrepareVirtiofsdOwnership's own doc comment for why
+// workspaceDir gets chown but never chmod).
+//
+// Like TestRestorePreparesVirtiofsdOwnership, this substitutes both indirected
+// seams (chvChown and chvChmod) rather than depending on the real syscalls:
+// chvChown needs no root here only because it is faked, and chvChmod's real
+// form would actually succeed against a t.TempDir() (this test process owns
+// it) but faking it keeps this test about the CALL, consistent with its
+// sibling.
+func TestChvPrepareVirtiofsdOwnershipChmodsRunDir(t *testing.T) {
+	origChown := chvChown
+	origChmod := chvChmod
+	defer func() { chvChown = origChown; chvChmod = origChmod }()
+	chvChown = func(path string, uid, gid int) error { return nil }
+
+	type call struct {
+		path string
+		mode os.FileMode
+	}
+	var calls []call
+	chvChmod = func(path string, mode os.FileMode) error {
+		calls = append(calls, call{path, mode})
+		return nil
+	}
+
+	opts := chvOpts(t)
+	runDir := t.TempDir()
+	workspaceDir := t.TempDir()
+	if err := chvPrepareVirtiofsdOwnership(runDir, workspaceDir, opts.VirtiofsdUID, opts.VirtiofsdGID); err != nil {
+		t.Fatalf("chvPrepareVirtiofsdOwnership: %v", err)
+	}
+
+	if len(calls) != 1 {
+		t.Fatalf("chvChmod called %d times, want 1: %+v", len(calls), calls)
+	}
+	if calls[0].path != runDir {
+		t.Fatalf("chvChmod called on %q, want runDir %q", calls[0].path, runDir)
+	}
+	if calls[0].mode != 0o700 {
+		t.Fatalf("chvChmod called with mode %v, want 0700", calls[0].mode)
+	}
+	for _, c := range calls {
+		if c.path == workspaceDir {
+			t.Fatalf("chvChmod must never touch workspaceDir (not this launcher's directory), but it was called on %q", c.path)
+		}
+	}
+}
+
+// TestChvPrepareVirtiofsdOwnershipPropagatesChmodFailure mirrors
+// TestRestorePreparesVirtiofsdOwnershipPropagatesFailure for the new chmod
+// step: a chmod failure must abort chvPrepareVirtiofsdOwnership rather than
+// being swallowed, which would silently reintroduce the unverified-writability
+// gap this fix round closes.
+func TestChvPrepareVirtiofsdOwnershipPropagatesChmodFailure(t *testing.T) {
+	origChown := chvChown
+	origChmod := chvChmod
+	defer func() { chvChown = origChown; chvChmod = origChmod }()
+	chvChown = func(path string, uid, gid int) error { return nil }
+	chvChmod = func(path string, mode os.FileMode) error { return os.ErrPermission }
+
+	opts := chvOpts(t)
+	err := chvPrepareVirtiofsdOwnership(t.TempDir(), t.TempDir(), opts.VirtiofsdUID, opts.VirtiofsdGID)
+	if err == nil {
+		t.Fatal("chvPrepareVirtiofsdOwnership swallowed a chmod failure")
+	}
+}
+
+// TestRestoreCallsCheckSocketDirWritable covers fix round 11's wiring: Restore
+// must call the new writability check (via the indirected
+// chvCheckSocketDirWritable) with runDir and the configured VirtiofsdUID/GID,
+// and must abort — before any process spawn, so no binaries and no KVM are
+// needed — if that check fails. Mirrors TestRestoreChecksWorkspaceReachableBeforeVirtiofsd's
+// structure exactly, for the same reason: without this, a mutation that
+// deleted the call site, or passed the wrong path/uid/gid (e.g.
+// req.WorkspaceDir instead of runDir), would pass every other test in this
+// file.
+func TestRestoreCallsCheckSocketDirWritable(t *testing.T) {
+	// Bypass the two checks upstream of the one under test, for the same
+	// documented reasons their own tests bypass their upstream neighbors: real
+	// chown fails non-root, and real ancestor-reachability of a t.TempDir()
+	// workspace depends on this machine's own temp-directory layout, neither of
+	// which this test is about.
+	origPrepare := chvPrepareOwnership
+	origReachable := chvCheckWorkspaceReachable
+	defer func() { chvPrepareOwnership = origPrepare; chvCheckWorkspaceReachable = origReachable }()
+	chvPrepareOwnership = func(runDir, workspaceDir string, uid, gid int) error { return nil }
+	chvCheckWorkspaceReachable = func(path string, uid, gid uint32) error { return nil }
+
+	origWritable := chvCheckSocketDirWritable
+	defer func() { chvCheckSocketDirWritable = origWritable }()
+
+	type call struct {
+		path     string
+		uid, gid uint32
+	}
+	var got []call
+	sentinel := errors.New("sentinel: socket dir not writable")
+	chvCheckSocketDirWritable = func(path string, uid, gid uint32) error {
+		got = append(got, call{path, uid, gid})
+		return sentinel
+	}
+
+	opts := chvOpts(t)
+	lc, err := NewCloudHypervisorLauncher(opts)
+	if err != nil {
+		t.Fatalf("NewCloudHypervisorLauncher: %v", err)
+	}
+	workspaceDir := t.TempDir()
+	vm, err := lc.Restore(context.Background(), RestoreRequest{
+		ID: "vm-chv-socket-writable", Key: "run-a", WorkspaceDir: workspaceDir, GuestRAMBytes: 256 << 20,
+	})
+
+	if err == nil {
+		t.Fatal("Restore returned nil error despite chvCheckSocketDirWritable failing")
+	}
+	if vm != nil {
+		t.Fatalf("Restore returned a non-nil VM alongside an error: %v", vm)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Restore's error does not wrap the sentinel: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("chvCheckSocketDirWritable called %d times via Restore, want 1: %+v", len(got), got)
+	}
+	c := got[0]
+	wantRunDir := filepath.Join(opts.RunDir, "vm-chv-socket-writable")
+	if c.path != wantRunDir {
+		t.Fatalf("chvCheckSocketDirWritable called with path %q, want runDir %q (not workspaceDir %q)", c.path, wantRunDir, workspaceDir)
+	}
+	if c.uid != uint32(opts.VirtiofsdUID) || c.gid != uint32(opts.VirtiofsdGID) {
+		t.Fatalf("chvCheckSocketDirWritable called with %d:%d, want configured %d:%d",
+			c.uid, c.gid, opts.VirtiofsdUID, opts.VirtiofsdGID)
+	}
+}
+
+// TestRestoreFailsWhenSocketDirNotWritable is fix round 11's mutation test run
+// for real, through the actual Restore entry point rather than the seam
+// above: runDir is created by Restore's own os.MkdirAll(runDir, 0o700), owned
+// by this test's own uid — never chvOpts's VirtiofsdUID 65534 — so the real
+// chvCheckSocketDirWritable (checkPathWritableBy) must refuse it exactly as
+// virtiofsd itself would fail to create its socket and ".pid" sidecar file
+// there. This reproduces the rig's failure shape ("Error creating pid file
+// ...: Permission denied") without root, virtiofsd, or cloud-hypervisor.
+//
+// chvPrepareOwnership is stubbed out because its real chown to VirtiofsdUID
+// fails non-root before Restore ever reaches the check under test (same
+// documented limitation as TestRestoreFailsWhenWorkspaceIsUnreachable);
+// critically, that stub is what leaves runDir's mode at MkdirAll's untouched
+// 0700 for this test to observe — a real chvPrepareOwnership would have
+// chmod'd it, just not to a mode uid 65534 could write into as "other" either,
+// since chmod alone cannot make a directory this test owns writable by uid
+// 65534 without root. chvCheckWorkspaceReachable is likewise stubbed to nil so
+// this test is about socket-dir writability specifically, not workspace
+// ancestor traversal (already covered by TestRestoreFailsWhenWorkspaceIsUnreachable).
+func TestRestoreFailsWhenSocketDirNotWritable(t *testing.T) {
+	origPrepare := chvPrepareOwnership
+	origReachable := chvCheckWorkspaceReachable
+	defer func() { chvPrepareOwnership = origPrepare; chvCheckWorkspaceReachable = origReachable }()
+	chvPrepareOwnership = func(runDir, workspaceDir string, uid, gid int) error { return nil }
+	chvCheckWorkspaceReachable = func(path string, uid, gid uint32) error { return nil }
+
+	opts := chvOpts(t)
+	lc, err := NewCloudHypervisorLauncher(opts)
+	if err != nil {
+		t.Fatalf("NewCloudHypervisorLauncher: %v", err)
+	}
+	workspaceDir := t.TempDir()
+
+	vm, err := lc.Restore(context.Background(), RestoreRequest{
+		ID: "vm-chv-socket-unwritable", Key: "run-a", WorkspaceDir: workspaceDir, GuestRAMBytes: 256 << 20,
+	})
+	if err == nil {
+		t.Fatal("Restore with a socket dir not writable by the configured uid: want error, got nil")
+	}
+	if vm != nil {
+		t.Fatalf("Restore returned a non-nil VM alongside an error: %v", vm)
+	}
+	wantRunDir := filepath.Join(opts.RunDir, "vm-chv-socket-unwritable")
+	for _, want := range []string{wantRunDir, "0700", "65534"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Restore error %q: missing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestDestroyRemovesVirtiofsdPidFile covers deliverable (d) of fix round 11
+// honestly: rather than adding new cleanup code for virtiofsd's
+// "<socket>.pid" sidecar file, this proves the cleanup Destroy() already has —
+// os.RemoveAll(v.runDir), wholesale, unconditionally — already removes it, the
+// same way it already removes cloud-hypervisor's own ".sock.lock" and every
+// other file virtiofsd or cloud-hypervisor drop into runDir. No literal
+// "*.sock.lock" or "*.pid" handling exists anywhere in this file; runDir's
+// entire contents are disposable by construction, and this test pins that
+// invariant so a future change narrowing Destroy's cleanup (e.g. switching
+// from RemoveAll to removing a fixed list of known filenames) would be caught
+// here rather than resurfacing as a leaked .pid file on a real rig.
+func TestDestroyRemovesVirtiofsdPidFile(t *testing.T) {
+	runDir := t.TempDir()
+	pidFile := filepath.Join(runDir, "vfsd.sock.pid")
+	if err := os.WriteFile(pidFile, []byte("12345\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile %s: %v", pidFile, err)
+	}
+
+	v := &chvVM{id: "vm-chv-pid-cleanup", key: "run-a", runDir: runDir}
+	if err := v.Destroy(); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+
+	if _, err := os.Stat(runDir); !os.IsNotExist(err) {
+		t.Fatalf("runDir %s still exists after Destroy (stat err: %v); virtiofsd's .pid file would leak", runDir, err)
+	}
+}
+
 func TestCloudHypervisorRestoresPausedAndRunsOneCommand(t *testing.T) {
 	requireKVM(t)
 	if _, err := exec.LookPath(chvOpts(t).CHVBin); err != nil {

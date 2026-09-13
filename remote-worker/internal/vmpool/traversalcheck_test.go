@@ -126,3 +126,115 @@ func TestCheckPathTraversableByAllowsOwnerWhenUIDMatches(t *testing.T) {
 		t.Fatalf("checkPathTraversableBy(%s, %d, %d) with the ancestor's own owning uid:gid: %v", leaf, uid, gid, err)
 	}
 }
+
+// TestCheckPathWritableByDetectsUnwritableDir is fix round 11's direct
+// (non-Restore) mutation test for checkPathWritableBy, done for real rather
+// than through a fake seam — the same shape as
+// TestCheckPathTraversableByDetectsBlockingAncestor, but checking the LEAF
+// directory itself (write+execute) instead of an ancestor (execute only): a
+// genuine 0700 directory, owned by whatever uid runs `go test` (never 65534 in
+// any environment this suite runs in), is not writable by uid:gid 65534:65534
+// — exactly virtiofsd's own configured identity (chvOpts), and exactly the
+// shape of the rig's "Error creating pid file ...: Permission denied": runDir
+// itself, not one of its ancestors, is the directory virtiofsd could not
+// write its socket and .pid sidecar file into.
+func TestCheckPathWritableByDetectsUnwritableDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod %s to 0700: %v", dir, err)
+	}
+
+	err := checkPathWritableBy(dir, 65534, 65534)
+	if err == nil {
+		t.Fatalf("checkPathWritableBy(%s, 65534, 65534): want error (dir is 0700, "+
+			"owned by this test's own uid, not 65534), got nil", dir)
+	}
+	for _, want := range []string{dir, "65534", "0700"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("checkPathWritableBy error %q: missing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestCheckPathWritableByAllowsWorldWritableDir is the pass case: a directory
+// granting write+execute to "other" (0777) is writable by an arbitrary
+// uid:gid that owns neither it nor its group — pinning canWrite's "other"
+// class branch, the one virtiofsd's unprivileged uid actually depends on in
+// production (this launcher's chvChmod sets runDir to 0700 owner-only, not
+// world-writable, but canWrite's other-class arithmetic is exercised here
+// independently of what this launcher happens to choose to chmod to).
+func TestCheckPathWritableByAllowsWorldWritableDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatalf("chmod %s to 0777: %v", dir, err)
+	}
+	if err := checkPathWritableBy(dir, 65534, 65534); err != nil {
+		t.Fatalf("checkPathWritableBy(%s, 65534, 65534) with a world-writable dir: %v", dir, err)
+	}
+}
+
+// TestCheckPathWritableByRejectsExecuteOnlyDir pins the one detail that makes
+// checkPathWritableBy a genuinely different check from checkPathTraversableBy
+// rather than a copy of it with a different error message: canWrite requires
+// write AND execute together per permission class (0o3), not execute alone
+// (0o1, canTraverse's own bit) — a directory an uid can enter but not create
+// entries in (mode 0701: "other" gets --x, no w) is exactly what virtiofsd's
+// bind()+".pid"-file-create needs and traversal alone does not provide. A
+// canWrite that checked only the execute bit (silently degrading into
+// canTraverse) would pass every other test in this file — none of them uses a
+// mode with execute set but write cleared for the class under test — so this
+// one exists specifically to catch that reduction.
+func TestCheckPathWritableByRejectsExecuteOnlyDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o701); err != nil {
+		t.Fatalf("chmod %s to 0701: %v", dir, err)
+	}
+
+	// canTraverse (the OTHER function's bit test) must still consider this mode
+	// traversable by 65534:65534 -- confirming this mode really does isolate
+	// "execute granted, write not" rather than accidentally testing a
+	// fully-blocked directory a weakened canWrite could pass for the wrong
+	// reason. This deliberately calls canTraverse directly rather than
+	// checkPathTraversableBy(dir's own ancestors, which include this test's
+	// t.TempDir() parent levels (0700, owned by this test's own uid) and are
+	// not the point of this test -- see
+	// TestCheckPathTraversableByAllowsWorldExecutableAncestors's doc comment
+	// for why walking those for real would fail for unrelated reasons.
+	ownerUID, ownerGID, mode, err := statOwnerMode(dir)
+	if err != nil {
+		t.Skipf("statOwnerMode(%s): %v (this platform cannot verify ownership; see device_other.go)", dir, err)
+	}
+	if !canTraverse(mode, ownerUID, ownerGID, 65534, 65534) {
+		t.Fatalf("canTraverse(mode 0701, ..., 65534, 65534) = false, want true -- this test needs " +
+			"a mode where \"other\" can traverse but not write to isolate canWrite's extra bit")
+	}
+
+	werr := checkPathWritableBy(dir, 65534, 65534)
+	if werr == nil {
+		t.Fatalf("checkPathWritableBy(%s, 65534, 65534): want error (dir is 0701 -- other can "+
+			"traverse but not write), got nil", dir)
+	}
+	if !strings.Contains(werr.Error(), "0701") {
+		t.Fatalf("checkPathWritableBy error %q: missing %q", werr.Error(), "0701")
+	}
+}
+
+// TestCheckPathWritableByAllowsOwnerWhenUIDMatches mirrors
+// TestCheckPathTraversableByAllowsOwnerWhenUIDMatches for canWrite's owner
+// class branch: a 0700 directory owned by exactly the uid:gid being checked is
+// writable by it — this is what makes runDir's own chvChmod(runDir, 0o700)
+// correct in production, where VirtiofsdUID/GID is also the uid chvChown just
+// gave runDir, so the owner class (not "other") governs.
+func TestCheckPathWritableByAllowsOwnerWhenUIDMatches(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod %s to 0700: %v", dir, err)
+	}
+	uid, gid, _, err := statOwnerMode(dir)
+	if err != nil {
+		t.Skipf("statOwnerMode(%s): %v (this platform cannot verify ownership; see device_other.go)", dir, err)
+	}
+	if err := checkPathWritableBy(dir, uid, gid); err != nil {
+		t.Fatalf("checkPathWritableBy(%s, %d, %d) with the dir's own owning uid:gid: %v", dir, uid, gid, err)
+	}
+}
