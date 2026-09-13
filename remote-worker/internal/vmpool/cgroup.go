@@ -171,17 +171,36 @@ func isPoolVMCgroupDirName(name string) bool {
 // name, and a filter that assumes what the caller's cgroup is called is the same species
 // of premise that produced H1 in the first place.
 func callersOwnCgroupDir() string {
-	b, err := os.ReadFile("/proc/self/cgroup")
+	b, err := os.ReadFile(selfCgroupProcPath)
 	if err != nil {
 		return ""
 	}
-	for _, line := range strings.Split(string(b), "\n") {
+	return parseSelfCgroupV2(string(b))
+}
+
+// selfCgroupProcPath is the file callersOwnCgroupDir reads. A constant, not a variable, so
+// nothing can repoint it at runtime; the PARSING is what gets tested, via
+// parseSelfCgroupV2 below.
+const selfCgroupProcPath = "/proc/self/cgroup"
+
+// parseSelfCgroupV2 extracts the cgroup v2 (unified) path from /proc/self/cgroup's
+// content. Split out from the file read for one reason: the read only ever succeeds on
+// Linux, and a parse that can only be exercised on the deployment platform is a parse
+// nothing checks — which is precisely the shape of final-review H2 (a Linux-only code path
+// that was wrong on every Linux host and invisible on darwin). This function is driven
+// against real /proc/self/cgroup content, including the systemd-shaped line this worker
+// actually runs under, by TestParseSelfCgroupV2 on darwin.
+//
+// Returns "" for anything with no usable v2 path, the root cgroup included: there is no
+// meaningful directory to exclude when the caller is at the root.
+func parseSelfCgroupV2(content string) string {
+	for _, line := range strings.Split(content, "\n") {
 		// cgroup v2 unified: "0::<path>". v1 lines carry a non-zero hierarchy id and a
 		// controller list, and are not what any of this deals with (D2: both the dev
 		// host and the production box are cgroup2 unified).
 		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "0::"); ok {
 			if rest == "" || rest == "/" {
-				return "" // the root cgroup: no meaningful directory to exclude
+				return ""
 			}
 			return rest
 		}

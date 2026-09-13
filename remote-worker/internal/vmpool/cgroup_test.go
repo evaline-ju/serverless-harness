@@ -228,6 +228,62 @@ func TestSweepOrphansRecognisesBothArmsCgroupNames(t *testing.T) {
 	}
 }
 
+// TestParseSelfCgroupV2 drives guard 2's parse on darwin. The file it normally reads,
+// /proc/self/cgroup, exists only on Linux — and a parse exercised only on the deployment
+// platform is a parse nothing checks, which is exactly how final-review H2 shipped a
+// Linux-only expression that was wrong on every Linux host. The inputs below are real
+// /proc/self/cgroup shapes, including the systemd one this worker actually runs under.
+func TestParseSelfCgroupV2(t *testing.T) {
+	for _, tc := range []struct{ name, in, want string }{
+		{"systemd-managed service (the shipped shape)", "0::/microvm-vms.slice/microvm-worker.service\n", "/microvm-vms.slice/microvm-worker.service"},
+		{"a transient scope", "0::/microvm-vms.slice/vm-vm-9.scope\n", "/microvm-vms.slice/vm-vm-9.scope"},
+		{"root cgroup is not a directory worth excluding", "0::/\n", ""},
+		{"hybrid host: the v2 line is picked out of the v1 ones",
+			"12:pids:/user.slice\n1:name=systemd:/user.slice/session-3.scope\n0::/user.slice/session-3.scope\n",
+			"/user.slice/session-3.scope"},
+		{"cgroup v1 only: no unified line at all", "12:pids:/user.slice\n1:name=systemd:/init.scope\n", ""},
+		{"empty (what a non-Linux read yields before this is even called)", "", ""},
+	} {
+		if got := parseSelfCgroupV2(tc.in); got != tc.want {
+			t.Errorf("%s: parseSelfCgroupV2(%q) = %q, want %q", tc.name, tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestIsCallersOwnCgroupMatchesAcrossTheMountAnchorDifference covers guard 2's comparison.
+// The two paths it compares are anchored differently on purpose — /proc/self/cgroup's path
+// is relative to the cgroup2 mount, while the sweep walks filesystem paths — and what is
+// asserted here is that the suffix match bridges that with no false NEGATIVE for the case
+// that matters, and that its only failure direction is the safe one (refusing to sweep).
+func TestIsCallersOwnCgroupMatchesAcrossTheMountAnchorDifference(t *testing.T) {
+	self := "/microvm-vms.slice/microvm-worker.service"
+
+	// The case H1 was: the worker's own cgroup, met as a filesystem path under the slice.
+	if !isCallersOwnCgroup("/sys/fs/cgroup/microvm-vms.slice/microvm-worker.service", self) {
+		t.Error("guard 2 did not recognise the caller's own cgroup as a cgroupfs path")
+	}
+	// A sibling VM cgroup in the same slice must NOT match, or the sweep would refuse
+	// every orphan and silently stop working.
+	for _, sibling := range []string{
+		"/sys/fs/cgroup/microvm-vms.slice/vm-9",
+		"/sys/fs/cgroup/microvm-vms.slice/vm-vm-9.scope",
+	} {
+		if isCallersOwnCgroup(sibling, self) {
+			t.Errorf("guard 2 refused %q, a sibling VM cgroup — the sweep would never remove an orphan", sibling)
+		}
+	}
+	// An ancestor of the caller's cgroup is refused too (a misconfigured SH_PARENT_CGROUP
+	// pointing above the slice).
+	if !isCallersOwnCgroup("/sys/fs/cgroup/microvm-vms.slice", self) {
+		t.Error("guard 2 did not refuse an ancestor of the caller's own cgroup")
+	}
+	// And with no self path — every non-Linux platform, and a v1-only host — the guard is
+	// inert rather than refusing everything. Guards 1 and 3 stand alone there.
+	if isCallersOwnCgroup("/sys/fs/cgroup/microvm-vms.slice/vm-9", "") {
+		t.Error("guard 2 refused a directory with no known self cgroup; it must be inert, not absolute")
+	}
+}
+
 // TestSweepOrphansNeverSignalsTheCallerItself is the innermost of the three guards
 // (name allowlist, own-cgroup exclusion, pid refusal). Even if a directory filter were
 // wrong again, the pid layer must refuse the calling process, its process-group leader,
