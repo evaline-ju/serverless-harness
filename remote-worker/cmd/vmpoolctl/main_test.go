@@ -227,8 +227,68 @@ func TestModeTeardownVariantsAreDistinct(t *testing.T) {
 		_ = json.Unmarshal([]byte(strings.TrimSpace(out)), &rec)
 		// Spec §7.2 rung 4: three variants, because "the per-VM number does not predict"
 		// the bulk reclaim the sweep actually performs.
-		if rec.Mode != mode || rec.P50DestroyUs == 0 {
-			t.Fatalf("%s: rec = %+v", mode, rec)
+		//
+		// The MAGNITUDE of the destroy term is deliberately NOT asserted here. A fake
+		// Destroy() returns in well under a microsecond, so p50 rounds to 0 on a fast
+		// machine: the previous `rec.P50DestroyUs == 0` check failed 8 runs in 12 on an
+		// idle laptop and would have flaked in CI. Asserting a duration is nonzero
+		// asserts that the clock had resolution, not that the code under test works.
+		// Real magnitudes come from the rig run; what this test can honestly establish
+		// is the STRUCTURE of the record, which is timing-independent.
+		if rec.Mode != mode {
+			t.Fatalf("%s: Mode = %q, want %q (rec = %+v)", mode, rec.Mode, mode, rec)
+		}
+		// A teardown rung measures destroy, not run. If mode wiring regressed to exec,
+		// a run term would appear here — which is what makes this assertion carry
+		// weight rather than merely pass.
+		if rec.P50RunUs != 0 {
+			t.Fatalf("%s: P50RunUs = %d, want 0 — a teardown rung has no run term", mode, rec.P50RunUs)
+		}
+		// The destroy term IS the whole measurement in these modes, so total tracks it
+		// at any clock resolution, including when both round to 0.
+		if rec.P50TotalUs != rec.P50DestroyUs {
+			t.Fatalf("%s: P50TotalUs = %d but P50DestroyUs = %d — destroy should be the whole term",
+				mode, rec.P50TotalUs, rec.P50DestroyUs)
+		}
+		if rec.P50DestroyUs < 0 {
+			t.Fatalf("%s: P50DestroyUs = %d, want >= 0", mode, rec.P50DestroyUs)
+		}
+	}
+}
+
+func TestUnknownModeIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	// A typo in a mode name must be a refusal, not a plausible-looking result: every
+	// percentile of an undispatched rung is 0, which reads exactly like a real rung
+	// whose timings fell below clock resolution.
+	out, err := run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+		"--key=run-a", "--mode=teardown-inflght", "--iterations=3", "--json", "--", "true")
+	if err == nil {
+		t.Fatalf("a misspelled --mode was accepted and produced: %s", out)
+	}
+	// The message must name the offending value AND the accepted set — an error that
+	// says only "invalid mode" makes the operator re-read the source to find the list.
+	msg := err.Error()
+	if !strings.Contains(msg, "teardown-inflght") || !strings.Contains(msg, "teardown-bulk") {
+		t.Fatalf("error names neither the bad value nor the valid set: %v", err)
+	}
+}
+
+func TestEveryValidModeIsDispatched(t *testing.T) {
+	// The accepted-mode list and realMain's dispatch switch are two lists that must
+	// agree, and nothing structural forces them to. A mode present in the validator but
+	// absent from the dispatcher passes validation, falls through, and yields an
+	// all-zeros record at exit 0. Running every accepted mode is what keeps them
+	// agreeing; the dispatcher's default case is what makes a divergence loud.
+	for _, mode := range []string{"exec", "replenish", "teardown-inflight", "teardown-standby", "teardown-bulk"} {
+		dir := t.TempDir()
+		out, err := run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+			"--key=run-a", "--mode="+mode, "--iterations=2", "--json", "--", "true")
+		if err != nil && strings.Contains(err.Error(), "diverged") {
+			t.Fatalf("%s is accepted by the validator but not dispatched: %v", mode, err)
+		}
+		if err != nil {
+			t.Fatalf("%s: %v (%s)", mode, err, out)
 		}
 	}
 }

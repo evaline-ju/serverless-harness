@@ -220,6 +220,19 @@ func realMain(args []string, stdout io.Writer) error {
 		samples, firstErr = runTeardownPerVMMode(hooks, *mode, *key, *wsRoot, *iterations, warmupN, &res)
 	case "teardown-bulk":
 		samples, firstErr = runTeardownBulkMode(hooks, *key, *iterations, *depth, &res)
+	default:
+		// Guards DIVERGENCE between two lists that must agree: the flag validator's
+		// accepted set (see the switch near the top of realMain) and this dispatcher's
+		// cases. A mode added to the validator but not here would pass validation and
+		// then fall straight through, leaving `samples` nil so every percentile computed
+		// as 0 — while the process still exited 0. That record is indistinguishable from
+		// a real rung whose timings fell below clock resolution, which is the same shape
+		// as E11's mem_available_bytes defect (a sweep that wrote zero records and
+		// exited 0). Unreachable while the two lists agree; TestEveryValidModeIsDispatched
+		// is what keeps them agreeing, and this is what makes the disagreement loud
+		// instead of silent.
+		return fmt.Errorf("vmpoolctl: --mode %q passed validation but is not dispatched "+
+			"(the validator's mode list and realMain's dispatch switch have diverged)", *mode)
 	}
 	res.WarmupDiscarded = warmupN
 
