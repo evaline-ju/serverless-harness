@@ -190,10 +190,66 @@ if [ -n "$verdict_body" ]; then
   case "$out" in *"RE-PRICED"*) row4mid=yes ;; *) row4mid=no ;; esac
   check "replenishment (metal, [25,50]ms): RE-PRICED" "$row4mid" "yes"
 
-  # Replenishment proceed.
+  # Replenishment proceed. Matched on the row-1 PHRASE, not on the substring
+  # "PROCEED", which "PROCEED, RE-PRICED" also contains -- so the old form of this
+  # check could not tell row 1 from row 2 at all.
   out="$(run_verdict metal 3 2 10)"
-  case "$out" in *"PROCEED"*) row4ok=yes ;; *) row4ok=no ;; esac
-  check "replenishment (metal, <25ms): PROCEED" "$row4ok" "yes"
+  repl_line="$(echo "$out" | sed -n 's/^repl_verdict=//p')"
+  case "$repl_line" in "PROCEED - "*) row4ok=yes ;; *) row4ok=no ;; esac
+  check "replenishment (metal, <25ms): row 1 PROCEED, not row 2 RE-PRICED" "$row4ok" "yes"
+
+  # -------------------------------------------------------------------------
+  # The NESTED replenishment half (final review M2). Spec §7.2's row 1 sets TWO dual
+  # thresholds -- warm hot path < 5ms metal / < 8ms nested AND replenishment CPU
+  # < 25ms metal / < 40ms nested -- and only the first was honoured. The warm path
+  # already had a nested case above; these three cover the half that did not, which
+  # is why M2 shipped: all three replenishment cases passed `metal`, so the untested
+  # half was exactly the wrong half.
+  #
+  # RULING 20-B makes nested the only substrate this project has, so [25, 40) ms is
+  # the band an actual run is most likely to land in.
+  # -------------------------------------------------------------------------
+  repl_verdict_of() { echo "$1" | sed -n 's/^repl_verdict=//p'; }
+
+  # 30ms on nested: spec row 1 (< 40ms nested) -> PROCEED, not RE-PRICED.
+  out="$(run_verdict nested-m8i 3 2 30)"
+  repl_line="$(repl_verdict_of "$out")"
+  case "$repl_line" in "PROCEED - "*) n30=yes ;; *) n30=no ;; esac
+  check "replenishment (nested, 30ms): row 1 PROCEED - the spec's nested threshold is 40ms" "$n30" "yes"
+  case "$repl_line" in *RE-PRICED*) n30r=yes ;; *) n30r=no ;; esac
+  check "  ...and NOT row 2's RE-PRICED (M2's misclassification)" "$n30r" "no"
+  # The labelling half of M2: a nested measurement must never be given a metal band.
+  case "$repl_line" in *metal*) n30m=yes ;; *) n30m=no ;; esac
+  check "  ...and the text never labels a nested number with a 'metal' band (RULING 20-B)" "$n30m" "no"
+  case "$repl_line" in *nested-m8i*) n30s=yes ;; *) n30s=no ;; esac
+  check "  ...and DOES name the actual substrate" "$n30s" "yes"
+
+  # 45ms on nested: above 40ms, at or below 50ms -> row 2, and the band it names must
+  # be this substrate's [40,50], not metal's [25,50].
+  out="$(run_verdict nested-m8i 3 2 45)"
+  repl_line="$(repl_verdict_of "$out")"
+  case "$repl_line" in *"RE-PRICED"*) n45=yes ;; *) n45=no ;; esac
+  check "replenishment (nested, 45ms): row 2 RE-PRICED (>= the 40ms nested threshold)" "$n45" "yes"
+  case "$repl_line" in *"[40,50]"*) n45b=yes ;; *) n45b=no ;; esac
+  check "  ...and names the [40,50]ms band for this substrate, not metal's [25,50]" "$n45b" "yes"
+  case "$repl_line" in *metal\ band*) n45m=yes ;; *) n45m=no ;; esac
+  check "  ...and never calls it a 'metal band'" "$n45m" "no"
+
+  # Boundary, both directions, so the cutoff is pinned at 40 rather than merely
+  # somewhere between 30 and 45: 39.9ms is row 1, 40ms is row 2.
+  out="$(run_verdict nested-m8i 3 2 39.9)"
+  case "$(repl_verdict_of "$out")" in "PROCEED - "*) nb1=yes ;; *) nb1=no ;; esac
+  check "replenishment (nested, 39.9ms): still row 1 (strictly below 40)" "$nb1" "yes"
+  out="$(run_verdict nested-m8i 3 2 40)"
+  case "$(repl_verdict_of "$out")" in *RE-PRICED*) nb2=yes ;; *) nb2=no ;; esac
+  check "replenishment (nested, 40ms exactly): row 2 (the band is [40,50] inclusive)" "$nb2" "yes"
+
+  # And the metal boundary is unchanged by all of this -- 30ms on METAL is still row 2.
+  # Without this, moving the nested cutoff could have moved metal's with it unnoticed.
+  out="$(run_verdict metal 3 2 30)"
+  repl_line="$(repl_verdict_of "$out")"
+  case "$repl_line" in *"[25,50]ms metal band"*) mb=yes ;; *) mb=no ;; esac
+  check "replenishment (metal, 30ms): STILL row 2's [25,50]ms metal band (unchanged)" "$mb" "yes"
 
   echo "== E9's structural-incapacity property: never STOP/MANDATORY off metal"
   # Extreme inputs that DO trigger STOP and MANDATORY on metal (non-vacuousness

@@ -387,15 +387,36 @@ run_vmpoolctl_rungs() {
 # Prints: three lines - ratio=, warm_verdict=, repl_verdict=.
 verdict() {
   local substrate="$1" warm_ms="$2" container_ms="$3" repl_ms="$4"
-  local ratio warm_cutoff warm_verdict repl_verdict is_metal=0
+  local ratio warm_cutoff repl_cutoff warm_verdict repl_verdict is_metal=0
 
   [ "$substrate" = "metal" ] && is_metal=1
 
   ratio="$(awk -v w="$warm_ms" -v c="$container_ms" 'BEGIN{ if (c>0) printf "%.2f", w/c; else print "inf" }')"
 
-  # Row 1/2 boundary: < 5ms metal / < 8ms nested (spec §7.2, explicit dual threshold).
+  # Spec §7.2's row 1 carries TWO dual thresholds on the SAME line, "because nested virt
+  # taxes exactly the VM-exit-heavy work restore consists of":
+  #
+  #   Warm hot path < 5ms metal / < 8ms nested
+  #   AND replenishment CPU < 25ms metal / < 40ms nested
+  #
+  # Final review M2: only the first was honoured here. The replenishment boundary was
+  # hard-coded at 25/50 with no nested analogue, so on the nested rig -- per RULING 20-B
+  # the only substrate this project has -- a replenishment CPU anywhere in [25, 40) ms was
+  # put in row 2 ("proceed, re-priced, split pre-authorised if the ratio exceeds 2x") when
+  # the spec's own nested threshold puts it in row 1 ("proceed as designed"), AND the
+  # verdict text labelled that nested measurement with a "metal band". Both halves matter:
+  # the row was wrong for the substrate, and labelling a nested number with a metal band is
+  # the exact substrate conflation this script's discipline exists to prevent.
+  #
+  # Rows 2, 3 and 4 keep their metal-only 15ms / [25,50] / 50ms figures, because the spec
+  # qualifies each of those with "metal" explicitly and states "nested fires no stop rule"
+  # rather than inventing further nested thresholds. Only the row-1 boundaries are dual, so
+  # only they are parameterised: off metal, row 2's lower edge moves to repl_cutoff and its
+  # text says so, and no path can print STOP or MANDATORY (hardware-corrections E9).
   warm_cutoff=5
   [ "$is_metal" -eq 1 ] || warm_cutoff=8
+  repl_cutoff=25
+  [ "$is_metal" -eq 1 ] || repl_cutoff=40
 
   if awk -v w="$warm_ms" 'BEGIN{exit !(w>=15)}'; then
     # Row 3: warm hot path >= 15ms. "'>= 15ms' stays a hard stop regardless of ratio."
@@ -428,10 +449,16 @@ verdict() {
     else
       repl_verdict="ABOVE 50ms on $substrate (${repl_ms}ms) - schedules a metal run; never mandatory except on metal"
     fi
-  elif awk -v r="$repl_ms" 'BEGIN{exit !(r>=25)}'; then
-    repl_verdict="PROCEED, RE-PRICED - replenishment CPU ${repl_ms}ms is in the [25,50]ms metal band; section 3.3 split pre-authorised if the warm-path ratio exceeds 2x"
+  elif awk -v r="$repl_ms" -v t="$repl_cutoff" 'BEGIN{exit !(r>=t)}'; then
+    # Row 2's replenishment half. Its lower edge is the row-1 boundary for THIS substrate.
+    if [ "$is_metal" -eq 1 ]; then
+      repl_verdict="PROCEED, RE-PRICED - replenishment CPU ${repl_ms}ms is in the [25,50]ms metal band; section 3.3 split pre-authorised if the warm-path ratio exceeds 2x"
+    else
+      repl_verdict="PROCEED, RE-PRICED on $substrate - replenishment CPU ${repl_ms}ms is in the [${repl_cutoff},50]ms band for $substrate; section 3.3 split pre-authorisation is contingent on confirming this on metal"
+    fi
   else
-    repl_verdict="PROCEED - replenishment CPU ${repl_ms}ms < 25ms metal"
+    # Row 1's replenishment half: below this substrate's own threshold.
+    repl_verdict="PROCEED - replenishment CPU ${repl_ms}ms < ${repl_cutoff}ms $substrate"
   fi
 
   echo "ratio=${ratio}x"
