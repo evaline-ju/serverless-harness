@@ -1,6 +1,7 @@
 package vmpool
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -82,6 +83,16 @@ func (v *fakeHostVM) Run(ctx context.Context, c Command, out Sink) (Result, erro
 
 	cmd := exec.CommandContext(ctx, "bash", "-c", c.Command)
 	cmd.Dir = v.dir
+	// c.Stdin wired through so vmpoolctl's --stdin flag is observable under
+	// --vmm=fake too (no /dev/kvm needed to prove it reaches the command) — spec
+	// §5.4's "commands that consume stdin need a freshly forked child in the
+	// guest" only has meaning on a real launcher (guestconn.go's
+	// HasStdin: len(c.Stdin) > 0 selects the guest agent's fresh-child path), but
+	// the byte-level plumbing from vmpool.Exec.Stdin down to here is common to
+	// every arm, so it belongs here rather than only on the two real launchers.
+	if len(c.Stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(c.Stdin)
+	}
 	stdout, err := cmd.Output()
 	if len(stdout) > 0 {
 		out.Stdout(stdout)

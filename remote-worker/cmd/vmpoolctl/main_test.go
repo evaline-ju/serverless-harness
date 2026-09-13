@@ -109,6 +109,55 @@ func TestAnUnquotedMultiWordCommandIsNotSilentlyTruncated(t *testing.T) {
 	}
 }
 
+// TestStdinFlagReachesTheCommand proves --stdin's byte-level plumbing all the way
+// down to the launcher, under --vmm=fake, with no /dev/kvm needed. The real payoff
+// (guest agent's HasStdin-driven parked-vs-fresh-child choice, spec §5.4) only
+// exists on a real launcher and cannot be exercised here — but the flag reaching
+// vmpool.Exec.Stdin, which becomes vmpool.Command.Stdin (pool.go), which is what
+// guestconn.go's HasStdin: len(c.Stdin) > 0 actually tests, is exactly the part
+// this binary owns and can prove locally. E10's driver relies on an empty --stdin
+// vs a non-empty one being the one knob that flips that boolean.
+func TestStdinFlagReachesTheCommand(t *testing.T) {
+	dir := t.TempDir()
+	out, err := run(t,
+		"--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+		"--key=run-stdin", "--iterations=1", "--stdin=hello-from-stdin",
+		"--", "cat > out.txt")
+	if err != nil {
+		t.Fatalf("realMain: %v (out=%s)", err, out)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "run-stdin", "out.txt"))
+	if err != nil {
+		t.Fatalf("workspace file missing — --stdin never reached the command: %v", err)
+	}
+	if want := "hello-from-stdin"; string(got) != want {
+		t.Fatalf("out.txt = %q, want %q", got, want)
+	}
+}
+
+// TestStdinFlagDefaultsToEmpty guards the other half of TestStdinFlagReachesTheCommand:
+// a run with no --stdin must not carry any (e.g. from a stale default), or a rung
+// meant to price the parked-bash path (spec §5.4) would silently exercise the
+// fresh-child path instead. `cat` with no stdin and stdin closed exits 0 with empty
+// output; a nonzero exit or nonempty out.txt here would mean stdin leaked in.
+func TestStdinFlagDefaultsToEmpty(t *testing.T) {
+	dir := t.TempDir()
+	out, err := run(t,
+		"--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+		"--key=run-nostdin", "--iterations=1",
+		"--", "cat > out.txt; wc -c < out.txt > count.txt")
+	if err != nil {
+		t.Fatalf("realMain: %v (out=%s)", err, out)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "run-nostdin", "count.txt"))
+	if err != nil {
+		t.Fatalf("workspace file missing: %v", err)
+	}
+	if want := "0"; strings.TrimSpace(string(got)) != want {
+		t.Fatalf("count.txt = %q, want %q (no --stdin must mean no stdin bytes reach the command)", got, want)
+	}
+}
+
 func TestRefusesAnEmptyKey(t *testing.T) {
 	dir := t.TempDir()
 	_, err := run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir, "--key=", "--", "true")
@@ -133,4 +182,73 @@ func sumUint(m map[string]uint64) uint64 {
 		n += v
 	}
 	return n
+}
+
+func TestModeReplenishMeasuresRestoreOnly(t *testing.T) {
+	dir := t.TempDir()
+	out, err := run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+		"--key=run-a", "--mode=replenish", "--iterations=4", "--warmup=1", "--json", "--", "true")
+	if err != nil {
+		t.Fatalf("realMain: %v (%s)", err, out)
+	}
+	var rec runResult
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rec); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, out)
+	}
+	// Rung 3 measures spawn -> restore -> pause -> ready, WALL AND CPU. Spec §7.2: "The
+	// CPU number is what §7.3 divides into host capacity. Wall time alone misleads."
+	if rec.Mode != "replenish" || rec.P50AcquireUs == 0 {
+		t.Fatalf("rec = %+v", rec)
+	}
+	if rec.CPUChildUs < 0 {
+		t.Fatalf("CPUChildUs = %d", rec.CPUChildUs)
+	}
+	// No command ran, so there is no run term to report — reporting one would invite
+	// reading a replenishment rung as a hot-path rung.
+	if rec.P50RunUs != 0 {
+		t.Fatalf("P50RunUs = %d in replenish mode, want 0", rec.P50RunUs)
+	}
+	// Spec §7.5: "The first restore differs from the hundredth (page cache, THP,
+	// fragmentation). Discard warmup, report steady state."
+	if rec.WarmupDiscarded != 1 || rec.Iterations != 4 {
+		t.Fatalf("rec = %+v, want 1 warmup discarded out of 4", rec)
+	}
+}
+
+func TestModeTeardownVariantsAreDistinct(t *testing.T) {
+	dir := t.TempDir()
+	for _, mode := range []string{"teardown-inflight", "teardown-standby", "teardown-bulk"} {
+		out, err := run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+			"--key=run-a", "--mode="+mode, "--iterations=3", "--json", "--", "true")
+		if err != nil {
+			t.Fatalf("%s: %v (%s)", mode, err, out)
+		}
+		var rec runResult
+		_ = json.Unmarshal([]byte(strings.TrimSpace(out)), &rec)
+		// Spec §7.2 rung 4: three variants, because "the per-VM number does not predict"
+		// the bulk reclaim the sweep actually performs.
+		if rec.Mode != mode || rec.P50DestroyUs == 0 {
+			t.Fatalf("%s: rec = %+v", mode, rec)
+		}
+	}
+}
+
+func TestEveryRecordCarriesItsSubstrate(t *testing.T) {
+	dir := t.TempDir()
+	out, _ := run(t, "--vmm=fake", "--snapshot-dir="+dir, "--workspace-root="+dir,
+		"--key=run-a", "--substrate=nested-c8i", "--json", "--", "true")
+	var rec runResult
+	_ = json.Unmarshal([]byte(strings.TrimSpace(out)), &rec)
+	// Spec §6: "Nested-virt vs metal divergence — Record the substrate in every run
+	// record." A rung whose substrate is unknown cannot be compared to any other.
+	if rec.Substrate != "nested-c8i" {
+		t.Fatalf("Substrate = %q", rec.Substrate)
+	}
+	// Spec §7.5: raise and record the kernel limits, because they "fail at 500 VMs after
+	// working at 20, indistinguishably from a real ceiling".
+	for _, k := range []string{"RLIMIT_MEMLOCK", "RLIMIT_NOFILE", "vm.max_map_count", "pid_max"} {
+		if _, ok := rec.Limits[k]; !ok {
+			t.Errorf("Limits is missing %s: %v", k, rec.Limits)
+		}
+	}
 }
