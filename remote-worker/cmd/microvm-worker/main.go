@@ -143,7 +143,16 @@ func launcherFor(kind vmpool.VMMKind, get func(string) string, snapDir string, p
 		// only it should decide — that "fake" and anything else are refused, so
 		// microvm-worker structurally has no host-execution fallback (spec §3.5), the
 		// one thing this file must NOT delegate to a helper vmpoolctl also calls.
-		return vmpool.LauncherFromEnv(kind, get, snapDir, perVMBytes, "/run/microvm-worker/chv")
+		//
+		// "microvm-worker" (last argument) is CloudHypervisor's chvRunDirName, not a
+		// path: fix round 10 stopped hardcoding a fixed /run/... RunDir default in
+		// favor of a same-device sibling of snapshotDir (chvDefaultRunDir, in
+		// launcher_env.go — see its doc comment and LauncherFromEnv's CloudHypervisor
+		// case for why /run could never actually work here once Restore started
+		// hardlinking snapshot files into it). This name only has to differ from
+		// vmpoolctl's own ("vmpoolctl") so the two never derive the identical default
+		// directory when pointed at the same snapshotDir.
+		return vmpool.LauncherFromEnv(kind, get, snapDir, perVMBytes, "microvm-worker")
 	default:
 		return nil, fmt.Errorf("SH_VMM=%q must be %q or %q; there is no host-execution fallback (spec §3.5)",
 			kind, vmpool.Firecracker, vmpool.CloudHypervisor)

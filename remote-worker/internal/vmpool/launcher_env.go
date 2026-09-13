@@ -1,9 +1,12 @@
 package vmpool
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // env and envInt64 back LauncherFromEnv below. They mirror the two helpers of the
@@ -30,6 +33,80 @@ func envInt64(get func(string) string, k string, def int64) (int64, error) {
 	return n, nil
 }
 
+// chvDefaultRunDir derives CloudHypervisor's default RunDir as a same-device sibling
+// of snapshotDir when SH_CHV_RUN_DIR is unset — see LauncherFromEnv's CloudHypervisor
+// case for why this replaced a hardcoded /run/<name> path (fix round 10, Task 16).
+// name discriminates each caller's default (e.g. "microvm-worker", "vmpoolctl") so two
+// callers pointed at the same snapshotDir never derive the identical RunDir.
+//
+// The derived directory is a SIBLING of snapshotDir (filepath.Dir(snapshotDir) is its
+// parent), never a CHILD of it: SnapshotDir is root-owned 0555 and hash-pinned in the
+// build manifest (deploy/microvm/build-snapshot.sh's lock_down), so nothing may create
+// or write beneath it. The guard below checks this directly on the derived path (not
+// just "trust the formula") because that is the exact regression
+// TestChvDefaultRunDirIsNotInsideSnapshotDir mutates in: changing the Join below to
+// nest under snapshotDir instead of beside it. This mirrors sameDeviceSiblingDir (this
+// package's own test helper, launcher_firecracker_test.go) and new_verify_dir() in
+// deploy/microvm/build-snapshot.sh, which solve the identical problem for their own
+// hardlink targets.
+//
+// createdHere reports whether this call created the directory (false if it already
+// existed — e.g. a second launcher construction against the same snapshotDir in the
+// same process, or a directory left over from this host's last run). Callers use it to
+// decide whether THEY are responsible for removing it again on a later failure — see
+// LauncherFromEnv's cleanupRunDir. If chvDefaultRunDir itself creates the directory but
+// the device-sharing self-check below then fails, it removes what it just created
+// before returning the error, rather than leaving an empty, unusable directory behind.
+//
+// The self-check re-uses checkPathsShareDevice — the same production machinery
+// checkDeviceSharing calls at pool.New — rather than trusting the sibling derivation
+// blindly: "same parent directory" is only "same device" on a normal layout, and an
+// unusual mount (e.g. a bind mount, or a parent that is itself a mount point) could
+// make filepath.Dir(snapshotDir) share a name but not a device with snapshotDir. Going
+// through checkPathsShareDevice means TestChvDefaultRunDirSelfCheckCatchesDeviceMismatch
+// can force a real mismatch through the withFakeDevices seam (devicecheck_test.go) and
+// confirm this function reacts correctly (error returned, directory removed if this
+// call created it), without needing this dev machine to actually have a second real
+// filesystem device — see deviceNumberFunc's doc comment on why it does not.
+func chvDefaultRunDir(snapshotDir, name string) (dir string, createdHere bool, err error) {
+	parent := filepath.Dir(snapshotDir)
+	dir = filepath.Join(parent, ".chv-run-"+name)
+	clean := filepath.Clean(snapshotDir)
+	if dir == clean || strings.HasPrefix(dir, clean+string(filepath.Separator)) {
+		return "", false, fmt.Errorf(
+			"vmpool: derived CloudHypervisor RunDir %s is inside SnapshotDir %s, not beside "+
+				"it — SnapshotDir is root-owned read-only and hash-pinned; RunDir must be a "+
+				"sibling (see chvDefaultRunDir's doc comment)", dir, snapshotDir)
+	}
+	if _, statErr := os.Stat(dir); statErr == nil {
+		createdHere = false
+	} else if errors.Is(statErr, os.ErrNotExist) {
+		// 0711 (execute-without-read), matching sameDeviceSiblingDir's own chmod: an
+		// unprivileged virtiofsd must be able to traverse INTO this directory's per-VM
+		// subdirectories without being able to list its other, unrelated siblings'
+		// contents. See that function's doc comment for the round-3 incident this
+		// mode fixed.
+		if mkErr := os.MkdirAll(dir, 0o711); mkErr != nil {
+			return "", false, fmt.Errorf("vmpool: creating default CloudHypervisor RunDir %s: %w", dir, mkErr)
+		}
+		createdHere = true
+	} else {
+		return "", false, fmt.Errorf("vmpool: stat default CloudHypervisor RunDir %s: %w", dir, statErr)
+	}
+	if chkErr := checkPathsShareDevice(
+		"Restore hardlinks the golden snapshot's vmstate and memory-ranges files into "+
+			"the run directory, and hardlink(2) cannot cross devices",
+		namedPath{"derived CloudHypervisor RunDir", dir},
+		namedPath{"CHVOptions.SnapshotDir", snapshotDir},
+	); chkErr != nil {
+		if createdHere {
+			_ = os.RemoveAll(dir)
+		}
+		return "", false, chkErr
+	}
+	return dir, createdHere, nil
+}
+
 // LauncherFromEnv maps a real VMMKind (Firecracker or CloudHypervisor) to a Launcher,
 // reading the environment variables both binaries that drive real hardware need to
 // agree on.
@@ -50,16 +127,18 @@ func envInt64(get func(string) string, k string, def int64) (int64, error) {
 // (hardware-corrections D1) — the SAME figure admission control charges per VM,
 // threaded into both arms' CgroupMemoryMaxBytes so jailer's --cgroup memory.max=
 // and systemd-run --scope's -p MemoryMax= can never drift from a second,
-// independently maintained constant. chvRunDirDefault lets each caller pick its own
-// default run directory (see the CloudHypervisor case below) while still sharing
-// everything else.
+// independently maintained constant. chvRunDirName lets each caller pick its own
+// discriminator for the default run directory chvDefaultRunDir derives (see the
+// CloudHypervisor case below) — a short name, not a full path, since round 10
+// stopped hardcoding fixed /run/... paths; see chvDefaultRunDir's doc comment for
+// why.
 //
 // Deliberately NOT included: a "fake" case. vmpool.FakeLauncher (host bash) must
 // stay reachable ONLY from vmpoolctl's own launcher() — folding it in here would put
 // microvm-worker's launcherFor one accidental case away from a host-execution
 // fallback, which spec §3.3/§3.5 rule out structurally, not just by convention. See
 // cmd/microvm-worker/main_test.go's TestThereIsNoHostFallbackLauncher.
-func LauncherFromEnv(kind VMMKind, get func(string) string, snapshotDir string, perVMBytes int64, chvRunDirDefault string) (Launcher, error) {
+func LauncherFromEnv(kind VMMKind, get func(string) string, snapshotDir string, perVMBytes int64, chvRunDirName string) (Launcher, error) {
 	switch kind {
 	case Firecracker:
 		wsImageMB, err := envInt64(get, "SH_WORKSPACE_IMAGE_MB", 2048)
@@ -95,27 +174,74 @@ func LauncherFromEnv(kind VMMKind, get func(string) string, snapshotDir string, 
 		if err != nil {
 			return nil, err
 		}
-		// RunDir default is under /run, not /srv or /tmp: it holds only per-VM sockets
-		// and rewritten config for the CURRENT boot's live cloud-hypervisor/virtiofsd
-		// processes (spec §4.3, §7.3) — see launcherFor's own longer comment on this in
-		// cmd/microvm-worker/main.go for the orphan-sweep argument (Task 17). Each
-		// caller supplies its own chvRunDirDefault (microvm-worker and vmpoolctl use
-		// different defaults, /run/microvm-worker/chv and /run/vmpoolctl/chv) so the
-		// production daemon and a diagnostic CLI run against the same host never
-		// collide on the same per-VM socket/config directory naming, while SH_CHV_RUN_DIR
-		// still overrides either the same way.
-		return NewCloudHypervisorLauncher(CHVOptions{
+		// RunDir's default used to be a hardcoded /run/<caller>/chv (tmpfs). Fix round 3
+		// picked /run because it is cleared on every reboot, which let Task 17's orphan
+		// sweep reconcile leftover per-VM directories against live PIDs within a single
+		// boot with no risk of a stale recorded PID being reused by an unrelated
+		// process after a reboot (a PID file that survived a reboot cannot be trusted;
+		// a tmpfs RunDir simply isn't there anymore to be stale). That protection is
+		// abandoned here — not because it stopped mattering, but because Task 18
+		// established a harder constraint that outranks it: Restore hardlinks the
+		// golden snapshot's vmstate and memory-ranges files into RunDir/<id>/ (see
+		// checkDeviceSharing below), and hardlink(2) always fails EXDEV across a device
+		// boundary, unconditionally — /run is tmpfs and SnapshotDir is persistent disk,
+		// so nothing could ever restore at all under the old default. A hard "restore
+		// cannot work" beats a mere "orphan reconciliation is a little more
+		// convenient". What now gives the orphan sweep the same protection /run used to
+		// provide: Task 17's own correction prefers matching a live process's
+		// cgroup.procs membership over trusting any recorded PID file, because kernel
+		// cgroup membership cannot go stale across a reboot the way a PID number can
+		// (the process either still is or isn't a member; there is no
+		// reuse-after-reboot ambiguity) — see Task 17's report. So RunDir now defaults
+		// to a same-device SIBLING of SnapshotDir (chvDefaultRunDir above), mirroring
+		// sameDeviceSiblingDir (this package's own test helper) and new_verify_dir() in
+		// deploy/microvm/build-snapshot.sh, which solve the identical problem for their
+		// own hardlink targets. SH_CHV_RUN_DIR still overrides this outright, so an
+		// operator-supplied bad value is still caught by checkDeviceSharing at
+		// pool.New rather than silently accepted; chvRunDirName discriminates each
+		// caller's default (microvm-worker vs. vmpoolctl) so the production daemon and
+		// a diagnostic CLI run against the same host never collide on the same per-VM
+		// socket/config directory naming.
+		//
+		// Because the derived directory now lives on persistent storage (a sibling of
+		// SnapshotDir, not tmpfs), nothing reclaims it on reboot the way /run used to —
+		// whatever creates it must remove it again, including on any failure path.
+		// That is why it is created up front here, tracked via cleanupRunDir, and torn
+		// down below if NewCloudHypervisorLauncher goes on to fail validation for an
+		// unrelated reason — rather than left to Restore's own os.MkdirAll, which only
+		// ever created it as an incidental side effect of creating its per-VM child and
+		// never removed the top-level directory itself.
+		runDir := get("SH_CHV_RUN_DIR")
+		var cleanupRunDir func()
+		if runDir == "" {
+			derivedDir, createdHere, derr := chvDefaultRunDir(snapshotDir, chvRunDirName)
+			if derr != nil {
+				return nil, derr
+			}
+			runDir = derivedDir
+			if createdHere {
+				cleanupRunDir = func() { _ = os.RemoveAll(derivedDir) }
+			}
+		}
+		lc, err := NewCloudHypervisorLauncher(CHVOptions{
 			SnapshotDir:          snapshotDir,
 			CHVBin:               env(get, "SH_CHV_BIN", "/usr/bin/cloud-hypervisor"),
 			ChRemoteBin:          env(get, "SH_CH_REMOTE_BIN", "/usr/bin/ch-remote"),
 			VirtiofsdBin:         env(get, "SH_VIRTIOFSD_BIN", "/usr/libexec/virtiofsd"),
-			RunDir:               env(get, "SH_CHV_RUN_DIR", chvRunDirDefault),
+			RunDir:               runDir,
 			VirtiofsdUID:         int(uid),
 			VirtiofsdGID:         int(gid),
 			ParentCgroup:         env(get, "SH_PARENT_CGROUP", "microvm-vms.slice"),
 			CgroupMemoryMaxBytes: perVMBytes,
 			VsockPort:            1024,
 		})
+		if err != nil {
+			if cleanupRunDir != nil {
+				cleanupRunDir()
+			}
+			return nil, err
+		}
+		return lc, nil
 	default:
 		return nil, fmt.Errorf("vmpool: LauncherFromEnv cannot construct %q — only %q and %q "+
 			"are wired here; the fake launcher is deliberately excluded (see this function's "+

@@ -216,11 +216,13 @@ func launcher(kind string, snapshotDir string, perVMBytes int64) (vmpool.Launche
 	case "fake":
 		return vmpool.NewFakeLauncher(), nil
 	case string(vmpool.Firecracker), string(vmpool.CloudHypervisor):
-		// chvRunDirDefault differs from main.go's /run/microvm-worker/chv so this CLI,
-		// if ever run for diagnostics on the same host as a live microvm-worker, does
-		// not collide on the same per-VM socket/config directory naming; SH_CHV_RUN_DIR
-		// still overrides either the same way.
-		return vmpool.LauncherFromEnv(vmpool.VMMKind(kind), os.Getenv, snapshotDir, perVMBytes, "/run/vmpoolctl/chv")
+		// "vmpoolctl" differs from main.go's "microvm-worker" so the default RunDir
+		// vmpool.LauncherFromEnv derives (chvDefaultRunDir, fix round 10 — a
+		// same-device sibling of snapshotDir, not a hardcoded /run/... path any more)
+		// never collides with microvm-worker's own default when this CLI is run for
+		// diagnostics on the same host as a live microvm-worker daemon pointed at the
+		// same snapshot; SH_CHV_RUN_DIR still overrides either the same way.
+		return vmpool.LauncherFromEnv(vmpool.VMMKind(kind), os.Getenv, snapshotDir, perVMBytes, "vmpoolctl")
 	default:
 		return nil, fmt.Errorf("--vmm=%q is not one of cloud-hypervisor, firecracker, fake", kind)
 	}
