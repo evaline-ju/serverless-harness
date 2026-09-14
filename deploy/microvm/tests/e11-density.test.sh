@@ -58,6 +58,86 @@ extract_fns() {
   done
 }
 
+# ---------------------------------------------------------------------------
+# Marker processes: how this suite gets a real, LIVE, DETERMINISTICALLY DISCOVERABLE pid
+# for the PSS sampler to be pointed at.
+#
+# Every block below used to spawn `sh -c 'sleep 5' &` and match it with the pattern
+# "sleep 5". That is where the ubuntu-24.04 CI failure came from, and it is a fixture bug,
+# not a driver bug:
+#
+#   - Ubuntu's /bin/sh is dash, and dash does NOT exec the command in `sh -c CMD` -- it
+#     FORKS a child. So `pgrep -f 'sleep 5'` returned TWO pids: the `sh -c sleep 5` wrapper
+#     that `$!` names, and a `sleep 5` child. The fabricated proc tree covered only the
+#     first, and a LIVE pid with no readable smaps_rollup is precisely what
+#     pss_bytes_for_pids refuses to guess about (spec section 7.3's boxed warning) -- so the
+#     snapshot refused, the acceptance assertion read "want 0, got 1", and json.load then
+#     got an empty file. Confirmed by running this suite in an ubuntu:24.04 container:
+#     `pid=2534 cmdline=[sh -c sleep 5]` alongside `pid=2536 cmdline=[sleep 5]`.
+#   - bash, which is /bin/sh on macOS and on Amazon Linux 2023, execs instead, so there was
+#     exactly one pid and the same fixture passed on both of those hosts.
+#   - `kill "$!"` killed only the wrapper, orphaning the `sleep 5` child for the rest of its
+#     five seconds -- where a later block matching the same pattern could pick it up.
+#
+# The replacement depends on no shell's exec/fork choice and on no host process: ONE
+# process, no shell wrapper, and a token in its argv that nothing else on any host shares.
+# Blocks then fabricate a rollup for EVERY pid discover_pids actually returns, so the
+# fixture covers the real pid set instead of assuming what it will be.
+marker_token() {
+  printf '__e11_marker_%s_%s' "$$" "$1"
+}
+
+# spawn_marker_process starts one marker process and sets MARKER_PID. A plain assignment
+# rather than a printed pid, so the process is this shell's own child and `wait` works.
+# The 60s lifetime bounds the leak if the suite dies before stop_marker_process.
+MARKER_PID=""
+spawn_marker_process() {
+  python3 -c 'import sys, time; time.sleep(int(sys.argv[1]))' 60 "$1" &
+  MARKER_PID=$!
+}
+
+stop_marker_process() {
+  [ -n "${1:-}" ] || return 0
+  kill "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+  return 0
+}
+
+# discovered_pids_for prints the pids the REAL discover_pids (sourced from $1) returns for
+# pattern $2, retrying until at least $3 of them appear. The retry is not politeness: a
+# process that has not been scheduled yet would silently make a block assert things about an
+# EMPTY pid set, which is the vacuous-test shape this suite exists to avoid.
+discovered_pids_for() {
+  local snippet="$1" pattern="$2" want="${3:-1}" tries=0 pids="" n=0
+  while [ "$tries" -lt 25 ]; do
+    tries=$((tries + 1))
+    pids="$(
+      # shellcheck disable=SC1090
+      . "$snippet"
+      discover_pids "$pattern"
+    )"
+    n="$(printf '%s\n' "$pids" | grep -c '[0-9]')"
+    [ "$n" -lt "$want" ] || break
+    sleep 0.2
+  done
+  printf '%s' "$pids"
+}
+
+# count_pids counts the pid lines in $1 (an empty list counts 0, not 1).
+count_pids() {
+  printf '%s\n' "$1" | grep -c '[0-9]'
+}
+
+# plant_rollups fabricates $3 kB of Pss for EVERY pid in $2, under fake proc root $1.
+plant_rollups() {
+  local root="$1" kb="$3" pid
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    mkdir -p "$root/$pid"
+    printf 'Pss: %s kB\n' "$kb" >"$root/$pid/smaps_rollup"
+  done <<<"$2"
+}
+
 echo "== the script exists, is executable, and is shellcheck-clean"
 check "e11-density.sh present" "$([ -f "$SCRIPT" ] && echo yes || echo no)" "yes"
 check "e11-density.sh executable" "$([ -x "$SCRIPT" ] && echo yes || echo no)" "yes"
@@ -106,10 +186,12 @@ if [ -n "$pss_body" ]; then
     printf '%s\n' "$pss_body"
   } >"$pss_snippet"
 
-  # A real, still-alive process (this shell's own subshell sleeper) whose fake
-  # PROC_ROOT/<pid>/smaps_rollup we control directly.
-  sh -c 'sleep 5' &
-  live_pid=$!
+  # A real, still-alive process whose fake PROC_ROOT/<pid>/smaps_rollup we control directly.
+  # One process, not an `sh -c` wrapper: see spawn_marker_process for why that distinction
+  # cost a CI run. This block passes the pid EXPLICITLY, so it never depended on pgrep --
+  # but killing the wrapper used to orphan its `sleep` child into later blocks that do.
+  spawn_marker_process "$(marker_token pss_unit)"
+  live_pid="$MARKER_PID"
 
   fake_proc="$pss_tmpdir/proc"
   mkdir -p "$fake_proc/$live_pid"
@@ -163,8 +245,7 @@ if [ -n "$pss_body" ]; then
   check "an already-exited pid contributes 0, is not an unreadable-file failure" "$rc_dead" "0"
   check "an already-exited pid's contribution is exactly 0 bytes" "$out_dead" "0"
 
-  kill "$live_pid" 2>/dev/null
-  wait "$live_pid" 2>/dev/null
+  stop_marker_process "$live_pid"
   rm -rf "$pss_tmpdir"
 fi
 
@@ -271,8 +352,9 @@ if [ -n "$signals_body" ]; then
 
   # --- The whole assembly, end to end, parsed by its REAL consumer (json.load), with a
   # live pid whose smaps_rollup exists so no other field can fail for its own reasons.
-  sh -c 'sleep 5' &
-  sig_live=$!
+  sig_marker="$(marker_token signals)"
+  spawn_marker_process "$sig_marker"
+  sig_live="$MARKER_PID"
   mkdir -p "$sig_proc/$sig_live"
   printf 'Pss:                 512 kB\n' >"$sig_proc/$sig_live/smaps_rollup"
   sig_json=$(
@@ -302,7 +384,10 @@ if [ -n "$signals_body" ]; then
     PROC_ROOT="$sig_proc"
     export PROC_ROOT
     # shellcheck disable=SC2034 # read by host_signals_snapshot, sourced below
-    VMM_PROC_PATTERN="sleep 5"
+    # The marker token, not "sleep 5": under dash that pattern also matched a forked child
+    # this fixture never covered, so the refusal below could fire for the WRONG reason (an
+    # uncovered sibling) rather than the chmod 000 rollup this case is about.
+    VMM_PROC_PATTERN="$sig_marker"
     # shellcheck disable=SC2034
     VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
     # shellcheck disable=SC1090
@@ -318,8 +403,7 @@ if [ -n "$signals_body" ]; then
   fi
   chmod 644 "$sig_proc/$sig_live/smaps_rollup" 2>/dev/null || true
 
-  kill "$sig_live" 2>/dev/null
-  wait "$sig_live" 2>/dev/null
+  stop_marker_process "$sig_live"
   rm -rf "$sig_tmpdir"
 fi
 
@@ -636,25 +720,59 @@ if [ -n "$vmm_body" ]; then
 
   # --- And a matched process whose rollups sum to 0 is refused too: pids present is not
   # the same claim as memory measured.
-  sh -c 'sleep 5' &
-  zero_pid=$!
-  mkdir -p "$vmm_proc/$zero_pid"
-  printf 'Pss:                   0 kB\n' >"$vmm_proc/$zero_pid/smaps_rollup"
+  #
+  # The pid set comes from the REAL discover_pids and the fabricated rollups cover ALL of
+  # it, so this depends on no host process and on no shell's exec/fork choice -- see
+  # spawn_marker_process for the ubuntu-24.04 failure that shape caused.
+  vmm_marker="$(marker_token pss)"
+  spawn_marker_process "$vmm_marker"
+  vmm_marker_pid="$MARKER_PID"
+  vmm_pids="$(discovered_pids_for "$vmm_snippet" "$vmm_marker" 1)"
+  vmm_pid_count="$(count_pids "$vmm_pids")"
+  # Non-vacuousness: everything below is about a NON-EMPTY matched pid set, so prove the
+  # real discover_pids found one before asserting anything about what is done with it.
+  check "non-vacuousness: the real discover_pids finds this block's marker process" \
+    "$([ "$vmm_pid_count" -ge 1 ] && echo yes || echo no)" "yes"
+  [ "$vmm_pid_count" -le 1 ] ||
+    echo "  (note: the marker matched $vmm_pid_count processes; every one of them gets a fabricated rollup, so the totals below still add up)"
+
+  plant_rollups "$vmm_proc" "$vmm_pids" 0
   zero_rc=0
-  zero_out="$(snapshot_with "sleep 5" 1 2>/dev/null)" || zero_rc=$?
+  zero_out="$(snapshot_with "$vmm_marker" 1 2>/dev/null)" || zero_rc=$?
   check "a matched VMM whose PSS sums to 0 is refused as well" \
     "$([ "$zero_rc" -ne 0 ] && echo yes || echo no)" "yes"
   check "  ...printing no JSON" "$zero_out" ""
-  # ...while a real, nonzero reading for that same pid is accepted, so the check above is
+
+  # ...while a real, nonzero reading for the SAME pids is accepted, so the check above is
   # about the VALUE being zero and not about the pattern matching at all.
-  printf 'Pss:                 512 kB\n' >"$vmm_proc/$zero_pid/smaps_rollup"
+  plant_rollups "$vmm_proc" "$vmm_pids" 512
+  nz_expected=$((512 * 1024 * vmm_pid_count))
   nz_rc=0
-  nz_json="$(snapshot_with "sleep 5" 1 2>/dev/null)" || nz_rc=$?
+  nz_json="$(snapshot_with "$vmm_marker" 1 2>/dev/null)" || nz_rc=$?
   check "a nonzero PSS for the same matched pid IS accepted with require_vmm=1" "$nz_rc" "0"
   check "  ...and reports the real total" \
-    "$(printf '%s' "$nz_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pssBytes"])' 2>&1)" "524288"
-  kill "$zero_pid" 2>/dev/null
-  wait "$zero_pid" 2>/dev/null
+    "$(printf '%s' "$nz_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pssBytes"])' 2>&1)" "$nz_expected"
+
+  # --- And the CI failure mode itself, pinned as CORRECT behaviour rather than something to
+  # be loosened away: a SECOND live process the pattern matches, whose rollup the fabricated
+  # tree does not cover, makes the whole snapshot refuse. That is spec section 7.3's
+  # never-guess-a-pid's-memory guarantee, and it is exactly what dash's forked `sleep`
+  # child did to this block on ubuntu-24.04.
+  spawn_marker_process "$vmm_marker"
+  sibling_pid="$MARKER_PID"
+  sib_pids="$(discovered_pids_for "$vmm_snippet" "$vmm_marker" $((vmm_pid_count + 1)))"
+  if [ "$(count_pids "$sib_pids")" -le "$vmm_pid_count" ]; then
+    echo "  (skip: the second marker process never became discoverable -- the uncovered-sibling refusal was not exercised, not claimed verified)"
+  else
+    sib_rc=0
+    sib_out="$(snapshot_with "$vmm_marker" 1 2>/dev/null)" || sib_rc=$?
+    check "an uncovered sibling pid makes the whole snapshot REFUSE (the ubuntu-24.04 symptom)" \
+      "$([ "$sib_rc" -ne 0 ] && echo yes || echo no)" "yes"
+    check "  ...printing no JSON, which is what left json.load with an empty file in CI" \
+      "$sib_out" ""
+  fi
+  stop_marker_process "$sibling_pid"
+  stop_marker_process "$vmm_marker_pid"
 
   rm -rf "$vmm_tmpdir"
 fi
