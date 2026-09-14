@@ -129,6 +129,18 @@ RUNG1_RELAY_TOKEN="${SH_E10_RELAY_TOKEN:-e10-dev-token}"
 RUNG1_SANDBOX_ID="${SH_E10_SANDBOX_ID:-e10-rung1}"
 RUNG1_START_STACK="${SH_E10_START_STACK:-1}" # set 0 to reuse an already-running stack
 
+# Which rungs to run. Rung 1 is the CONTAINER BASELINE and needs grpcurl, docker and pnpm; a
+# benchmark host with a hypervisor but none of those can still measure rungs 2-4, which are
+# the microVM terms and where the substrate-independent RATIOS live (parked shell on/off,
+# memfile pinned/unpinned). Selecting a subset is therefore legitimate.
+#
+# But a run without rung 1 has NO baseline, and section 7.2's middle band is decided by the
+# ratio against it. So a partial run prints the rungs it measured and DECLINES the verdict,
+# naming what is missing -- never a favourable verdict from an incomplete run, which is the
+# defect most of this driver's review was about.
+RUNGS="${SH_E10_RUNGS:-1 2 3 4}"
+wants_rung() { case " $RUNGS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
 # The redis image, overridable so an operator can PIN A DIGEST
 # (SH_E10_REDIS_IMAGE=redis@sha256:...) for a reproducible run. `redis:7` is a
 # floating tag; it is kept as the default because it is what the rest of this repo
@@ -275,12 +287,14 @@ preflight() {
   # Tooling, checked by name up front rather than discovered as a 127 mid-rung.
   require_tool python3 "every JSON record and readback in this script is written by python3"
   require_tool go "rung 1's worker and rungs 2-4's vmpoolctl are both built from source here"
-  require_tool grpcurl "rung 1 drives its Exec RPCs through grpcurl; without it every timing would measure grpcurl failing to launch"
-  [ -f "$PROTO_FILE" ] ||
-    die "the sandbox proto is missing at $PROTO_FILE - grpcurl cannot encode an Exec request without it, so rung 1 would time a client-side error"
-  if [ "$RUNG1_START_STACK" = "1" ]; then
-    require_tool docker "rung 1 starts its own redis in a container (set SH_E10_START_STACK=0 to reuse a running stack instead)"
-    require_tool pnpm "rung 1 starts the real sandbox-relay via pnpm (set SH_E10_START_STACK=0 to reuse a running stack instead)"
+  if wants_rung 1; then
+    require_tool grpcurl "rung 1 drives its Exec RPCs through grpcurl; without it every timing would measure grpcurl failing to launch (set SH_E10_RUNGS='2 3 4' to skip the container baseline)"
+    [ -f "$PROTO_FILE" ] ||
+      die "the sandbox proto is missing at $PROTO_FILE - grpcurl cannot encode an Exec request without it, so rung 1 would time a client-side error"
+    if [ "$RUNG1_START_STACK" = "1" ]; then
+      require_tool docker "rung 1 starts its own redis in a container (set SH_E10_START_STACK=0 to reuse a running stack, or SH_E10_RUNGS='2 3 4' to skip the container baseline)"
+      require_tool pnpm "rung 1 starts the real sandbox-relay via pnpm (set SH_E10_START_STACK=0 to reuse a running stack, or SH_E10_RUNGS='2 3 4' to skip the container baseline)"
+    fi
   fi
   ensure_vmpoolctl
   mkdir -p "$RESULTS"
@@ -492,6 +506,13 @@ shuffle_arms() {
 vmpoolctl_run() {
   local out_json="$1" log_file="$2" key="$3"
   shift 3
+  # vmpoolctl requires a command after `--` in every mode, including the replenishment and
+  # teardown modes that never run it, so that every rung's invocation has the same shape.
+  # Supply a no-op when the caller did not: rungs 3 and 4 measure a lifecycle phase rather
+  # than a command, and both died on "a command is required after --" the first time they ran.
+  local has_cmd=0 a
+  for a in "$@"; do [ "$a" = "--" ] && has_cmd=1; done
+  if [ "$has_cmd" -eq 0 ]; then set -- "$@" -- true; fi
   "$VMPOOLCTL" --snapshot-dir="$SNAPSHOT_DIR" --workspace-root="$WORKSPACE_ROOT" \
     --substrate="$SUBSTRATE" --iterations="$ITERS" --warmup="$WARMUP" --json \
     --key="$key" "$@" >"$out_json" 2>"$log_file" ||
@@ -667,7 +688,11 @@ print_verdict() {
 # ---------------------------------------------------------------------------
 main() {
   preflight
-  run_rung1
+  if wants_rung 1; then
+    run_rung1
+  else
+    log "rung1: SKIPPED (SH_E10_RUNGS='$RUNGS') - there will be no container baseline, so no section 7.2 verdict"
+  fi
   run_vmpoolctl_rungs
 
   # Pull the warm-path (rung2, parked) and replenishment (rung3, pinned) p50s the
@@ -694,6 +719,25 @@ d = json.load(open('$RESULTS/e10-rung3-${arm}-${SUBSTRATE}-pinned.json'))
 print(d.get('cpu_child_us',0))
 ")" || die "could not read the rung 3 record at $RESULTS/e10-rung3-${arm}-${SUBSTRATE}-pinned.json (the traceback is above) - refusing to print a section 7.2 verdict about a replenishment CPU cost that was never measured"
   repl_us="$(require_positive replenishment_cpu_p50_us "$repl_us")" || exit 1
+  if ! wants_rung 1; then
+    # The rung 2/3/4 records are already on disk; what cannot be produced is the RATIO row,
+    # because section 7.2's middle band is defined against the container baseline. Say that,
+    # report the terms that were measured, and exit non-zero so no caller mistakes a partial
+    # run for a completed experiment.
+    echo
+    echo "PARTIAL RUN - no section 7.2 verdict"
+    echo "  rungs run:              $RUNGS"
+    echo "  warm hot path p50:      ${warm_ms}ms   (rung 2, parked)"
+    echo "  replenishment CPU p50:  ${repl_ms}ms   (rung 3, pinned)"
+    echo "  container baseline:     NOT MEASURED - rung 1 was not selected"
+    echo "  substrate:              $SUBSTRATE"
+    echo
+    echo "The decision-rule table is NOT evaluated: its middle band is a ratio against the"
+    echo "container baseline, and its absolute rows are only meaningful beside it. Per-rung"
+    echo "records are in $RESULTS. Re-run with SH_E10_RUNGS='1 2 3 4' on a host with grpcurl,"
+    echo "docker and pnpm to get a verdict."
+    exit 3
+  fi
   container_ms="$(require_positive container_baseline_p50_ms "${RUNG1_P50_MS:-}")" || exit 1
   warm_ms="$(awk -v u="$warm_us" 'BEGIN{printf "%.2f", u/1000.0}')"
   repl_ms="$(awk -v u="$repl_us" 'BEGIN{printf "%.2f", u/1000.0}')"

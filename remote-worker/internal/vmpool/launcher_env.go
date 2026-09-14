@@ -4,10 +4,36 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
+
+// vmmBin resolves a VMM binary: an explicit env override wins, then PATH, then the
+// distro-packaged location as a last resort.
+//
+// The hardcoded /usr/bin default was wrong on every host that installs Firecracker the way
+// upstream ships it. Its release tarball puts firecracker and jailer under /usr/local/bin,
+// which is also where this repo's own systemd unit puts microvm-worker -- so the default
+// disagreed with the project's own install convention. It surfaced twice: the shipped unit
+// crash-looped on "fork/exec /usr/bin/jailer: no such file or directory" until the unit named
+// the paths explicitly, and then the E10 driver hit the identical error through vmpoolctl,
+// because naming them in the unit fixed only the unit.
+//
+// Resolving through PATH fixes it once for every caller -- the unit, both benchmark drivers,
+// vmpoolctl and the gates -- instead of requiring each one to know where the binary lives. An
+// explicit SH_*_BIN still wins, so a host with two installs can pin the one it means, and the
+// final fallback keeps behaviour unchanged where /usr/bin really is correct.
+func vmmBin(get func(string) string, envVar, name, fallback string) string {
+	if v := get(envVar); v != "" {
+		return v
+	}
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+	return fallback
+}
 
 // env and envInt64 back LauncherFromEnv below. They mirror the two helpers of the
 // same names cmd/microvm-worker/main.go has defined since before this file existed
@@ -147,8 +173,8 @@ func LauncherFromEnv(kind VMMKind, get func(string) string, snapshotDir string, 
 		}
 		return NewFirecrackerLauncher(FirecrackerOptions{
 			SnapshotDir:          snapshotDir,
-			JailerBin:            env(get, "SH_JAILER_BIN", "/usr/bin/jailer"),
-			FirecrackerBin:       env(get, "SH_FIRECRACKER_BIN", "/usr/bin/firecracker"),
+			JailerBin:            vmmBin(get, "SH_JAILER_BIN", "jailer", "/usr/bin/jailer"),
+			FirecrackerBin:       vmmBin(get, "SH_FIRECRACKER_BIN", "firecracker", "/usr/bin/firecracker"),
 			ChrootBase:           env(get, "SH_CHROOT_BASE", "/srv/jail"),
 			UID:                  os.Getuid(),
 			GID:                  os.Getgid(),
@@ -225,9 +251,9 @@ func LauncherFromEnv(kind VMMKind, get func(string) string, snapshotDir string, 
 		}
 		lc, err := NewCloudHypervisorLauncher(CHVOptions{
 			SnapshotDir:          snapshotDir,
-			CHVBin:               env(get, "SH_CHV_BIN", "/usr/bin/cloud-hypervisor"),
+			CHVBin:               vmmBin(get, "SH_CHV_BIN", "cloud-hypervisor", "/usr/bin/cloud-hypervisor"),
 			ChRemoteBin:          env(get, "SH_CH_REMOTE_BIN", "/usr/bin/ch-remote"),
-			VirtiofsdBin:         env(get, "SH_VIRTIOFSD_BIN", "/usr/libexec/virtiofsd"),
+			VirtiofsdBin:         vmmBin(get, "SH_VIRTIOFSD_BIN", "virtiofsd", "/usr/libexec/virtiofsd"),
 			RunDir:               runDir,
 			VirtiofsdUID:         int(uid),
 			VirtiofsdGID:         int(gid),

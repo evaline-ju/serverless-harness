@@ -308,6 +308,67 @@ check "ARMS defaults to firecracker, not the brief's two-arm list" \
 check "the brief's hardcoded two-arm default is not present" \
   "$(grep -c '^ARMS=(firecracker cloud-hypervisor)' "$SCRIPT")" "0"
 
+echo "== SH_E10_RUNGS: a partial run measures rungs but DECLINES the verdict"
+# Rung 1 is the container baseline and needs grpcurl/docker/pnpm. A hypervisor host without
+# them can still measure rungs 2-4, where the substrate-independent ratios live. What must
+# never happen is a favourable verdict computed without a baseline.
+wr_snippet="$(mktemp "$DIR/tests/zz-wants-rung-XXXXXX.sh")"
+# Extracted into the tests directory, not /tmp: the suite computes DIR from its own location,
+# and a snippet elsewhere would resolve paths differently.
+sed -n '/^wants_rung() {/,/^}/p' "$SCRIPT" > "$wr_snippet"
+wr_ok=yes
+# RUNGS is read by the sourced wants_rung, not by this file, hence SC2034; and the snippet
+# path is built at run time, hence SC1090.
+# shellcheck disable=SC1090,SC2034
+( RUNGS="2 3 4"; . "$wr_snippet"; wants_rung 1 ) && wr_ok=no    # must be FALSE
+# shellcheck disable=SC1090,SC2034
+( RUNGS="2 3 4"; . "$wr_snippet"; wants_rung 3 ) || wr_ok=no    # must be TRUE
+# shellcheck disable=SC1090,SC2034
+( RUNGS="1 2 3 4"; . "$wr_snippet"; wants_rung 1 ) || wr_ok=no  # non-vacuousness: TRUE by default
+# shellcheck disable=SC1090,SC2034
+( RUNGS="2 3 4"; . "$wr_snippet"; wants_rung 34 ) && wr_ok=no   # must not substring-match
+rm -f "$wr_snippet"
+check "wants_rung selects exactly the listed rungs (and does not substring-match)" "$wr_ok" "yes"
+
+check "SH_E10_RUNGS is the selector, defaulting to all four" \
+  "$(grep -c 'RUNGS="\${SH_E10_RUNGS:-1 2 3 4}"' "$SCRIPT")" "1"
+
+# grpcurl/docker/pnpm must only be demanded when rung 1 will actually run, or a rungs-2-4 run
+# refuses on tooling it never uses.
+pre_body="$(awk '/^preflight\(\) \{/,/^\}/' "$SCRIPT")"
+gated=yes
+printf '%s\n' "$pre_body" | grep -q 'if wants_rung 1; then' || gated=no
+check "preflight gates rung 1's tooling behind wants_rung 1" "$gated" "yes"
+
+# The decline path: it must print PARTIAL RUN and must NOT contain any verdict token, because
+# section 7.2's middle band is a ratio against the baseline it does not have.
+partial="$(awk '/if ! wants_rung 1; then/,/^  fi$/' "$SCRIPT")"
+check "a partial run announces itself" \
+  "$(printf '%s\n' "$partial" | grep -c 'PARTIAL RUN')" "1"
+pv=no
+printf '%s\n' "$partial" | grep -qE 'PROCEED|STOP|MANDATORY|RE-PRICED' || pv=yes
+check "the partial-run branch emits NO verdict token" "$pv" "yes"
+check "...and exits non-zero so a caller cannot mistake it for a completed experiment" \
+  "$(printf '%s\n' "$partial" | grep -c 'exit 3')" "1"
+# Non-vacuousness for the two checks above: verdict tokens DO exist elsewhere in the script,
+# so their absence in that branch is a property of the branch, not of the file.
+check "non-vacuousness: verdict tokens exist elsewhere in the script" \
+  "$([ "$(grep -cE 'PROCEED AS DESIGNED' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== every rung passes a command after --, because vmpoolctl requires one in EVERY mode"
+# Rungs 3 and 4 measure a lifecycle phase, not a command, and originally passed none -- so both
+# died on "a command is required after --" the first time they were ever run. Rung 2 did pass
+# one, which is why the ladder's first rung worked and this survived review.
+vr_body="$(awk '/^vmpoolctl_run\(\) \{/,/^\}/' "$SCRIPT")"
+check "vmpoolctl_run supplies a no-op command when the caller gave none" \
+  "$(printf '%s\n' "$vr_body" | grep -c 'set -- "$@" -- true')" "1"
+check "...detected by looking for an existing -- in the caller's args" \
+  "$(printf '%s\n' "$vr_body" | grep -c 'has_cmd=1')" "1"
+# Non-vacuousness: rung 2 DOES pass its own command, so the guard must not double it.
+r2_body="$(awk '/^run_rung2\(\) \{/,/^\}/' "$SCRIPT")"
+check "non-vacuousness: rung 2 still passes its own command" \
+  "$([ "$(printf '%s\n' "$r2_body" | grep -c -- '-- true')" -ge 1 ] && echo yes || echo no)" "yes"
+
 echo "== no guest-side timing: no 'date' inside any vmpoolctl -- command"
 # vmpoolctl_run's own definition legitimately shells out to vmpoolctl; what must
 # never happen is a 'date' call embedded in the COMMAND STRING handed to vmpoolctl
