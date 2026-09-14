@@ -318,7 +318,7 @@ func (a *Agent) runOnParkedShell(req Request, w *frameWriter) (End, error) {
 	// No leading newline before the nonce: the printf write and the nonce line are
 	// read as separate lines by drainUntilNonce, so a leading "\n" here would surface
 	// as a spurious blank line of "output" ahead of the sentinel on every command.
-	line := fmt.Sprintf("( . %q )\n__ga_rc=$?\nprintf '%s %%d\\n' \"$__ga_rc\"\nprintf '%s\\n' >&2\n", path, nonce, nonce)
+	line := parkedShellLine(path, nonce)
 	if _, err := io.WriteString(stdin, line); err != nil {
 		return End{}, fmt.Errorf("writing to the parked shell: %w", err)
 	}
@@ -371,6 +371,36 @@ func (a *Agent) runOnParkedShell(req Request, w *frameWriter) (End, error) {
 		// have rather than hanging: the VM is about to be destroyed anyway.
 	}
 	return End{ExitCode: res.code}, nil
+}
+
+// parkedShellStdinRedirect is what closes stdin for a command that was given none.
+// Kept as a named constant because the test that proves the hazard is real builds its
+// "without this" case by removing exactly this string from parkedShellLine's output —
+// see TestParkedShellSubshellCannotReadTheAgentsControlPipe.
+const parkedShellStdinRedirect = " < /dev/null"
+
+// parkedShellLine is the one line written into the parked shell's stdin to run a
+// staged command: source it in a subshell, then print the sentinel on both streams.
+//
+// The subshell's stdin is redirected from /dev/null, which is internal/exec/runner.go's
+// stated invariant for the container arm — "stdin ALWAYS closes. `base64 -d > f` waits
+// for EOF, and a command given no stdin must still see EOF or anything reading it
+// blocks forever" — restated here, because in the guest the consequence is worse than a
+// hang. Without the redirect the subshell inherits the PARKED SHELL's stdin, and that
+// pipe is this agent's own control channel: `cat`, `read`, `sort`, `wc` or `xargs` with
+// no file argument would swallow the "__ga_rc=$?" / "printf '<nonce> %d\n'" bytes
+// written immediately after them, echo the agent's own protocol back as the command's
+// output, and destroy the exit status the sentinel carries — or, having consumed
+// everything buffered, block until TimeoutS, which is frequently unset (see pool.go's
+// comment on dispatch without a timeout) and therefore forever. Either way it is a tier
+// divergence the harness cannot detect, so the redirect is not an optimisation.
+//
+// The HasStdin path does not come through here at all: runFreshChild forks a child and
+// closes its stdin explicitly, which is the only way to give a command a *finite* stdin
+// without killing the long-lived parked shell (spec §5.4).
+func parkedShellLine(path, nonce string) string {
+	return fmt.Sprintf("( . %q )%s\n__ga_rc=$?\nprintf '%s %%d\\n' \"$__ga_rc\"\nprintf '%s\\n' >&2\n",
+		path, parkedShellStdinRedirect, nonce, nonce)
 }
 
 // runFreshChild is the stdin path: a real bash -c child whose stdin is fed and closed.

@@ -2,11 +2,13 @@ package guestagent
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -136,6 +138,113 @@ func TestAgentServesAWriteWithStdinOnAFreshChild(t *testing.T) {
 	// The parked shell survived: the stdin command went to a child, not to it.
 	if a.ShellPID() != pid {
 		t.Fatalf("ShellPID changed %d -> %d — feeding stdin must not kill the parked shell", pid, a.ShellPID())
+	}
+}
+
+// TestParkedShellSubshellCannotReadTheAgentsControlPipe is the reachability half of
+// the pair below: before asserting that a command CANNOT read the control pipe, prove
+// that it could.
+//
+// The hazard is not hypothetical and it is not about hanging. The parked shell reads
+// its commands from a pipe the agent writes, so a subshell that inherits that stdin
+// reads the agent's own protocol. This test drives a real bash the same way forkShell
+// does, with the SAME line the agent writes (parkedShellLine), for a staged command of
+// `cat` — once with the redirect the fix added and once with exactly that redirect
+// removed, which is the pre-fix line byte for byte.
+//
+// Discriminator: bash's control tail is `__ga_rc=$?` followed by two printfs. If `cat`
+// inherits the shell's stdin it consumes and ECHOES that text, so the literal,
+// unexpanded source lands on stdout ("__ga_rc=$?", "%d", "$__ga_rc"); if stdin is /dev/null,
+// bash executes the tail instead and stdout carries the *evaluated* sentinel
+// ("<nonce> 0"). One string tells the two apart with no timing involved.
+//
+// Stdin is closed after the line is written only so the leaking case terminates for the
+// test; production never closes it, which is precisely why the pre-fix leak's other
+// outcome is an unbounded block rather than a wrong answer.
+func TestParkedShellSubshellCannotReadTheAgentsControlPipe(t *testing.T) {
+	nonce, err := newNonce()
+	if err != nil {
+		t.Fatalf("newNonce: %v", err)
+	}
+	staged := filepath.Join(t.TempDir(), "cmd")
+	if err := os.WriteFile(staged, []byte("cat\n"), 0o600); err != nil {
+		t.Fatalf("stage command: %v", err)
+	}
+
+	runLine := func(t *testing.T, line string) string {
+		t.Helper()
+		cmd := exec.Command("bash")
+		in, err := cmd.StdinPipe()
+		if err != nil {
+			t.Fatalf("StdinPipe: %v", err)
+		}
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start bash: %v", err)
+		}
+		if _, err := io.WriteString(in, line); err != nil {
+			t.Fatalf("write line: %v", err)
+		}
+		_ = in.Close()
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("bash: %v (stdout %q)", err, out.String())
+		}
+		return out.String()
+	}
+
+	// PRESENCE: the pre-fix line, derived from the real one by removing exactly the
+	// redirect, so this case cannot silently stop being the pre-fix line.
+	leaky := strings.Replace(parkedShellLine(staged, nonce), parkedShellStdinRedirect, "", 1)
+	if leaky == parkedShellLine(staged, nonce) {
+		t.Fatalf("parkedShellLine no longer contains %q, so this test is not exercising the hazard it claims to",
+			parkedShellStdinRedirect)
+	}
+	if got := runLine(t, leaky); !strings.Contains(got, "__ga_rc=$?") {
+		t.Fatalf("without the redirect, `cat` did not echo the agent's control bytes; stdout = %q — "+
+			"the hazard this test's other half guards against must be reachable, or that half proves nothing", got)
+	}
+
+	// ABSENCE: the real line. `cat` sees EOF at once, so the control tail reaches bash
+	// and the sentinel arrives evaluated.
+	got := runLine(t, parkedShellLine(staged, nonce))
+	if strings.Contains(got, "__ga_rc=$?") {
+		t.Fatalf("the staged command read the agent's own control pipe; stdout = %q", got)
+	}
+	if want := nonce + " 0\n"; !strings.Contains(got, want) {
+		t.Fatalf("stdout = %q, want it to contain the evaluated sentinel %q", got, want)
+	}
+}
+
+// TestAgentGivesACommandWithNoStdinAnEOF is the same invariant through the real
+// ServeConn path: internal/exec/runner.go's container arm closes stdin unconditionally
+// ("a command given no stdin must still see EOF"), and the two tiers must not diverge
+// on it.
+//
+// `cat` with no stdin is the whole test. Pre-fix it either blocked until TimeoutS or
+// echoed the agent's protocol back and lost the exit code; the second command proves
+// the control stream is still in sync afterwards, which a leak would have broken for
+// every subsequent command on this VM as well as this one.
+func TestAgentGivesACommandWithNoStdinAnEOF(t *testing.T) {
+	a := newTestAgent(t)
+	start := time.Now()
+	stdout, _, end, errMsg := drive(t, a, Request{
+		Command: "cat; echo rc=$?", TimeoutS: 20, CapBytes: 1 << 20,
+	}, nil)
+	if errMsg != "" {
+		t.Fatalf("agent error: %s (a command reading stdin must see EOF, not the control pipe)", errMsg)
+	}
+	if stdout != "rc=0\n" {
+		t.Fatalf("stdout = %q, want %q: `cat` with no stdin must read EOF and nothing else", stdout, "rc=0\n")
+	}
+	if end.ExitCode != 0 {
+		t.Fatalf("end = %+v, want exit 0", end)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("took %s: `cat` blocked on stdin instead of seeing EOF", elapsed)
+	}
+	if _, _, end2, errMsg2 := drive(t, a, Request{Command: "echo after", CapBytes: 1 << 20}, nil); errMsg2 != "" || end2.ExitCode != 0 {
+		t.Fatalf("second command: end=%+v err=%s — the first command consumed the agent's control stream", end2, errMsg2)
 	}
 }
 
