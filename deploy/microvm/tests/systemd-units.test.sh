@@ -154,6 +154,50 @@ sh_max_committed="$(grep -oE 'SH_MAX_COMMITTED_MB=[0-9]+' "$SERVICE" | head -n1 
 check "SH_MAX_COMMITTED_MB is set" "$([ -n "$sh_max_committed" ] && echo yes || echo no)" "yes"
 check "SH_MAX_COMMITTED_MB is non-zero" "$([ -n "$sh_max_committed" ] && [ "$sh_max_committed" -gt 0 ] && echo yes || echo no)" "yes"
 
+echo "== the admission budget is checked against the host's physical memory, not just against itself"
+# SH_MAX_COMMITTED_MB less SH_MEMORY_RESERVE_MB is what the pool will admit, and nothing
+# in the worker reads MemTotal (grep -rE 'MemTotal|MemAvailable|meminfo|Sysinfo' over
+# remote-worker returns nothing). On a host with less RAM than the budget the gate
+# therefore cannot refuse before the OOM killer arrives, and spec §7.4's prediction 1
+# reads as confirmed by a gate that never refuses at all. AssertMemory is the control
+# that makes the budget a statement about THIS host: systemd compares it against
+# physical memory and fails the unit at start, the same posture as
+# AssertPathExists=/dev/kvm.
+assert_memory_raw="$(sed -n '/^\[Unit\]/,/^\[Service\]/p' "$SERVICE" | grep -oE '^AssertMemory=[<>=]*[0-9]+[KMGT]?' | head -n1 | cut -d= -f2-)"
+check "AssertMemory is set in [Unit]" \
+  "$([ -n "$assert_memory_raw" ] && echo yes || echo no)" "yes"
+# The operator must be >= : "at least this much RAM". An = or <= would assert something
+# else entirely (and a bare size means =, which would refuse on any larger host).
+check "AssertMemory uses the >= comparison (at LEAST this much physical memory)" \
+  "$(printf '%s' "$assert_memory_raw" | grep -cE '^>=[0-9]+[KMGT]?$')" "1"
+# Normalised to MiB so it can be compared with SH_MAX_COMMITTED_MB, which is in MiB.
+# systemd's size suffixes are 1024-based.
+assert_memory_mb=""
+case "$assert_memory_raw" in
+  *T) assert_memory_mb=$(( $(printf '%s' "$assert_memory_raw" | tr -dc '0-9') * 1024 * 1024 )) ;;
+  *G) assert_memory_mb=$(( $(printf '%s' "$assert_memory_raw" | tr -dc '0-9') * 1024 )) ;;
+  *M) assert_memory_mb=$(printf '%s' "$assert_memory_raw" | tr -dc '0-9') ;;
+  *K) assert_memory_mb=$(( $(printf '%s' "$assert_memory_raw" | tr -dc '0-9') / 1024 )) ;;
+  *[0-9]) assert_memory_mb=$(( $(printf '%s' "$assert_memory_raw" | tr -dc '0-9') / 1024 / 1024 )) ;;
+esac
+# Two bounds, and both are load-bearing:
+#
+#   - not far BELOW the budget: raising SH_MAX_COMMITTED_MB without raising the
+#     assertion is exactly the drift that leaves a 16 GiB host admitting 20 GiB of VMs.
+#     The 90% floor is the tolerance the assertion needs, because physical memory here is
+#     MemTotal, which is always somewhat below nominal RAM.
+#   - not ABOVE the budget: an assertion at or above nominal RAM refuses to start on a
+#     host of exactly the size the budget was written for, because of that same MemTotal
+#     shortfall. That would be a self-inflicted outage, so it is a test failure too.
+budget_floor=$(( sh_max_committed * 90 / 100 ))
+check "AssertMemory is within the tolerance band of SH_MAX_COMMITTED_MB (>= 90% of it, and not above it)" \
+  "$([ -n "$assert_memory_mb" ] && [ "$assert_memory_mb" -ge "$budget_floor" ] && [ "$assert_memory_mb" -le "$sh_max_committed" ] && echo yes || echo no)" "yes"
+# The reserve is headroom INSIDE the ceiling (budget.go: MaxCommittedBytes less
+# MemoryReserveBytes), so the ceiling itself is what the host has to be able to hold.
+sh_reserve="$(grep -oE 'SH_MEMORY_RESERVE_MB=[0-9]+' "$SERVICE" | head -n1 | cut -d= -f2)"
+check "SH_MEMORY_RESERVE_MB is set and smaller than SH_MAX_COMMITTED_MB (Config.Normalize refuses otherwise)" \
+  "$([ -n "$sh_reserve" ] && [ "$sh_reserve" -lt "$sh_max_committed" ] && echo yes || echo no)" "yes"
+
 echo "== the slice's swap posture (spec §6 mitigation #3: fast, attributable in-cgroup OOM kill)"
 check "MemorySwapMax=0 is set on the slice" \
   "$([ "$(grep -cF 'MemorySwapMax=0' "$SLICE")" -ge 1 ] && echo yes || echo no)" "yes"

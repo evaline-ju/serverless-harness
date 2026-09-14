@@ -68,6 +68,31 @@ AssertPathExists=/dev/kvm
 # reintroducing.
 StartLimitIntervalSec=300
 StartLimitBurst=5
+# The admission budget below (SH_MAX_COMMITTED_MB) is a promise about how much memory
+# this host has, and nothing in the worker reads MemTotal. On a host with less RAM than
+# the budget the gate therefore cannot refuse before the OOM killer arrives -- it admits
+# VMs against memory that does not exist, and spec §7.4's prediction 1 ("replenishment
+# binds on process/memory count before CPU") gets "confirmed" by a gate that never
+# refuses at all. Every other invariant in this tier fails at start rather than trusting
+# the operator (AssertPathExists=/dev/kvm above, SH_MAX_COMMITTED_MB being mandatory,
+# Config.Normalize's cross-field checks); the one that was missing is the check against
+# the host this unit is actually running on. A comment is not a control.
+#
+# AssertMemory compares the amount of PHYSICAL memory in the system (in a container, the
+# memory assigned to it) -- systemd's ConditionMemory family, available since v244 -- so
+# it is the same fact the budget is asserting, read from the host. Assertion rather than
+# Condition deliberately: a Condition silently skips the start, an Assert fails it
+# loudly. And like AssertPathExists it does NOT trigger Restart=, so it cannot produce
+# the crash-loop the StartLimit keys above exist to bound.
+#
+# 23G against a 24 GiB SH_MAX_COMMITTED_MB, not 24G: physical memory here is MemTotal,
+# which is always somewhat BELOW nominal RAM (firmware and kernel reservations), so a
+# threshold equal to the budget would refuse to start on a genuine 24 GiB host. The band
+# is deliberate -- this catches "the budget is bigger than the machine" (a 16 GiB host
+# refuses), not a 1% discrepancy. deploy/microvm/tests/systemd-units.test.sh does that
+# arithmetic against SH_MAX_COMMITTED_MB below and against that tolerance, so raising
+# either value alone is a test failure rather than a discovery made by the OOM killer.
+AssertMemory=>=23G
 
 [Service]
 Type=simple
