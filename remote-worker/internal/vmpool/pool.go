@@ -476,6 +476,18 @@ func (p *pool) nextIDLocked() string {
 // spec §4.4 establishes the workspace is a per-dispatch derivation — a detached
 // worktree at a pinned commit, with continuity living in the Redis session log — so
 // reclaiming costs a re-converge, never data.
+//
+// EXCEPT while an Exec is in flight, which is the one case where it costs exactly that.
+// It used to keep the map entry when rp.busy() — correctly — and then remove the
+// directory anyway, under the running command; on the Firecracker arm the guest would go
+// on writing to a now-unlinked workspace.img inode (its jail hardlink keeps it alive) and
+// those writes would vanish silently. There is no safe way to honour the request then, so
+// the standbys are dropped, the workspace is KEPT, and the caller is told: the run's own
+// idle clock reclaims the tree at WorkspaceIdle, which is late rather than wrong.
+//
+// The directory is detached under the lock and removed after (detachWorkspace), for the
+// same reason the sweep does it: a key re-created between the two steps must not have its
+// fresh tree deleted by this removal.
 func (p *pool) Reclaim(ctx context.Context, key string) error {
 	p.mu.Lock()
 	rp := p.runs[key]
@@ -489,11 +501,13 @@ func (p *pool) Reclaim(ctx context.Context, key string) error {
 		tm.Stop()
 	}
 	rp.pending = nil
-	dir := rp.dir
-	// Keep the entry while work is in flight: deleting it would let the next Exec
-	// re-create the directory under a run that is still using the old one.
-	if !rp.busy() {
-		delete(p.runs, key)
+	busy := rp.busy()
+	var tomb string
+	var detachErr error
+	if !busy {
+		if tomb, detachErr = detachWorkspace(rp.dir); detachErr == nil {
+			delete(p.runs, key)
+		}
 	}
 	p.mu.Unlock()
 
@@ -503,7 +517,15 @@ func (p *pool) Reclaim(ctx context.Context, key string) error {
 			log.Printf("vmpool: reclaim %q: destroy: %v", key, err)
 		}
 	}
-	return removeWorkspace(dir)
+	switch {
+	case busy:
+		return fmt.Errorf("vmpool: reclaimed %q's standbys but KEPT its workspace: an Exec is "+
+			"in flight, and removing the tree under a running command loses its writes silently "+
+			"on the Firecracker arm; WorkspaceIdle will reclaim it", key)
+	case detachErr != nil:
+		return detachErr
+	}
+	return removeWorkspace(tomb)
 }
 
 func (p *pool) Stats() Stats {

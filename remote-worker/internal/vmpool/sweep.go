@@ -6,6 +6,10 @@ import (
 )
 
 // reclaimBatch is what a sweep detached: VMs to destroy and workspaces to remove.
+//
+// dirs holds DETACHED paths, not live workspace directories — see detachWorkspace. A
+// live path in this slice would be removable out from under a run that has since
+// re-claimed the key, which is exactly the bug the tombstone exists to prevent.
 type reclaimBatch struct {
 	vms  []VM
 	dirs []string
@@ -68,7 +72,22 @@ func (p *pool) sweepOnce(now time.Time) reclaimBatch {
 			// what makes it safe: the workspace is a per-dispatch derivation — a
 			// detached worktree at a pinned commit, with continuity living in the Redis
 			// session log — so early reclamation costs a re-converge, never data.
-			b.dirs = append(b.dirs, rp.dir)
+			//
+			// The tree is detached HERE, under the lock, in the same critical section
+			// that drops the map entry — so the key and its directory become
+			// unreachable together and the queued removal cannot touch whatever a
+			// re-created run puts at the original path (detachWorkspace).
+			tomb, err := detachWorkspace(rp.dir)
+			if err != nil {
+				// Keep the run rather than dropping an entry whose directory is still
+				// live: the next tick retries, and a run that outlives its own
+				// reclamation is recoverable where a leaked-but-forgotten tree is not.
+				log.Printf("vmpool: sweep detach %s: %v", rp.dir, err)
+				continue
+			}
+			if tomb != "" {
+				b.dirs = append(b.dirs, tomb)
+			}
 			delete(p.runs, key)
 			continue
 		}

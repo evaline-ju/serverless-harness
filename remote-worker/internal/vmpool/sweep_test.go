@@ -3,6 +3,7 @@ package vmpool
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -168,6 +169,151 @@ func TestWorkspaceIdleDeletesTheWorkspaceAndTheKeyCanBeReused(t *testing.T) {
 	}
 	if got := p.Stats().ColdAcquires[ColdFirstExec]; got != 2 {
 		t.Fatalf("ColdAcquires[first-exec] = %d, want 2 — a reclaimed key is an unseen key again", got)
+	}
+}
+
+// ageOutAndSweep puts key past WorkspaceIdle and runs ONE sweep pass by hand, returning
+// the detached batch and the run's live workspace directory.
+//
+// It ages the run by rewriting lastExec rather than by advancing the clock, deliberately:
+// advancing past WorkspaceIdle also fires the reclaim ticker, which would sweep and hand
+// the batch to the reclaim goroutine itself, and the window under test is precisely the
+// one between "the sweep decided" and "the removal ran". Driving the two halves by hand
+// is the only way to sit inside it deterministically.
+func ageOutAndSweep(t *testing.T, p Pool, lc *fakeLauncher, clk *fakeClock, key string) (reclaimBatch, string) {
+	t.Helper()
+	var dir string
+	lc.setBeforeRestore(func(r RestoreRequest) { dir = r.WorkspaceDir })
+	if _, err := p.Exec(context.Background(), key, Exec{Command: "converge"}, &capturingSink{}); err != nil {
+		t.Fatalf("Exec %s: %v", key, err)
+	}
+	if dir == "" {
+		t.Fatal("the launcher was never handed a workspace directory")
+	}
+
+	pp := p.(*pool)
+	pp.mu.Lock()
+	rp := pp.runs[key]
+	if rp == nil {
+		pp.mu.Unlock()
+		t.Fatalf("no run pool for %s after an Exec", key)
+	}
+	rp.lastExec = clk.Now().Add(-2 * DefaultWorkspaceIdle)
+	for _, tm := range rp.pending {
+		tm.Stop()
+	}
+	rp.pending = nil
+	pp.mu.Unlock()
+
+	b := pp.sweepOnce(clk.Now())
+	if len(b.dirs) != 1 {
+		t.Fatalf("sweepOnce queued %d workspaces for removal, want 1 — nothing was reclaimed, so anything this test then asserts about the removal would be vacuous", len(b.dirs))
+	}
+	if b.dirs[0] == dir {
+		t.Fatalf("the batch carries the LIVE workspace path %s; a queued removal must name a detached tree that no workspace_key can resolve to", dir)
+	}
+	return b, dir
+}
+
+// TestGateReclamationCannotDeleteALiveWorkspace is spec §2.3's isolation property seen
+// from the housekeeping side, and the companion to TestGateNoCrossRunBleed: that gate
+// interleaves two keys, this one interleaves one key with its own reclamation. It needs no
+// KVM — the window is Pool bookkeeping plus real directories, not anything only hardware
+// could get wrong.
+//
+// The sweep decides to reclaim under p.mu but os.RemoveAll runs later on the reclaim
+// goroutine, behind up to MaxReclaimsPerScan VM destroys. In that window a new Exec for
+// the same key used to pass runLocked, re-create the directory and restore a VM into it —
+// and then the removal deleted the tree under a running command, silently on the
+// Firecracker arm, because the guest goes on writing to a workspace.img inode its jail
+// hardlink keeps alive.
+func TestGateReclamationCannotDeleteALiveWorkspace(t *testing.T) {
+	// Presence before absence: the removal this gate constrains must actually happen,
+	// or "the new run's files survived" would be true of a pool that reclaims nothing.
+	t.Run("an_uncontested_reclamation_really_removes_the_tree", func(t *testing.T) {
+		p, lc, clk := testPool(t)
+		b, dir := ageOutAndSweep(t, p, lc, clk, "run-a")
+		root := filepath.Dir(dir)
+
+		p.(*pool).doReclaim(b)
+
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("stat(%s) after the reclamation: err = %v, want IsNotExist", dir, err)
+		}
+		// And the detached tree is gone too, not merely renamed out of sight: a
+		// tombstone nobody removes is a disk leak wearing a fix's clothing.
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			names := make([]string, 0, len(entries))
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			t.Fatalf("WorkspaceRoot holds %v after the reclamation, want nothing", names)
+		}
+	})
+
+	t.Run("a_key_re_created_before_the_removal_keeps_its_own_tree", func(t *testing.T) {
+		p, lc, clk := testPool(t)
+		b, dir := ageOutAndSweep(t, p, lc, clk, "run-a")
+
+		// The key comes back inside the window: a fresh dispatch for the same run id,
+		// which re-derives its worktree and writes to it.
+		if _, err := p.Exec(context.Background(), "run-a", Exec{Command: "re-converge"}, &capturingSink{}); err != nil {
+			t.Fatalf("Exec after the sweep decided to reclaim: %v", err)
+		}
+		marker := filepath.Join(dir, "converged")
+		if err := os.WriteFile(marker, []byte("pinned commit"), 0o600); err != nil {
+			t.Fatalf("write marker: %v", err)
+		}
+
+		p.(*pool).doReclaim(b)
+
+		got, err := os.ReadFile(marker)
+		if err != nil || string(got) != "pinned commit" {
+			t.Fatalf("marker after the queued reclamation ran = %q, err = %v — the removal ate the NEW run's workspace", got, err)
+		}
+	})
+}
+
+// TestReclaimKeepsTheWorkspaceOfARunWithAnExecInFlight pins the same finding in
+// Pool.Reclaim, which had the worse shape of the two: it correctly KEPT the map entry
+// while work was in flight and then removed the directory anyway.
+func TestReclaimKeepsTheWorkspaceOfARunWithAnExecInFlight(t *testing.T) {
+	p, lc, clk := testPool(t)
+	var dir string
+	lc.setBeforeRestore(func(r RestoreRequest) { dir = r.WorkspaceDir })
+	primed(t, p, clk, "run-a")
+
+	release, entered := hold(lc)
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.Exec(context.Background(), "run-a", Exec{Command: "sleep", TimeoutS: 30}, &capturingSink{})
+		done <- err
+	}()
+	<-entered
+
+	marker := filepath.Join(dir, "being-written")
+	if err := os.WriteFile(marker, []byte("mid-command"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	err := p.Reclaim(context.Background(), "run-a")
+	if err == nil {
+		t.Fatal("Reclaim of a run with an Exec in flight returned nil — it cannot have honoured the request safely")
+	}
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("stat(%s) after Reclaim: %v — the workspace of a running command must survive; deleting it loses the guest's writes silently on the Firecracker arm", marker, statErr)
+	}
+	// What Reclaim CAN do, it still does: the standbys are gone.
+	if s := p.Stats(); s.StandbysResident != 0 {
+		t.Fatalf("StandbysResident = %d after Reclaim, want 0 — the standbys are droppable even when the workspace is not", s.StandbysResident)
+	}
+
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("the in-flight Exec failed after a Reclaim: %v", err)
 	}
 }
 
