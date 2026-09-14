@@ -193,6 +193,44 @@ die() { echo "e11: $*" >&2; exit 1; }
 log() { echo "e11: $*" >&2; }
 
 # ---------------------------------------------------------------------------
+# Teardown, armed BEFORE anything is started (review 4001908613).
+#
+# This driver had no `trap` at all, so every `die` path -- host_signals_snapshot's two
+# refusals, the record guard, a failed percentile -- left the whole arm's stack running:
+# the worker, the relay, the redis container, and the per-rung temp dirs. Beyond the
+# leak, the orphans actively corrupt the next attempt:
+#   - the orphaned relay/worker keep 8444/6381 bound, so the operator's rerun fails at
+#     relay start with a bind error that says nothing about the real cause;
+#   - an orphaned `firecracker` is still matched by discover_pids' UNSCOPED
+#     `pgrep -f firecracker`, so it silently inflates the NEXT run's pssBytes -- the one
+#     number spec section 7.3 insists must not be wrong, corrupted in a way that looks
+#     like a real density result.
+#
+# Ordering and variable discipline both follow build-snapshot.sh's cleanup_on_exit
+# (which documents the bug at length): kill before remove, and nothing this trap touches
+# is ever a function local. That is why the pid globals and the temp root are declared
+# HERE, above the trap, rather than further down next to the functions that assign them:
+# a failure anywhere after this point finds them defined, and `${VAR:-}` defaults keep a
+# future global added without one from reintroducing the "unbound variable INSIDE the
+# trap, which aborts the rest of the trap" failure.
+#
+# Every temp path this script creates now lives under $E11_TMPDIR (rather than bare
+# `mktemp`/`mktemp -d` calls held in function locals), so one `rm -rf` here reclaims all
+# of them however deep the sweep was when it stopped.
+# ---------------------------------------------------------------------------
+E11_WORKER_PID=""
+E11_RELAY_PID=""
+E11_WORKER_BIN=""
+E11_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/e11-density.XXXXXX")"
+
+cleanup_on_exit() {
+  stop_container_stack || true
+  stop_microvm_stack || true
+  [ -z "${E11_TMPDIR:-}" ] || rm -rf "$E11_TMPDIR"
+}
+trap cleanup_on_exit EXIT
+
+# ---------------------------------------------------------------------------
 # Preflight -- duplicated from e10-lifecycle.sh's own check_kvm/check_cgroups/
 # check_swap/check_governor rather than sourcing that file: sourcing a sibling
 # script that ends in its own unconditional main() call is a fragile cross-script
@@ -336,6 +374,32 @@ require_numeric() {
   printf '%s' "$value"
 }
 
+# dimension_literal prints the PYTHON LITERAL for one swept dimension: the number itself,
+# or `None` (JSON null) for the "-" main() passes on the container arm, which has neither a
+# standby depth nor a guest RAM size.
+#
+# Review 4001908573: `run_density_rung container - - "$c"` fed those dashes straight into
+# the record writer's bare numeric interpolations (`'standbyDepth': $d,` -> `: -,`), so
+# EVERY container rung raised a SyntaxError, wrote no record, and tripped the `[ -s ]`
+# guard -- and since shuffle_e11_arms randomises arm order, roughly half of all runs died
+# there before the microvm arm ran at all, with the container stack left running. The arm
+# the whole experiment is priced against recorded nothing.
+#
+# `required=1` (the microvm arm) makes "not applicable" itself a refusal: null there would
+# mean the sweep lost the dimension it is sweeping.
+dimension_literal() {
+  local field="$1" value="$2" required="${3:-0}"
+  case "$value" in
+  '-' | '')
+    [ "$required" != "1" ] ||
+      die "$field is '$value' (not applicable) on an arm that requires it - a rung cannot be recorded without the dimension it swept"
+    printf 'None'
+    return 0
+    ;;
+  esac
+  require_numeric "$field" "$value"
+}
+
 # host_cpu_fraction samples /proc/stat twice, SAMPLE_WINDOW_S apart, and returns
 # the busy fraction over that window -- never a single-sample /proc/stat snapshot,
 # which is meaningless (it is a cumulative counter since boot).
@@ -372,15 +436,36 @@ host_cpu_fraction() {
 # defanged even pss_bytes_for_pids's "refusing to fall back to RSS" refusal, which spec
 # section 7.3's boxed warning makes the single most important failure in this file.
 # Checking the status here is what turns those refusals back into stops.
+#
+# $1 ("require_vmm", default 0) is what makes a ZERO PSS TOTAL a refusal rather than a
+# value on the arm where it can only be wrong (review 4001908599). With no match for
+# $VMM_PROC_PATTERN, all_pids is empty, pss_bytes_for_pids returns 0, and require_numeric
+# happily accepts it -- so the rung records pssBytes: 0. That is reachable from a mis-set
+# SH_E11_VMM_PROC_PATTERN, from the jailer renaming the process, or from the arm simply
+# not being up, and it is wrong in the OPTIMISTIC direction: the single number E11 exists
+# to produce goes missing while the record still looks complete, which is the same failure
+# mode as the RSS fallback that pss_bytes_for_pids goes to real lengths to refuse.
+#
+# It is a parameter, not an unconditional check, because ZERO IS CORRECT on the container
+# arm (no VMM at all) and for the virtiofsd pattern on the Firecracker-only microvm arm
+# (see the header). Only "the microvm arm found no VMM process" is impossible-by-
+# construction, and only main()'s microvm call sites pass 1.
 host_signals_snapshot() {
+  local require_vmm="${1:-0}"
   local vmm_pids virtiofsd_pids all_pids pss mem cpu count
   vmm_pids="$(discover_pids "$VMM_PROC_PATTERN")"
+  if [ "$require_vmm" = "1" ] && [ -z "$vmm_pids" ]; then
+    die "no host process matches the VMM pattern '$VMM_PROC_PATTERN' while the microvm arm is running: PSS would total 0 bytes, and a zero is a REFUSAL here, not a measurement (spec section 7.3's boxed warning). Check SH_E11_VMM_PROC_PATTERN against the process the jailer actually spawns, and that the worker is up."
+  fi
   virtiofsd_pids="$(discover_pids "$VIRTIOFSD_PROC_PATTERN")"
   # shellcheck disable=SC2086 # word-splitting into pss_bytes_for_pids's "$@" is intended
   all_pids="$vmm_pids $virtiofsd_pids"
   # shellcheck disable=SC2086
   pss="$(pss_bytes_for_pids $all_pids)" || return 1
   pss="$(require_numeric pssBytes "$pss")" || return 1
+  if [ "$require_vmm" = "1" ] && [ "$pss" = "0" ]; then
+    die "the VMM pattern '$VMM_PROC_PATTERN' matched pids [$(printf '%s' "$vmm_pids" | tr '\n' ' ')] but their PSS summed to 0 bytes - refusing a zero total on the microvm arm (spec section 7.3): a real Firecracker guest is never 0, so \$SH_E11_PROC_ROOT or the smaps_rollup content is wrong, not the memory."
+  fi
   mem="$(require_numeric memAvailableBytes "$(mem_available_bytes)")" || return 1
   cpu="$(require_numeric hostCpuFraction "$(host_cpu_fraction 1)")" || return 1
   count="$(require_numeric processCount "$(printf '%s\n%s\n' "$vmm_pids" "$virtiofsd_pids" | grep -c '[0-9]' || true)")" || return 1
@@ -399,10 +484,23 @@ json_escape() {
 
 percentile() {
   local p="$1" file="$2"
+  # A missing or EMPTY input file is not a zero percentile, it is the absence of any
+  # measurement -- so this refuses (prints nothing, returns non-zero) and the caller names
+  # the rung. Two defects lived in the old `print 0` form (review 4001908597):
+  #
+  #   1. the value. `p95Ms: 0` at a rung where every Exec failed is not a fast rung, and
+  #      detectKnee reads it as the healthiest point in the ladder; at c=1 it makes the
+  #      baseline bound (p95 * degradeX) zero and marks every later rung unhealthy.
+  #   2. the SHAPE. `sort -n` on a missing file exits 2, awk still printed 0, and
+  #      `pipefail` propagated sort's status -- so a caller's `|| echo 0` appended a
+  #      SECOND line, which is exactly the two-line-value defect final review H2 fixed in
+  #      mem_available_bytes. The `[ -s ]` guard means `sort` is never handed a missing
+  #      file at all, and the awk END branch exits non-zero instead of printing.
+  [ -s "$file" ] || return 1
   sort -n "$file" | awk -v p="$p" '
     { a[NR] = $1; n = NR }
     END {
-      if (n == 0) { print 0; exit }
+      if (n == 0) { exit 1 }
       rank = int((p / 100.0) * n)
       if (rank < 1) rank = 1
       if (rank > n) rank = n
@@ -433,7 +531,7 @@ e11_tool_call_mix() {
 grpc_exec_record() {
   local relay_port="$1" sandbox_id="$2" workspace_key="$3" cmd="$4" req_id="$5" out_file="$6"
   local t0 t1 ms err_log cause status
-  err_log="$(mktemp)"
+  err_log="$(mktemp "$E11_TMPDIR/errlog.XXXXXX")"
   t0="$(date +%s%N)"
   if grpcurl -plaintext -proto "$PROTO_FILE" \
     -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":$req_id,\"command\":$(json_escape "$cmd"),\"timeout_s\":30,\"workspace_key\":$(json_escape "$workspace_key")}}" \
@@ -486,16 +584,22 @@ SCRIPT
 # converge_slot times ONE Exec running build_converge_script's output, SEPARATELY
 # from the slot's Exec-mix loop (spec section 7.5: "Time converge separately from
 # Exec ... or the cost hides inside the rungs"). Prints elapsed ms.
+# It also RETURNS THE RPC's OWN STATUS. A FAILED converge is not a fast converge: the
+# workspace was never prepared, so every Exec in that slot afterwards measures something
+# else, and timing the failure would put a small number in convergeMsP50 -- wrong in the
+# "looks cheap" direction. The slot below turns a non-zero status here into a slot failure,
+# and run_density_rung refuses the rung.
 converge_slot() {
   local relay_port="$1" sandbox_id="$2" workspace_key="$3" run_id="$4"
-  local script t0 t1
+  local script t0 t1 rc=0
   script="$(build_converge_script "$CONVERGE_REPO_URL" "$CONVERGE_REF" "$run_id")"
   t0="$(date +%s%N)"
   grpcurl -plaintext -proto "$PROTO_FILE" \
     -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":0,\"command\":$(json_escape "$script"),\"timeout_s\":300,\"workspace_key\":$(json_escape "$workspace_key")}}" \
-    "localhost:${relay_port}" sandbox.v1.SandboxExec/Exec >/dev/null 2>>"$RESULTS/e11-converge.log"
+    "localhost:${relay_port}" sandbox.v1.SandboxExec/Exec >/dev/null 2>>"$RESULTS/e11-converge.log" || rc=$?
   t1="$(date +%s%N)"
   echo $(((t1 - t0) / 1000000))
+  return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -534,10 +638,6 @@ start_redis_loopback() {
     die "could not start the scratch redis on 127.0.0.1:$E11_REDIS_PORT for the $arm arm - the relay has nowhere to publish its presence record, so every Exec in this arm would fail for a reason that has nothing to do with density"
 }
 
-E11_WORKER_PID=""
-E11_RELAY_PID=""
-E11_WORKER_BIN=""
-
 start_container_stack() {
   [ "$E11_START_STACK" = "1" ] || {
     log "container stack: SH_E11_START_STACK=0, reusing an already-running stack"
@@ -571,8 +671,10 @@ start_container_stack() {
 
 stop_container_stack() {
   [ "$E11_START_STACK" = "1" ] || return 0
-  [ -n "$E11_WORKER_PID" ] && kill "$E11_WORKER_PID" 2>/dev/null
-  [ -n "$E11_RELAY_PID" ] && kill "$E11_RELAY_PID" 2>/dev/null
+  # ${VAR:-} because these run from the EXIT trap too, which can fire before either is
+  # assigned (build-snapshot.sh's cleanup_on_exit documents that exact failure).
+  [ -n "${E11_WORKER_PID:-}" ] && kill "${E11_WORKER_PID:-}" 2>/dev/null
+  [ -n "${E11_RELAY_PID:-}" ] && kill "${E11_RELAY_PID:-}" 2>/dev/null
   docker rm -f "sh-e11-redis-$$" >/dev/null 2>&1 || true
   E11_WORKER_PID=""
   E11_RELAY_PID=""
@@ -620,8 +722,10 @@ start_microvm_stack() {
 
 stop_microvm_stack() {
   [ "$E11_START_STACK" = "1" ] || return 0
-  [ -n "$E11_WORKER_PID" ] && kill "$E11_WORKER_PID" 2>/dev/null
-  [ -n "$E11_RELAY_PID" ] && kill "$E11_RELAY_PID" 2>/dev/null
+  # ${VAR:-} because these run from the EXIT trap too, which can fire before either is
+  # assigned (build-snapshot.sh's cleanup_on_exit documents that exact failure).
+  [ -n "${E11_WORKER_PID:-}" ] && kill "${E11_WORKER_PID:-}" 2>/dev/null
+  [ -n "${E11_RELAY_PID:-}" ] && kill "${E11_RELAY_PID:-}" 2>/dev/null
   docker rm -f "sh-e11-redis-$$" >/dev/null 2>&1 || true
   E11_WORKER_PID=""
   E11_RELAY_PID=""
@@ -642,9 +746,13 @@ run_density_rung() {
   local arm="$1" d="$2" ram_mb="$3" c="$4" sandbox_id="$5" relay_port="$6" out_json_path="$7"
   log "rung: arm=$arm D=$d guest=${ram_mb}MiB c=$c"
 
-  local slot_dir converge_file
-  slot_dir="$(mktemp -d)"
-  converge_file="$RESULTS/.e11-converge-times"
+  # Every temp path is under $E11_TMPDIR, named for the rung rather than mktemp-random, so
+  # the EXIT trap reclaims all of them however this rung ends (review 4001908613).
+  local slot_dir converge_file rung_tag
+  rung_tag="${arm}-d${d}-ram${ram_mb}-c${c}"
+  slot_dir="$E11_TMPDIR/slots-$rung_tag"
+  mkdir -p "$slot_dir"
+  converge_file="$E11_TMPDIR/converge-$rung_tag"
   : >"$converge_file"
 
   local wall_t0 wall_t1 pids=()
@@ -657,9 +765,13 @@ run_density_rung() {
         wskey="$run_id" # microvm arm REFUSES an empty workspace_key (proto doc comment)
       fi               # container arm may omit/empty it (today's single shared workspace)
 
-      local cms
-      cms="$(converge_slot "$relay_port" "$sandbox_id" "$wskey" "$run_id")"
+      local cms cms_rc=0
+      cms="$(converge_slot "$relay_port" "$sandbox_id" "$wskey" "$run_id")" || cms_rc=$?
       echo "$cms" >>"$converge_file"
+      if [ "$cms_rc" -ne 0 ]; then
+        echo "e11: slot $i: converge FAILED after ${cms}ms (see $RESULTS/e11-converge.log) - its workspace was never prepared, so its Exec timings would measure something else" >&2
+        exit 1
+      fi
 
       local times_file="$slot_dir/slot-$i.times" req=0
       local want=$((ITERS_PER_SLOT + WARMUP_PER_SLOT))
@@ -673,17 +785,26 @@ run_density_rung() {
     ) &
     pids+=("$!")
   done
-  local pid
+  # Each slot's exit status is CHECKED, not discarded: a slot exits non-zero only when its
+  # converge failed, which means its Exec timings measured a workspace that was never
+  # prepared. Recording that rung would put a fast-looking p95 and a small convergeMsP50
+  # into the ladder.
+  local pid slot_failures=0
   for pid in "${pids[@]}"; do
-    wait "$pid"
+    wait "$pid" || slot_failures=$((slot_failures + 1))
   done
+  [ "$slot_failures" -eq 0 ] ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c had $slot_failures of $c slot(s) fail before their timed loop (the reason is above, and in $RESULTS/e11-converge.log) - refusing to record a rung whose slots were not all measuring the same thing"
   wall_t1="$(date +%s%N)"
   local wall_s
-  wall_s="$(awk -v ns=$((wall_t1 - wall_t0)) 'BEGIN{printf "%.4f", ns/1000000000.0}')"
+  wall_s="$(require_numeric wallSeconds "$(awk -v ns=$((wall_t1 - wall_t0)) 'BEGIN{printf "%.4f", ns/1000000000.0}')")" ||
+    die "rung arm=$arm c=$c could not measure its own wall time (see the refusal above) - throughput is derived from it, so there is nothing to record"
 
   # Aggregate every slot's steady-state (post-warmup) samples together.
   local all_times all_ok=0 all_total=0
-  all_times="$(mktemp)"
+  all_times="$E11_TMPDIR/all-times-$rung_tag"
+  : >"$all_times"
+  rm -f "${all_times}.ok"
   declare -A cause_counts
   local f
   for f in "$slot_dir"/slot-*.times; do
@@ -701,17 +822,45 @@ run_density_rung() {
     fi
   done <"$all_times"
 
-  local p95 throughput cold_count=0
-  p95="$(percentile 95 "${all_times}.ok" 2>/dev/null || echo 0)"
-  throughput="$(awk -v n="$all_ok" -v s="$wall_s" 'BEGIN{ if (s>0) printf "%.4f", n/s; else print 0 }')"
-  if [ -e "${all_times}.ok" ]; then
-    cold_count="$(awk -v t="$COLD_LATENCY_MS" '$1>=t{c++} END{print c+0}' "${all_times}.ok")"
+  # execErrorsByCause is assembled HERE, ahead of the derived fields, rather than just
+  # above the record writer where it used to be: the refusals below name these causes,
+  # because "every Exec at this rung failed" is only actionable with the reason.
+  local errors_json="{}"
+  if [ "${#cause_counts[@]}" -gt 0 ]; then
+    local parts=()
+    local cause
+    for cause in "${!cause_counts[@]}"; do
+      parts+=("$(json_escape "$cause"):${cause_counts[$cause]}")
+    done
+    errors_json="{$(
+      IFS=,
+      echo "${parts[*]}"
+    )}"
   fi
+
+  # No `|| echo 0` on either percentile call (review 4001908597), and all five derived
+  # fields go through require_numeric -- the guard that until now covered only the four
+  # host signals, while p95, throughput, cold_rate, converge_p50 and wall_s reached the
+  # record writer unvalidated.
+  local p95 throughput cold_count=0
+  p95="$(percentile 95 "${all_times}.ok")" ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c completed $all_ok successful Execs out of $all_total attempts, so it has no latency distribution to take a p95 of. Refusing to record p95Ms=0: that is not a fast rung, it is an absent measurement, and detectKnee would read it as the healthiest point in the ladder. Error causes: $errors_json - see the worker/relay logs in $RESULTS."
+  p95="$(require_numeric p95Ms "$p95")" ||
+    die "rung arm=$arm c=$c: p95 failed validation (see the refusal above)"
+  throughput="$(require_numeric throughput "$(awk -v n="$all_ok" -v s="$wall_s" 'BEGIN{ if (s>0) printf "%.4f", n/s; else print 0 }')")" ||
+    die "rung arm=$arm c=$c: throughput failed validation (see the refusal above)"
+  # `.ok` is guaranteed non-empty here: the p95 refusal above is exactly the case where it
+  # is not, so this needs no existence guard of its own.
+  cold_count="$(awk -v t="$COLD_LATENCY_MS" '$1>=t{c++} END{print c+0}' "${all_times}.ok")"
   local cold_rate
-  cold_rate="$(awk -v c="$cold_count" -v n="$all_total" 'BEGIN{ if (n>0) printf "%.4f", c/n; else print 0 }')"
+  cold_rate="$(require_numeric coldAcquireRate "$(awk -v c="$cold_count" -v n="$all_total" 'BEGIN{ if (n>0) printf "%.4f", c/n; else print 0 }')")" ||
+    die "rung arm=$arm c=$c: coldAcquireRate failed validation (see the refusal above)"
 
   local converge_p50
-  converge_p50="$(percentile 50 "$converge_file")"
+  converge_p50="$(percentile 50 "$converge_file")" ||
+    die "rung arm=$arm d=$d ram=${ram_mb}MiB c=$c recorded no converge timings at all ($converge_file is empty), so section 4.5's converge cost -- which spec section 7.5 requires be timed SEPARATELY from the Exec mix -- has no value for this rung. Refusing to record 0, which would read as a free fetch."
+  converge_p50="$(require_numeric convergeMsP50 "$converge_p50")" ||
+    die "rung arm=$arm c=$c: convergeMsP50 failed validation (see the refusal above)"
 
   local signals pss_bytes mem_bytes cpu_frac proc_count
   # `|| die`, in run_density_rung's OWN shell (main calls it directly, not in a
@@ -719,7 +868,17 @@ run_density_rung() {
   # record. Section 7.3's whole point is that a wrong density number is worse than none;
   # a sweep that completes having recorded nothing is worse still, because it looks
   # exactly like success (final review H2).
-  signals="$(host_signals_snapshot)" ||
+  #
+  # require_vmm=1 only for the microvm arm's IN-RUNG snapshot, taken immediately after the
+  # slots finish: with D >= 1 at least one standby VMM is necessarily still resident there
+  # (StandbyIdle is 90s), so zero matching processes means the sampler is looking in the
+  # wrong place, not that memory is free. The two exceptions are deliberate: the container
+  # arm has no VMM at all, and a D=0 sweep legitimately keeps no standby resident.
+  local require_vmm=0
+  if [ "$arm" = "microvm" ] && [ "$d" != "0" ]; then
+    require_vmm=1
+  fi
+  signals="$(host_signals_snapshot "$require_vmm")" ||
     die "host signal snapshot failed for rung arm=$arm c=$c (see the refusal above) - refusing to write a rung record from signals that could not be sampled"
   pss_bytes="$(python3 -c "import json,sys; print(json.load(sys.stdin)['pssBytes'])" <<<"$signals")"
   mem_bytes="$(python3 -c "import json,sys; print(json.load(sys.stdin)['memAvailableBytes'])" <<<"$signals")"
@@ -741,7 +900,10 @@ run_density_rung() {
       # Captured to its own variable first: nesting host_signals_snapshot inside the
       # python command substitution would discard its exit status along with any
       # refusal it made, which is the same subshell-swallows-die shape as above.
-      idle_snapshot="$(host_signals_snapshot)" ||
+      # NOT require_vmm=1: this poll exists to watch standbys BE RECLAIMED (spec section
+      # 7.4 prediction 5), so reaching zero VMM processes here is the predicted outcome,
+      # not a sampling failure.
+      idle_snapshot="$(host_signals_snapshot 0)" ||
         die "host signal snapshot failed while polling idle standby residency for rung arm=$arm c=$c (see the refusal above)"
       last_count="$(python3 -c "import json,sys; print(json.load(sys.stdin)['processCount'])" <<<"$idle_snapshot")"
     done
@@ -749,18 +911,16 @@ run_density_rung() {
     reclaim_converge_s="$waited"
   fi
 
-  local errors_json="{}"
-  if [ "${#cause_counts[@]}" -gt 0 ]; then
-    local parts=()
-    local cause
-    for cause in "${!cause_counts[@]}"; do
-      parts+=("$(json_escape "$cause"):${cause_counts[$cause]}")
-    done
-    errors_json="{$(
-      IFS=,
-      echo "${parts[*]}"
-    )}"
-  fi
+  # The two swept dimensions become PYTHON LITERALS in the writer below, so they go through
+  # dimension_literal rather than straight into the interpolation -- see that function for
+  # what a bare "-" did to every container rung (review 4001908573). Required on the
+  # microvm arm, which cannot record a rung without the D and guest RAM it swept.
+  local d_json ram_json required_dims=0
+  [ "$arm" = "microvm" ] && required_dims=1
+  d_json="$(dimension_literal standbyDepth "$d" "$required_dims")" ||
+    die "rung arm=$arm c=$c cannot record standbyDepth (see the refusal above)"
+  ram_json="$(dimension_literal guestRamMb "$ram_mb" "$required_dims")" ||
+    die "rung arm=$arm c=$c cannot record guestRamMb (see the refusal above)"
 
   python3 -c "
 import json
@@ -780,8 +940,8 @@ rec = {
   # Recorded, not part of the RungSample contract consumed by analyzeLadder, but
   # written alongside it so no context is lost between the raw JSON and the report.
   'arm': '$arm',
-  'standbyDepth': $d,
-  'guestRamMb': $ram_mb,
+  'standbyDepth': $d_json,
+  'guestRamMb': $ram_json,
   'substrate': '$SUBSTRATE',
   'repoCacheShape': '$REPO_CACHE_SHAPE',
   'convergeMsP50': $converge_p50,

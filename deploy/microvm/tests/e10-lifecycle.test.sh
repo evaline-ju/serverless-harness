@@ -337,6 +337,313 @@ check "rung1_tool_call_mix includes the brief's 1 MiB read" \
 [ "$(printf '%s\n' "$mix_body" | grep -c '^  echo "')" -ge 5 ] && mix_rich=yes || mix_rich=no
 check "rung1_tool_call_mix has at least 5 distinct command shapes" "$mix_rich" "yes"
 
+# ---------------------------------------------------------------------------
+# vmpoolctl is built and checked, and no rung's p50 may default to zero.
+#
+# Review 4001908604: nothing built vmpoolctl and nothing checked it -- $VMPOOLCTL was just
+# a path. A missing binary exits 127 per rung; with `set -e` absent the `>` redirections
+# left empty JSON files, the readback in main() swallowed the json.load failure with
+# `2>/dev/null || echo 0`, and the script printed "PROCEED AS DESIGNED - 0.00ms is below
+# the 8ms threshold" -- the most favourable row of spec section 7.2's table, at exit 0, for
+# a run in which rungs 2, 3 and 4 never executed.
+# ---------------------------------------------------------------------------
+echo "== vmpoolctl is built and existence-checked before any rung uses it"
+check "ensure_vmpoolctl exists" "$(grep -c '^ensure_vmpoolctl() {' "$SCRIPT")" "1"
+check "preflight calls it, so no rung can run against a missing binary" \
+  "$(grep -c '^  ensure_vmpoolctl$' "$SCRIPT")" "1"
+check "it builds ./cmd/vmpoolctl, not only ./cmd/worker" \
+  "$(grep -c 'go build -o "\$VMPOOLCTL" ./cmd/vmpoolctl' "$SCRIPT")" "1"
+check "it refuses if the binary is still not executable afterwards" \
+  "$(grep -c '\[ -x "\$VMPOOLCTL" \]' "$SCRIPT")" "2"
+check "grpcurl is checked by name too (rung 1 measures nothing without it)" \
+  "$([ "$(grep -c 'require_tool grpcurl' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== every vmpoolctl rung is refused unless it wrote a parseable record"
+check "vmpoolctl_run dies when vmpoolctl exits non-zero" \
+  "$([ "$(grep -c 'vmpoolctl exited non-zero for' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "vmpoolctl_run dies when the record is empty (E11's [ -s ] guard, which E10 lacked)" \
+  "$([ "$(grep -c '\[ -s "\$out_json" \]' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "vmpoolctl_run dies when the record is not valid JSON" \
+  "$([ "$(grep -c 'is not valid JSON' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+# The shape that made the old form silent: the rungs redirected vmpoolctl's stdout at the
+# CALL SITE, so an empty file was indistinguishable from a record. The redirect now lives
+# inside vmpoolctl_run, which checks it.
+check "no rung redirects vmpoolctl's stdout at the call site any more" \
+  "$(grep -cE '^\s*>\"\$RESULTS/e10-rung' "$SCRIPT")" "0"
+check "the summary write is guarded the same way" \
+  "$([ "$(grep -c '\[ -s "\$RESULTS/e10-summary.json" \]' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "both p50 readbacks now die instead of defaulting to 0" \
+  "$(grep -c 'refusing to print a section 7.2 verdict about' "$SCRIPT")" "2"
+# The two `|| echo 0` left in code are `wc -l <file` LINE COUNTS -- a single command, not a
+# pipeline, so `pipefail` cannot make them emit a value plus a second line. Asserted as a
+# pair so a future `<pipeline> || echo 0` cannot slip in under the same count.
+code_only_e10="$(grep -v '^[[:space:]]*#' "$SCRIPT")"
+check "only two '|| echo 0' remain in code" \
+  "$(printf '%s\n' "$code_only_e10" | grep -c '|| echo 0')" "2"
+check "  ...and both are wc -l line counts, which cannot produce a two-line value" \
+  "$(printf '%s\n' "$code_only_e10" | grep '|| echo 0' | grep -c 'wc -l <')" "2"
+
+echo "== require_positive: a zero or absent p50 is refused, not defaulted"
+pos_body="$(extract_fn require_positive || true)"
+check "require_positive exists" "$([ -n "$pos_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$pos_body" ]; then
+  pos_tmpdir="$(mktemp -d)"
+  pos_snippet="$pos_tmpdir/pos.sh"
+  {
+    echo 'die() { echo "e10: $*" >&2; exit 1; }'
+    echo 'RESULTS=/tmp/e10-test-results'
+    printf '%s\n' "$pos_body"
+  } >"$pos_snippet"
+  rp() {
+    (
+      # shellcheck disable=SC1090
+      . "$pos_snippet"
+      require_positive "$1" "$2"
+    )
+  }
+
+  # Non-vacuousness first: real measurements pass through unchanged, so the refusals below
+  # are about the VALUES and not about require_positive rejecting everything.
+  check "a real integer p50 passes through unchanged" "$(rp warm_us 4312)" "4312"
+  check "a real decimal p50 passes through unchanged" "$(rp warm_ms 3.75)" "3.75"
+
+  for bad_case in "0:a zero (the value a rung that never ran produced)" \
+    ":an empty value (what a swallowed python traceback leaves)" \
+    "0.00:a zero with decimals"; do
+    bad_value="${bad_case%%:*}"
+    bad_why="${bad_case#*:}"
+    bad_rc=0
+    bad_out="$(rp warm_hot_path_p50_us "$bad_value" 2>&1)" || bad_rc=$?
+    check "refuses $bad_why" "$([ "$bad_rc" -ne 0 ] && echo yes || echo no)" "yes"
+    case "$bad_out" in *warm_hot_path_p50_us*) bad_named=yes ;; *) bad_named=no ;; esac
+    check "  ...naming the field" "$bad_named" "yes"
+  done
+
+  # The two-line shape, which is the H2 defect E11 hit: every line numeric, two of them.
+  two_rc=0
+  two_out="$(rp warm_us "$(printf '4312\n0')" 2>&1)" || two_rc=$?
+  check "refuses a two-line all-numeric value (the '<pipeline> || echo 0' shape)" \
+    "$([ "$two_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "  ...naming the field" "$(case "$two_out" in *warm_us*) echo yes ;; *) echo no ;; esac)" "yes"
+
+  rm -rf "$pos_tmpdir"
+fi
+
+# And the end-to-end consequence, driven through the REAL verdict(): the string that a
+# zeroed warm p50 used to produce must be reachable (non-vacuousness), which is exactly why
+# require_positive has to refuse the zero before verdict() ever sees it.
+if [ -n "$verdict_body" ]; then
+  verdict_snippet2="$(mktemp)"
+  printf '%s\n' "$verdict_body" >"$verdict_snippet2"
+  zeroed="$(
+    # shellcheck disable=SC1090
+    . "$verdict_snippet2"
+    verdict nested-m8i 0.00 0 0.00
+  )"
+  case "$zeroed" in *"PROCEED AS DESIGNED"*) zeroed_favourable=yes ;; *) zeroed_favourable=no ;; esac
+  check "non-vacuousness: zeroed p50s really do reach section 7.2's most favourable row" \
+    "$zeroed_favourable" "yes"
+  check "  ...which is why require_positive gates all three inputs to it" \
+    "$(grep -cE '^  (warm_us|repl_us|container_ms)="\$\(require_positive ' "$SCRIPT")" "3"
+  rm -f "$verdict_snippet2"
+fi
+
+# ---------------------------------------------------------------------------
+# percentile: a missing/empty input is a refusal, not a zero (review 4001908597 covers
+# e11-density.sh's copy; this file has the same helper, feeding the container baseline).
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# The summary writer, ACTUALLY RUN. Its numeric fields are bare Python interpolations, so
+# an empty one (what a rung that never recorded leaves behind) is a SyntaxError, not a 0 --
+# which is why require_positive has to refuse before the writer runs, and why the write is
+# guarded by [ -s ] afterwards.
+# ---------------------------------------------------------------------------
+echo "== the run-summary writer, executed with a representative record"
+
+# extract_python_block prints the `python3 -c "..."` block containing $1, from its opening
+# line to the closing quote line (which for the summary carries its own `>` redirect, so
+# the extracted text writes to $RESULTS exactly as the real script does).
+extract_python_block() {
+  awk -v marker="$1" '
+    !f && $0 == "  python3 -c \"" { f = 1; buf = $0 "\n"; next }
+    f {
+      buf = buf $0 "\n"
+      if ($0 ~ /^"/) { if (index(buf, marker) > 0) { printf "%s", buf; exit } f = 0; buf = "" }
+    }
+  ' "$SCRIPT"
+}
+
+summary_body="$(extract_python_block 'summary = {')"
+check "the summary writer is extractable from the real script" \
+  "$([ -n "$summary_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$summary_body" ]; then
+  sm_tmpdir="$(mktemp -d)"
+  # shellcheck disable=SC2034,SC2317 # all read by the extracted writer, through the eval
+  run_summary() {
+    (
+      RESULTS="$sm_tmpdir"
+      SUBSTRATE=nested-m8i
+      arms_json='["firecracker"]'
+      GOVERNOR_STATE="not exposed"
+      ITERS=5 WARMUP=1
+      container_ms="$1" warm_ms="$2" repl_ms="$3"
+      eval "$summary_body"
+    )
+  }
+
+  # --- NON-VACUOUSNESS: an EMPTY numeric field really does break the writer, against this
+  # exact summary shape. That is what a rung whose record was never written leaves behind.
+  rm -f "$sm_tmpdir/e10-summary.json"
+  sm_bad_rc=0
+  sm_bad_err="$(run_summary "" 3.5 12.0 2>&1)" || sm_bad_rc=$?
+  check "non-vacuousness: an empty p50 DOES break the summary writer (nonzero)" \
+    "$([ "$sm_bad_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$sm_bad_err" in *SyntaxError*) sm_syn=yes ;; *) sm_syn=no ;; esac
+  check "  ...with a SyntaxError from the bare interpolation" "$sm_syn" "yes"
+  check "  ...leaving no summary, which the [ -s ] guard then catches" \
+    "$([ -s "$sm_tmpdir/e10-summary.json" ] && echo wrote || echo nothing)" "nothing"
+
+  # --- And with the values require_positive now guarantees, it writes a record json.load
+  # accepts, with the governor's "not exposed" fact preserved rather than dropped.
+  sm_rc=0
+  sm_err="$(run_summary 2.5 3.75 12.0 2>&1)" || sm_rc=$?
+  check "a representative summary writes successfully" "$sm_rc" "0"
+  check "  ...with no error output" "$sm_err" ""
+  check "  ...and json.load parses it" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["container_p50_ms"], d["warm_p50_ms"], d["replenishment_cpu_p50_ms"], d["governor"])' "$sm_tmpdir/e10-summary.json" 2>&1)" \
+    "2.5 3.75 12.0 not exposed"
+  rm -rf "$sm_tmpdir"
+fi
+
+echo "== percentile refuses an absent measurement instead of printing 0"
+pct_body="$(extract_fn percentile || true)"
+check "percentile is extractable" "$([ -n "$pct_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$pct_body" ]; then
+  pct_tmpdir="$(mktemp -d)"
+  pct_snippet="$pct_tmpdir/pct.sh"
+  printf '%s\n' "$pct_body" >"$pct_snippet"
+
+  # Non-vacuousness: the pre-fix pipeline really did produce a two-line value for a missing
+  # file under `pipefail` + `|| echo 0` (sort exits 2, awk still prints 0, pipefail
+  # propagates sort's status, `|| echo 0` appends a second line).
+  prefix_value="$(
+    set -uo pipefail
+    prefix_percentile() { sort -n "$1" | awk 'END { if (NR == 0) { print 0; exit } }'; }
+    prefix_percentile "$pct_tmpdir/never-created" 2>/dev/null || echo 0
+  )"
+  check "non-vacuousness: the pre-fix form really does yield TWO lines on a missing file" \
+    "$(printf '%s\n' "$prefix_value" | wc -l | tr -d ' ')" "2"
+
+  pct_rc=0
+  pct_out="$(
+    # shellcheck disable=SC1090
+    . "$pct_snippet"
+    percentile 50 "$pct_tmpdir/never-created" 2>/dev/null
+  )" || pct_rc=$?
+  check "percentile on a missing file exits nonzero" \
+    "$([ "$pct_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "  ...and prints nothing (never a 0 that becomes the container baseline)" "$pct_out" ""
+
+  : >"$pct_tmpdir/empty"
+  pct_e_rc=0
+  pct_e_out="$(
+    # shellcheck disable=SC1090
+    . "$pct_snippet"
+    percentile 50 "$pct_tmpdir/empty" 2>/dev/null
+  )" || pct_e_rc=$?
+  check "percentile on an EMPTY file also refuses" \
+    "$([ "$pct_e_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "  ...printing nothing" "$pct_e_out" ""
+
+  # ...and it still computes the right nearest-rank value, so the refusals are not just
+  # "percentile stopped working".
+  printf '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n' >"$pct_tmpdir/ten"
+  check "percentile 50 over 1..10 is still 5" \
+    "$(
+      # shellcheck disable=SC1090
+      . "$pct_snippet"
+      percentile 50 "$pct_tmpdir/ten"
+    )" "5"
+  check "percentile 95 over 1..10 is still the nearest-rank 9" \
+    "$(
+      # shellcheck disable=SC1090
+      . "$pct_snippet"
+      percentile 95 "$pct_tmpdir/ten"
+    )" "9"
+  rm -rf "$pct_tmpdir"
+fi
+
+echo "== no value-producing helper is left with the '|| echo' two-line shape"
+# The whole class, audited rather than the one instance: with `pipefail`, a `|| echo` on a
+# PIPELINE that still printed something yields a two-line value. Comments are stripped so
+# the explanations of the defect do not count as instances of it.
+pipeline_or_echo=$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -nE '\|[^|]+\|\| *echo' || true)
+check "no '<pipeline> || echo' remains anywhere in the driver" \
+  "$([ -z "$pipeline_or_echo" ] && echo yes || echo no)" "yes"
+check "rung 1's percentile calls die instead of defaulting" \
+  "$(grep -c 'percentile .* || echo' "$SCRIPT")" "0"
+
+echo "== rung 1 refuses a baseline assembled from failed Execs"
+check "grpc_exec_ms returns the RPC's own status (it used to swallow it)" \
+  "$([ "$(grep -c 'return "\$rc"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "run_rung1 dies on a post-warmup Exec failure" \
+  "$([ "$(grep -c 'failed against the container baseline stack' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "run_rung1 also refuses a short steady-state sample" \
+  "$([ "$(grep -c 'steady-state samples, wanted' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# ---------------------------------------------------------------------------
+# The EXIT trap (review 4001908613), exercised rather than grepped.
+# ---------------------------------------------------------------------------
+echo "== an EXIT trap tears rung 1's stack down on every die/exit path"
+check "a trap is installed at all (there were zero before)" \
+  "$(grep -c '^trap cleanup_on_exit EXIT' "$SCRIPT")" "1"
+trap_body="$(extract_fn cleanup_on_exit || true)"
+check "cleanup_on_exit is extractable" "$([ -n "$trap_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$trap_body" ]; then
+  tr_tmpdir="$(mktemp -d)"
+  tr_probe="$tr_tmpdir/probe.sh"
+  tr_order="$tr_tmpdir/order"
+  doomed="$tr_tmpdir/doomed"
+  mkdir -p "$doomed"
+  : >"$doomed/rung1.times"
+  {
+    echo 'set -uo pipefail'
+    echo 'stop_rung1_stack() { echo stopped >>"$ORDER"; }'
+    printf '%s\n' "$trap_body"
+    echo 'trap cleanup_on_exit EXIT'
+    echo 'exit 7'
+  } >"$tr_probe"
+  tr_rc=0
+  ORDER="$tr_order" E10_TMPDIR="$doomed" bash "$tr_probe" || tr_rc=$?
+  check "the trap does not swallow the script's exit status" "$tr_rc" "7"
+  check "it stops rung 1's stack (kill before remove, as build-snapshot.sh does)" \
+    "$(cat "$tr_order")" "stopped"
+  check "and it removes the temp root, so no timings file survives a die" \
+    "$([ -e "$doomed" ] && echo survived || echo gone)" "gone"
+
+  # Non-vacuousness for the removal: the same exit without the trap leaves the dir behind.
+  mkdir -p "$doomed"
+  {
+    echo 'set -uo pipefail'
+    echo 'exit 7'
+  } >"$tr_tmpdir/probe-no-trap.sh"
+  bash "$tr_tmpdir/probe-no-trap.sh" || true
+  check "non-vacuousness: without the trap the same dir survives the same exit" \
+    "$([ -e "$doomed" ] && echo survived || echo gone)" "survived"
+  rm -rf "$tr_tmpdir"
+fi
+
+check "the stack teardown tolerates an EXIT before the pids exist (no unbound variable)" \
+  "$(grep -cE '\[ -n "\$\{RUNG1_(WORKER|RELAY)_PID:-\}" \]' "$SCRIPT")" "2"
+check "no bare mktemp local is left for the trap to miss" \
+  "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -cE 'mktemp( -d)? *$|mktemp( -d)?\)')" "0"
+check "the temp root itself is created once, at script scope" \
+  "$(grep -c '^E10_TMPDIR="\$(mktemp -d' "$SCRIPT")" "1"
+
 echo "== security: the scratch redis is published on loopback, never on all interfaces"
 # unbound_publishes prints every `docker run -p <host>:6379` publish in $1 whose host side
 # is not explicitly bound to 127.0.0.1. `-p "6380:6379"` binds 0.0.0.0, which on the

@@ -131,6 +131,66 @@ die() { echo "e10: $*" >&2; exit 1; }
 log() { echo "e10: $*" >&2; }
 
 # ---------------------------------------------------------------------------
+# Teardown, armed BEFORE anything is started (review 4001908613).
+#
+# This driver had no `trap` at all, so every `die`/`exit` path left rung 1's whole stack
+# running: the worker, the relay, and the redis container. Beyond the leak, the orphans
+# keep 8443/6380 bound, so the operator's rerun fails at relay start with a bind error
+# that says nothing about the real cause.
+#
+# Ordering and variable discipline follow build-snapshot.sh's cleanup_on_exit (which
+# documents the bug class at length): kill before remove, and nothing this trap touches is
+# ever a function local. That is why the pid globals and the temp root are declared HERE,
+# above the trap, rather than next to the functions that assign them -- a failure anywhere
+# after this point finds them defined, and the `${VAR:-}` defaults keep a future global
+# added without one from reintroducing "unbound variable INSIDE the trap", which aborts
+# the rest of the trap body.
+# ---------------------------------------------------------------------------
+RUNG1_WORKER_PID=""
+RUNG1_RELAY_PID=""
+RUNG1_WORKER_BIN=""
+E10_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/e10-lifecycle.XXXXXX")"
+
+cleanup_on_exit() {
+  stop_rung1_stack || true
+  [ -z "${E10_TMPDIR:-}" ] || rm -rf "$E10_TMPDIR"
+}
+trap cleanup_on_exit EXIT
+
+# require_tool refuses a MISSING external binary by name, in preflight, instead of letting
+# a rung "run" against a command that is not there. Without this, a missing grpcurl still
+# produced a full set of rung-1 timings -- of grpcurl failing to launch -- and a container
+# baseline assembled from those is a fabricated number, not a measurement.
+require_tool() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH: $2"
+}
+
+# require_positive echoes value unchanged when it is exactly ONE line holding one bare
+# POSITIVE number, and dies naming the field otherwise. Every field routed through it is a
+# MEASURED LATENCY, so all three refusals matter (review 4001908604):
+#
+#   - not one line: a two-line "number" cannot be interpolated into JSON or awk, and it is
+#     the shape a `<pipeline> || echo 0` produces under `pipefail`.
+#   - not a number: an empty value is what a swallowed python traceback leaves behind.
+#   - zero: a p50 of 0 across an acquire + resume + run + destroy, or across a container
+#     Exec round trip through a real relay, is never "instant" -- it means the keys were
+#     absent or the rung never ran. It is also the value that made this script print
+#     "PROCEED AS DESIGNED - 0.00ms is below the 8ms threshold", the most favourable row in
+#     spec section 7.2's table, for a run that measured nothing. A zero container baseline
+#     additionally makes verdict()'s ratio "inf", applying the whole table to a
+#     non-existent number.
+require_positive() {
+  local field="$1" value="$2"
+  [ "$(printf '%s\n' "$value" | wc -l | tr -d ' ')" = "1" ] ||
+    die "$field is not a single value (got '$(printf '%s' "$value" | tr '\n' '|')') - refusing to compute a section 7.2 verdict from it"
+  printf '%s\n' "$value" | grep -qxE '[0-9]+(\.[0-9]+)?' ||
+    die "$field is not a bare non-negative number (got '$value') - a rung that did not record leaves this empty, and a verdict computed from it would be a verdict about nothing"
+  awk -v v="$value" 'BEGIN{exit !(v>0)}' ||
+    die "$field is $value, which is not a measurement: refusing to print a section 7.2 verdict from a zero latency. Check the rung's own JSON record and log in $RESULTS."
+  printf '%s' "$value"
+}
+
+# ---------------------------------------------------------------------------
 # Preflight. Each check is its own function, unindented and closed by a bare "}" on
 # its own line, so e10-lifecycle.test.sh can extract and source check_governor() in
 # isolation (the whole script cannot be sourced: it ends in an unconditional main
@@ -173,12 +233,47 @@ check_governor() {
   echo "performance"
 }
 
+# ensure_vmpoolctl guarantees $VMPOOLCTL is an executable BEFORE any rung tries to use it,
+# building ./cmd/vmpoolctl if it is absent and refusing loudly if it still is not.
+#
+# Review 4001908604: this script `go build`s only ./cmd/worker, and $VMPOOLCTL was just a
+# PATH -- nothing built it and nothing checked it. A missing binary exits 127 per rung;
+# with no `set -e` the `>` redirections left empty JSON files, main()'s readback swallowed
+# the resulting json.load failure with `2>/dev/null || echo 0`, and the run then printed
+# "PROCEED AS DESIGNED - 0.00ms is below the 8ms threshold". That is the MOST FAVOURABLE
+# verdict in spec section 7.2's table, at exit 0, for a run in which rungs 2-4 never
+# executed. Building it here (and refusing the p50s below) is what makes that impossible.
+ensure_vmpoolctl() {
+  if [ -x "$VMPOOLCTL" ]; then
+    log "vmpoolctl: $VMPOOLCTL"
+    return 0
+  fi
+  [ -d "$REMOTE_WORKER_DIR" ] ||
+    die "vmpoolctl is absent at '$VMPOOLCTL' and the remote-worker module directory was not found either - rungs 2-4 have nothing to drive"
+  log "vmpoolctl: absent at $VMPOOLCTL - building ./cmd/vmpoolctl"
+  (cd "$REMOTE_WORKER_DIR" && go build -o "$VMPOOLCTL" ./cmd/vmpoolctl) ||
+    die "go build ./cmd/vmpoolctl failed - rungs 2, 3 and 4 (the warm hot path, replenishment and teardown) cannot run at all, and a verdict computed without them would be a verdict about nothing"
+  [ -x "$VMPOOLCTL" ] ||
+    die "go build reported success but '$VMPOOLCTL' is still not executable"
+}
+
 preflight() {
   check_kvm
   check_cgroups
   check_swap
   GOVERNOR_STATE="$(check_governor)"
   log "governor: $GOVERNOR_STATE"
+  # Tooling, checked by name up front rather than discovered as a 127 mid-rung.
+  require_tool python3 "every JSON record and readback in this script is written by python3"
+  require_tool go "rung 1's worker and rungs 2-4's vmpoolctl are both built from source here"
+  require_tool grpcurl "rung 1 drives its Exec RPCs through grpcurl; without it every timing would measure grpcurl failing to launch"
+  [ -f "$PROTO_FILE" ] ||
+    die "the sandbox proto is missing at $PROTO_FILE - grpcurl cannot encode an Exec request without it, so rung 1 would time a client-side error"
+  if [ "$RUNG1_START_STACK" = "1" ]; then
+    require_tool docker "rung 1 starts its own redis in a container (set SH_E10_START_STACK=0 to reuse a running stack instead)"
+    require_tool pnpm "rung 1 starts the real sandbox-relay via pnpm (set SH_E10_START_STACK=0 to reuse a running stack instead)"
+  fi
+  ensure_vmpoolctl
   mkdir -p "$RESULTS"
 }
 
@@ -187,10 +282,8 @@ preflight() {
 # real remote-worker binary, real Exec RPC over grpcurl, spec §7.2's "without it,
 # 15ms has nothing to be judged against."
 # ---------------------------------------------------------------------------
-RUNG1_WORKER_PID=""
-RUNG1_RELAY_PID=""
-RUNG1_WORKER_BIN=""
-
+# RUNG1_WORKER_PID / RUNG1_RELAY_PID / RUNG1_WORKER_BIN are declared next to the EXIT trap
+# above, not here: the trap must find them defined however early a failure lands.
 start_rung1_stack() {
   if [ "$RUNG1_START_STACK" != "1" ]; then
     log "rung1: SH_E10_START_STACK=0, reusing an already-running stack on port $RUNG1_RELAY_PORT"
@@ -235,9 +328,14 @@ start_rung1_stack() {
 
 stop_rung1_stack() {
   [ "$RUNG1_START_STACK" = "1" ] || return 0
-  [ -n "$RUNG1_WORKER_PID" ] && kill "$RUNG1_WORKER_PID" 2>/dev/null
-  [ -n "$RUNG1_RELAY_PID" ] && kill "$RUNG1_RELAY_PID" 2>/dev/null
+  # ${VAR:-} because this also runs from the EXIT trap, which can fire before either pid is
+  # assigned (build-snapshot.sh's cleanup_on_exit documents that exact failure). Kill
+  # before remove, same ordering.
+  [ -n "${RUNG1_WORKER_PID:-}" ] && kill "${RUNG1_WORKER_PID:-}" 2>/dev/null
+  [ -n "${RUNG1_RELAY_PID:-}" ] && kill "${RUNG1_RELAY_PID:-}" 2>/dev/null
   docker rm -f "sh-e10-redis-$$" >/dev/null 2>&1 || true
+  RUNG1_WORKER_PID=""
+  RUNG1_RELAY_PID=""
   return 0
 }
 
@@ -248,14 +346,20 @@ json_escape() {
 
 # grpc_exec_ms drives one Exec RPC through grpcurl and prints the host-side wall
 # time, in milliseconds, that the call took — never a guest-side timestamp.
+#
+# It also RETURNS THE RPC's OWN STATUS, so a caller can tell a measured Exec from a failed
+# one. It used to swallow it: a failing (or missing) grpcurl still produced a timing line,
+# so rung 1 would report a container baseline assembled from RPC failures -- fast,
+# confident, and not a measurement of anything. run_rung1 refuses those below.
 grpc_exec_ms() {
-  local cmd="$1" req_id="$2" t0 t1
+  local cmd="$1" req_id="$2" t0 t1 rc=0
   t0="$(date +%s%N)"
   grpcurl -plaintext -proto "$PROTO_FILE" \
     -d "{\"sandbox_id\":\"$RUNG1_SANDBOX_ID\",\"exec\":{\"req_id\":$req_id,\"command\":$(json_escape "$cmd"),\"timeout_s\":30}}" \
-    "localhost:${RUNG1_RELAY_PORT}" sandbox.v1.SandboxExec/Exec >/dev/null 2>>"$RESULTS/e10-rung1-grpcurl.log"
+    "localhost:${RUNG1_RELAY_PORT}" sandbox.v1.SandboxExec/Exec >/dev/null 2>>"$RESULTS/e10-rung1-grpcurl.log" || rc=$?
   t1="$(date +%s%N)"
   echo $(((t1 - t0) / 1000000))
+  return "$rc"
 }
 
 # rung1_tool_call_mix is the "Exec-per-tool-call mix" the brief calls for as this
@@ -276,18 +380,38 @@ rung1_tool_call_mix() {
 run_rung1() {
   log "rung1: container baseline"
   start_rung1_stack
-  local i=0 times_file
-  times_file="$(mktemp)"
+  # Under $E10_TMPDIR rather than a bare mktemp, so the EXIT trap reclaims it (see the trap).
+  local i=0 times_file failures=0
+  times_file="$E10_TMPDIR/rung1.times"
+  : >"$times_file"
   local want=$((ITERS + WARMUP))
   while [ "$(wc -l <"$times_file" 2>/dev/null || echo 0)" -lt "$want" ]; do
     while IFS= read -r cmd; do
       i=$((i + 1))
-      grpc_exec_ms "$cmd" "$i" >>"$times_file"
+      # A FAILED Exec is not a slow Exec. Failures inside the warmup window are tolerated
+      # (that is what the warmup is for -- the relay and worker have just bound their
+      # ports); one after it stops the rung, because the container baseline is the number
+      # every microVM figure in spec section 7.2 is priced against, and a baseline built
+      # partly out of RPC failures is not a baseline.
+      if ! grpc_exec_ms "$cmd" "$i" >>"$times_file"; then
+        failures=$((failures + 1))
+        [ "$i" -le "$WARMUP" ] ||
+          die "rung1: Exec #$i ($cmd) failed against the container baseline stack (grpcurl's own error is in $RESULTS/e10-rung1-grpcurl.log; the relay and worker logs are alongside it). Refusing to price the microVM tier against a baseline assembled from failed RPCs."
+      fi
     done < <(rung1_tool_call_mix)
   done
+  [ "$failures" -eq 0 ] || log "rung1: $failures Exec(s) failed inside the discarded warmup window"
   tail -n "+$((WARMUP + 1))" "$times_file" | head -n "$ITERS" >"${times_file}.steady"
-  RUNG1_P50_MS="$(percentile 50 "${times_file}.steady")"
-  RUNG1_P95_MS="$(percentile 95 "${times_file}.steady")"
+  local steady
+  steady="$(wc -l <"${times_file}.steady" 2>/dev/null || echo 0)"
+  [ "$steady" -ge "$ITERS" ] ||
+    die "rung1: collected $steady steady-state samples, wanted $ITERS - refusing to compute a baseline percentile from a short sample"
+  # percentile refuses an absent measurement rather than printing 0 (see its own comment),
+  # so these are `|| die`, never `|| echo 0`.
+  RUNG1_P50_MS="$(percentile 50 "${times_file}.steady")" ||
+    die "rung1: no steady-state samples to take a p50 of - the container baseline has no value, so nothing can be priced against it"
+  RUNG1_P95_MS="$(percentile 95 "${times_file}.steady")" ||
+    die "rung1: no steady-state samples to take a p95 of"
   write_json_record "rung1" "container" "$SUBSTRATE" \
     "$(printf '{"rung":"container-baseline","arm":"container","substrate":%s,"iterations":%d,"warmup_discarded":%d,"p50_ms":%s,"p95_ms":%s}' \
       "$(json_escape "$SUBSTRATE")" "$ITERS" "$WARMUP" "$RUNG1_P50_MS" "$RUNG1_P95_MS")"
@@ -301,10 +425,23 @@ run_rung1() {
 # ---------------------------------------------------------------------------
 percentile() {
   local p="$1" file="$2"
+  # A missing or EMPTY input file is not a zero percentile, it is the absence of any
+  # measurement -- so this refuses (prints nothing, returns non-zero) and the caller says
+  # which rung had no samples. Kept identical to e11-density.sh's copy, for two reasons
+  # that review 4001908597 raised against that one:
+  #
+  #   1. the value. A 0 here becomes the container baseline the whole of spec section 7.2
+  #      divides by, and `ratio=inf` or "0.00ms is below the threshold" is the most
+  #      favourable verdict in the table, printed for a rung that measured nothing.
+  #   2. the SHAPE. `sort -n` on a missing file exits 2, awk still printed 0, and
+  #      `pipefail` propagated sort's status -- so a caller's `|| echo 0` would append a
+  #      SECOND line and produce a two-line "number". The `[ -s ]` guard means `sort` is
+  #      never handed a missing file, and the awk END branch exits non-zero.
+  [ -s "$file" ] || return 1
   sort -n "$file" | awk -v p="$p" '
     { a[NR] = $1; n = NR }
     END {
-      if (n == 0) { print 0; exit }
+      if (n == 0) { exit 1 }
       rank = int((p / 100.0) * n)
       if (rank < 1) rank = 1
       if (rank > n) rank = n
@@ -335,32 +472,49 @@ shuffle_arms() {
   printf '%s\n' "${ARMS[@]}" | awk -v seed="$(($$ + $(date +%s)))" 'BEGIN{srand(seed)} {print rand()"\t"$0}' | sort -n | cut -f2-
 }
 
+# vmpoolctl_run drives ONE vmpoolctl mode and REFUSES to continue unless it wrote a
+# non-empty, parseable JSON record to $1.
+#
+# E11 grew a `[ -s ]` no-record guard for exactly this class and E10 had no equivalent
+# (review 4001908604): with `set -e` absent, a vmpoolctl that exited 127 (missing binary),
+# 1 (a failed restore) or anything else left an EMPTY file behind, the sweep carried on to
+# the next rung, and the readback in main() then defaulted the missing p50s to 0. Every
+# rung's record is now checked at the point it is written, naming the rung and its log.
 vmpoolctl_run() {
-  local key="$1"
-  shift
+  local out_json="$1" log_file="$2" key="$3"
+  shift 3
   "$VMPOOLCTL" --snapshot-dir="$SNAPSHOT_DIR" --workspace-root="$WORKSPACE_ROOT" \
     --substrate="$SUBSTRATE" --iterations="$ITERS" --warmup="$WARMUP" --json \
-    --key="$key" "$@"
+    --key="$key" "$@" >"$out_json" 2>"$log_file" ||
+    die "vmpoolctl exited non-zero for $key (its stderr is in $log_file) - refusing to continue a ladder with a rung that did not run"
+  [ -s "$out_json" ] ||
+    die "vmpoolctl wrote NO record for $key to $out_json (its stderr is in $log_file). A ladder missing this rung would still print a verdict, and it would be the most favourable one in the table."
+  python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$out_json" >/dev/null 2>&1 ||
+    die "the record vmpoolctl wrote for $key at $out_json is not valid JSON - refusing to read a p50 out of it"
 }
 
 run_rung2() {
   local arm="$1"
   log "rung2 ($arm): warm hot path, parked-bash (no stdin)"
-  vmpoolctl_run "e10-r2-${arm}-parked" --vmm="$arm" --mode=exec -- true \
-    >"$RESULTS/e10-rung2-${arm}-${SUBSTRATE}-parked.json" 2>"$RESULTS/e10-rung2-${arm}-parked.log"
+  vmpoolctl_run "$RESULTS/e10-rung2-${arm}-${SUBSTRATE}-parked.json" \
+    "$RESULTS/e10-rung2-${arm}-parked.log" "e10-r2-${arm}-parked" \
+    --vmm="$arm" --mode=exec -- true
   log "rung2 ($arm): warm hot path, fresh-child (--stdin set)"
-  vmpoolctl_run "e10-r2-${arm}-freshchild" --vmm="$arm" --mode=exec --stdin="e10-stdin-payload" -- "cat >/dev/null" \
-    >"$RESULTS/e10-rung2-${arm}-${SUBSTRATE}-freshchild.json" 2>"$RESULTS/e10-rung2-${arm}-freshchild.log"
+  vmpoolctl_run "$RESULTS/e10-rung2-${arm}-${SUBSTRATE}-freshchild.json" \
+    "$RESULTS/e10-rung2-${arm}-freshchild.log" "e10-r2-${arm}-freshchild" \
+    --vmm="$arm" --mode=exec --stdin="e10-stdin-payload" -- "cat >/dev/null"
 }
 
 run_rung3() {
   local arm="$1"
   log "rung3 ($arm): replenishment, cold memfile"
-  vmpoolctl_run "e10-r3-${arm}-cold" --vmm="$arm" --mode=replenish --pin-memfile=false \
-    >"$RESULTS/e10-rung3-${arm}-${SUBSTRATE}-cold.json" 2>"$RESULTS/e10-rung3-${arm}-cold.log"
+  vmpoolctl_run "$RESULTS/e10-rung3-${arm}-${SUBSTRATE}-cold.json" \
+    "$RESULTS/e10-rung3-${arm}-cold.log" "e10-r3-${arm}-cold" \
+    --vmm="$arm" --mode=replenish --pin-memfile=false
   log "rung3 ($arm): replenishment, pinned memfile"
-  vmpoolctl_run "e10-r3-${arm}-pinned" --vmm="$arm" --mode=replenish --pin-memfile=true \
-    >"$RESULTS/e10-rung3-${arm}-${SUBSTRATE}-pinned.json" 2>"$RESULTS/e10-rung3-${arm}-pinned.log"
+  vmpoolctl_run "$RESULTS/e10-rung3-${arm}-${SUBSTRATE}-pinned.json" \
+    "$RESULTS/e10-rung3-${arm}-pinned.log" "e10-r3-${arm}-pinned" \
+    --vmm="$arm" --mode=replenish --pin-memfile=true
 }
 
 run_rung4() {
@@ -368,8 +522,9 @@ run_rung4() {
   local mode
   for mode in teardown-inflight teardown-standby teardown-bulk; do
     log "rung4 ($arm): $mode"
-    vmpoolctl_run "e10-r4-${arm}-${mode}" --vmm="$arm" --mode="$mode" \
-      >"$RESULTS/e10-rung4-${arm}-${mode}-${SUBSTRATE}.json" 2>"$RESULTS/e10-rung4-${arm}-${mode}.log"
+    vmpoolctl_run "$RESULTS/e10-rung4-${arm}-${mode}-${SUBSTRATE}.json" \
+      "$RESULTS/e10-rung4-${arm}-${mode}.log" "e10-r4-${arm}-${mode}" \
+      --vmm="$arm" --mode="$mode"
   done
 }
 
@@ -512,17 +667,25 @@ main() {
   # back out of the JSON it just wrote rather than re-deriving them.
   local warm_ms container_ms repl_ms arm="${ARMS[0]}"
   local warm_us repl_us
+  # NOT `2>/dev/null || echo 0` (review 4001908604). That swallowed the json.load failure a
+  # rung that never ran produces, defaulted both p50s to 0, and sent verdict() down its
+  # row-1 branch: "PROCEED AS DESIGNED - 0.00ms is below the 8ms threshold", at exit 0, for
+  # a run with no rung 2 or rung 3 at all. The traceback is now visible, the failure is
+  # fatal, and require_positive refuses the zero itself -- a p50 of 0 us across an
+  # acquire, a resume, a run and a destroy is not a fast VM, it is an absent measurement.
   warm_us="$(python3 -c "
 import json
 d = json.load(open('$RESULTS/e10-rung2-${arm}-${SUBSTRATE}-parked.json'))
 print(d.get('p50_run_us',0)+d.get('p50_acquire_us',0)+d.get('p50_resume_us',0)+d.get('p50_destroy_us',0))
-" 2>/dev/null || echo 0)"
+")" || die "could not read the rung 2 record at $RESULTS/e10-rung2-${arm}-${SUBSTRATE}-parked.json (the traceback is above) - refusing to print a section 7.2 verdict about a warm hot path that was never measured"
+  warm_us="$(require_positive warm_hot_path_p50_us "$warm_us")" || exit 1
   repl_us="$(python3 -c "
 import json
 d = json.load(open('$RESULTS/e10-rung3-${arm}-${SUBSTRATE}-pinned.json'))
 print(d.get('cpu_child_us',0))
-" 2>/dev/null || echo 0)"
-  container_ms="${RUNG1_P50_MS:-0}"
+")" || die "could not read the rung 3 record at $RESULTS/e10-rung3-${arm}-${SUBSTRATE}-pinned.json (the traceback is above) - refusing to print a section 7.2 verdict about a replenishment CPU cost that was never measured"
+  repl_us="$(require_positive replenishment_cpu_p50_us "$repl_us")" || exit 1
+  container_ms="$(require_positive container_baseline_p50_ms "${RUNG1_P50_MS:-}")" || exit 1
   warm_ms="$(awk -v u="$warm_us" 'BEGIN{printf "%.2f", u/1000.0}')"
   repl_ms="$(awk -v u="$repl_us" 'BEGIN{printf "%.2f", u/1000.0}')"
 
@@ -542,6 +705,11 @@ summary = {
 }
 print(json.dumps(summary, indent=2))
 " >"$RESULTS/e10-summary.json"
+  # The same no-record guard E11's rung writer has: `set -e` is deliberately absent here,
+  # so a writer that died of a bad interpolation would otherwise leave an empty summary and
+  # let the verdict print anyway (review 4001908604).
+  [ -s "$RESULTS/e10-summary.json" ] ||
+    die "the run summary at $RESULTS/e10-summary.json was not written (the writer's traceback is above) - refusing to print a verdict that no record backs"
 
   print_verdict "$SUBSTRATE" "$warm_ms" "$container_ms" "$repl_ms"
 }

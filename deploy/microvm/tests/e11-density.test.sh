@@ -337,6 +337,387 @@ check "run_density_rung dies when out_json_path is empty or missing" \
 check "the record assertion tests the file, not the writer's exit status" \
   "$([ "$(grep -c '\[ -s "\$out_json_path" \]' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 
+# ---------------------------------------------------------------------------
+# The record writer, ACTUALLY RUN with container-arm inputs (review 4001908573).
+#
+# `run_density_rung container - - "$c"` passed a literal "-" for standbyDepth and
+# guestRamMb, and the writer interpolated them as bare Python numeric literals
+# (`'standbyDepth': -,`). Every container rung raised a SyntaxError, wrote no record, and
+# tripped the `[ -s ]` guard; because shuffle_e11_arms randomises arm order, about half of
+# all runs died there before the microvm arm ran at all. The arm the whole experiment is
+# priced against recorded nothing.
+#
+# The old assertion for this call site was `grep -c 'run_density_rung container'` -- it
+# asserted the call's PRESENCE and never executed a line of the generated Python, so no
+# test could catch it. This section extracts the writer's own source text out of the real
+# script and RUNS it, once with the pre-fix interpolation (proving the SyntaxError is real)
+# and once as the script now generates it.
+# ---------------------------------------------------------------------------
+echo "== the rung-record writer, executed with real container-arm inputs"
+
+# extract_record_writer prints the exact `python3 -c "..."` command run_density_rung uses,
+# from its opening line through the closing bare `"`.
+extract_record_writer() {
+  awk '
+    !f && $0 == "  python3 -c \"" { f = 1; print; next }
+    f { print; if ($0 == "\"") exit }
+  ' "$SCRIPT"
+}
+
+writer_body="$(extract_record_writer)"
+check "the record writer is extractable from the real script" \
+  "$([ -n "$writer_body" ] && echo yes || echo no)" "yes"
+check "  ...and it is the writer (it opens the out path for writing)" \
+  "$(printf '%s\n' "$writer_body" | grep -c "open('\$out_json_path', 'w')")" "1"
+
+dim_body="$(extract_fns die require_numeric dimension_literal static_settings_json || true)"
+check "dimension_literal is extractable" "$([ -n "$dim_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$writer_body" ] && [ -n "$dim_body" ]; then
+  wr_tmpdir="$(mktemp -d)"
+  # run_writer evaluates the REAL extracted writer with one full set of rung values.
+  # $1 is the value for standbyDepth/guestRamMb's interpolation, so the caller chooses
+  # between the pre-fix bare "-" and what dimension_literal now produces.
+  # Every assignment below is read by the EXTRACTED writer source, which shellcheck cannot
+  # see through the eval -- that is the whole point of driving the real generated code.
+  # shellcheck disable=SC2034,SC2317
+  run_writer() {
+    (
+      # shellcheck disable=SC1090
+      . "$wr_tmpdir/dims.sh"
+      d_json="$1" ram_json="$1"
+      out_json_path="$2"
+      arm=container d=- ram_mb=-
+      c=1 throughput=0.5000 p95=12 cold_rate=0.0000
+      pss_bytes=0 mem_bytes=8388608000 cpu_frac=0.1000 proc_count=0
+      standbys_resident=0 idle_residency=0 reclaim_converge_s=0 converge_p50=7
+      errors_json='{}'
+      SUBSTRATE=nested-m8i REPO_CACHE_SHAPE=accept-cold-fetch COLD_LATENCY_MS=50
+      eval "$writer_body"
+    )
+  }
+  printf '%s\n' "$dim_body" >"$wr_tmpdir/dims.sh"
+
+  # --- NON-VACUOUSNESS: the pre-fix literal really does kill the writer, against this
+  # exact record shape. Without this, the success below could be passing for any reason.
+  pre_out="$wr_tmpdir/prefix.json"
+  pre_rc=0
+  pre_err="$(run_writer '-' "$pre_out" 2>&1)" || pre_rc=$?
+  check "non-vacuousness: the pre-fix bare '-' literal DOES break the writer (nonzero)" \
+    "$([ "$pre_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$pre_err" in *SyntaxError*) pre_syn=yes ;; *) pre_syn=no ;; esac
+  check "  ...with a SyntaxError, exactly as the review describes" "$pre_syn" "yes"
+  check "  ...and it writes NO record at all (which is what the [ -s ] guard then catches)" \
+    "$([ -s "$pre_out" ] && echo wrote || echo nothing)" "nothing"
+
+  # --- The fix: dimension_literal maps the container arm's "-" to None, and the writer
+  # produces a record that json.load accepts with standbyDepth/guestRamMb null.
+  ok_out="$wr_tmpdir/container.json"
+  ok_rc=0
+  ok_err="$(
+    # shellcheck disable=SC1090
+    . "$wr_tmpdir/dims.sh"
+    run_writer "$(dimension_literal standbyDepth - 0)" "$ok_out" 2>&1
+  )" || ok_rc=$?
+  check "the container arm's record writes successfully (exit 0)" "$ok_rc" "0"
+  check "  ...with no error output" "$ok_err" ""
+  check "  ...and the record is non-empty, so the [ -s ] guard passes" \
+    "$([ -s "$ok_out" ] && echo yes || echo no)" "yes"
+  parsed_rc=0
+  parsed="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["standbyDepth"], d["guestRamMb"], d["c"], d["p95Ms"])' "$ok_out" 2>&1)" || parsed_rc=$?
+  check "  ...and json.load parses it (the real consumer of every rung record)" "$parsed_rc" "0"
+  check "  ...with the not-applicable dimensions as JSON null, not 0" "$parsed" "None None 1 12"
+
+  # --- And the microvm arm's numbers stay NUMBERS (null there would be the sweep losing
+  # the dimension it is sweeping, so dimension_literal refuses it).
+  mv_out="$wr_tmpdir/microvm.json"
+  mv_rc=0
+  (
+    # shellcheck disable=SC1090
+    . "$wr_tmpdir/dims.sh"
+    run_writer "$(dimension_literal standbyDepth 2 1)" "$mv_out"
+  ) || mv_rc=$?
+  check "the microvm arm's record writes successfully" "$mv_rc" "0"
+  check "  ...with standbyDepth recorded as the NUMBER it swept, not a string" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(repr(d["standbyDepth"]))' "$mv_out" 2>&1)" "2"
+
+  # --- dimension_literal's own contract, driven directly.
+  dl() {
+    (
+      # shellcheck disable=SC1090
+      . "$wr_tmpdir/dims.sh"
+      dimension_literal "$@"
+    )
+  }
+  check "dimension_literal('-', not required) -> Python None (JSON null)" "$(dl standbyDepth - 0)" "None"
+  check "dimension_literal('', not required) -> Python None too" "$(dl standbyDepth '' 0)" "None"
+  check "dimension_literal(2, required) -> 2" "$(dl standbyDepth 2 1)" "2"
+  dl_req_rc=0
+  dl_req_out="$(dl standbyDepth - 1 2>&1)" || dl_req_rc=$?
+  check "dimension_literal('-', REQUIRED) refuses: the microvm arm cannot lose its D" \
+    "$([ "$dl_req_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  case "$dl_req_out" in *standbyDepth*) dl_named=yes ;; *) dl_named=no ;; esac
+  check "  ...and the refusal names the field" "$dl_named" "yes"
+  dl_bad_rc=0
+  dl_bad_out="$(
+    (
+      # shellcheck disable=SC1090
+      . "$wr_tmpdir/dims.sh"
+      dimension_literal standbyDepth 'rm -rf /' 0
+    ) 2>&1
+  )" || dl_bad_rc=$?
+  check "dimension_literal refuses a non-numeric value outright (no injection into Python)" \
+    "$([ "$dl_bad_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "  ...and prints nothing that could reach the writer" \
+    "$(printf '%s' "$dl_bad_out" | grep -c 'rm -rf /$')" "0"
+
+  rm -rf "$wr_tmpdir"
+fi
+
+# ---------------------------------------------------------------------------
+# percentile: a missing/empty input is a refusal, not a zero (review 4001908597).
+# ---------------------------------------------------------------------------
+echo "== percentile refuses an absent measurement instead of printing 0"
+
+pct_body="$(extract_fn percentile || true)"
+check "percentile is extractable" "$([ -n "$pct_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$pct_body" ]; then
+  pct_tmpdir="$(mktemp -d)"
+  pct_snippet="$pct_tmpdir/pct.sh"
+  printf '%s\n' "$pct_body" >"$pct_snippet"
+  missing="$pct_tmpdir/never-created"
+
+  # --- NON-VACUOUSNESS, first: the PRE-FIX pipeline really did produce a TWO-LINE value
+  # for a missing file under `pipefail` + `|| echo 0`. This is the H2 shape reappearing:
+  # `sort` exits 2, awk still prints 0, pipefail propagates sort's status, and `|| echo 0`
+  # appends a second line. Run verbatim here so the assertions below cannot pass vacuously.
+  prefix_value="$(
+    set -uo pipefail
+    prefix_percentile() {
+      sort -n "$1" | awk 'END { if (NR == 0) { print 0; exit } }'
+    }
+    prefix_percentile "$missing" 2>/dev/null || echo 0
+  )"
+  check "non-vacuousness: the pre-fix form really does yield TWO lines on a missing file" \
+    "$(printf '%s\n' "$prefix_value" | wc -l | tr -d ' ')" "2"
+  # ...and that a two-line value really is fatal to the record writer's interpolation.
+  prefix_rc=0
+  python3 -c "
+rec = {'p95Ms': $prefix_value}
+print(rec)
+" >/dev/null 2>&1 || prefix_rc=$?
+  check "non-vacuousness: a two-line p95 really does make the writer's Python fail" \
+    "$([ "$prefix_rc" -ne 0 ] && echo yes || echo no)" "yes"
+
+  # --- The fix: a missing file is a refusal that prints NOTHING.
+  pct_missing_rc=0
+  pct_missing_out="$(
+    # shellcheck disable=SC1090
+    . "$pct_snippet"
+    percentile 95 "$missing" 2>/dev/null
+  )" || pct_missing_rc=$?
+  check "percentile on a missing file exits nonzero" \
+    "$([ "$pct_missing_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "  ...and prints nothing at all (not a 0 that reads as a fast rung)" "$pct_missing_out" ""
+
+  : >"$pct_tmpdir/empty"
+  pct_empty_rc=0
+  pct_empty_out="$(
+    # shellcheck disable=SC1090
+    . "$pct_snippet"
+    percentile 95 "$pct_tmpdir/empty" 2>/dev/null
+  )" || pct_empty_rc=$?
+  check "percentile on an EMPTY file also refuses" \
+    "$([ "$pct_empty_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "  ...printing nothing" "$pct_empty_out" ""
+
+  # --- And it still computes the right nearest-rank percentile on real data, so the
+  # refusals above are not just "percentile stopped working".
+  printf '1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n' >"$pct_tmpdir/ten"
+  pct_ok="$(
+    # shellcheck disable=SC1090
+    . "$pct_snippet"
+    percentile 95 "$pct_tmpdir/ten"
+  )"
+  check "percentile 95 over 1..10 is still the nearest-rank 9" "$pct_ok" "9"
+  pct_ok50="$(
+    # shellcheck disable=SC1090
+    . "$pct_snippet"
+    percentile 50 "$pct_tmpdir/ten"
+  )"
+  check "percentile 50 over 1..10 is still 5" "$pct_ok50" "5"
+  pct_one="$(
+    # shellcheck disable=SC1090
+    . "$pct_snippet"
+    printf '42\n' >"$pct_tmpdir/one"
+    percentile 95 "$pct_tmpdir/one"
+  )"
+  check "a single sample is a legitimate distribution (not refused)" "$pct_one" "42"
+
+  rm -rf "$pct_tmpdir"
+fi
+
+echo "== no value-producing helper is left with the '|| echo' two-line shape"
+# The whole class, audited rather than the one instance (review 4001908597). Every
+# `|| echo` in this file must sit on a SINGLE command, never on a pipeline: with
+# `pipefail`, a failing pipeline that still printed something turns `|| echo X` into a
+# two-line value. Comments are stripped so the explanations of the defect do not count.
+pipeline_or_echo="$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -nE '\|[^|]+\|\| *echo' || true)"
+check "no '<pipeline> || echo' remains anywhere in the driver" \
+  "$([ -z "$pipeline_or_echo" ] && echo yes || echo no)" "yes"
+# The one remaining `|| echo 0` is mem_available_bytes' single awk (not a pipeline), and it
+# is validated by require_numeric on the way into the record.
+check "percentile's call sites no longer swallow its status with '|| echo 0'" \
+  "$(grep -c 'percentile .* || echo' "$SCRIPT")" "0"
+check "the five derived rung fields now go through require_numeric" \
+  "$(grep -cE 'require_numeric (p95Ms|throughput|coldAcquireRate|convergeMsP50|wallSeconds)' "$SCRIPT")" "5"
+
+echo "== a FAILED converge is not recorded as a fast converge"
+# converge_slot used to discard grpcurl's status and return the timing anyway, so a converge
+# that never prepared the workspace still produced a small convergeMsP50 -- wrong in the
+# "looks cheap" direction -- and the slot's own Exec timings then measured something else.
+check "converge_slot returns the RPC's own status" \
+  "$([ "$(printf '%s\n' "$(extract_fn converge_slot)" | grep -c 'return "\$rc"')" -ge 1 ] && echo yes || echo no)" "yes"
+check "a slot whose converge failed exits non-zero instead of continuing" \
+  "$([ "$(grep -c 'converge FAILED after' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "and every slot's exit status is checked, not discarded by a bare wait" \
+  "$(grep -c 'wait "\$pid" || slot_failures=' "$SCRIPT")" "1"
+check "  ...with the rung refused when any slot failed" \
+  "$([ "$(grep -c 'slot(s) fail before their timed loop' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
+# ---------------------------------------------------------------------------
+# A zero PSS total on the microvm arm is a refusal, not a reading (review 4001908599).
+# ---------------------------------------------------------------------------
+echo "== pssBytes: 0 is refused on the microvm arm, and still legitimate on the container arm"
+
+vmm_body="$(extract_fns die require_numeric mem_available_bytes discover_pids pss_bytes_for_pids host_cpu_fraction host_signals_snapshot || true)"
+if [ -n "$vmm_body" ]; then
+  vmm_tmpdir="$(mktemp -d)"
+  vmm_snippet="$vmm_tmpdir/signals.sh"
+  printf '%s\n' "$vmm_body" >"$vmm_snippet"
+  vmm_proc="$vmm_tmpdir/proc"
+  mkdir -p "$vmm_proc"
+  printf 'MemTotal:  16384000 kB\nMemAvailable: 8192000 kB\n' >"$vmm_proc/meminfo"
+  printf 'cpu  100 0 100 800 0 0 0 0 0 0\n' >"$vmm_proc/stat"
+
+  snapshot_with() {
+    (
+      PROC_ROOT="$vmm_proc"
+      export PROC_ROOT
+      # shellcheck disable=SC2034 # read by host_signals_snapshot once sourced
+      VMM_PROC_PATTERN="$1"
+      # shellcheck disable=SC2034
+      VIRTIOFSD_PROC_PATTERN="__e11_no_such_process__"
+      # shellcheck disable=SC1090
+      . "$vmm_snippet"
+      host_signals_snapshot "$2"
+    )
+  }
+
+  # --- NON-VACUOUSNESS: with require_vmm=0 the SAME no-match pattern succeeds and reports
+  # pssBytes 0 -- which is correct on the container arm, and is exactly the value that used
+  # to be accepted on the microvm arm too.
+  cont_rc=0
+  cont_json="$(snapshot_with "__e11_no_such_process__" 0 2>/dev/null)" || cont_rc=$?
+  check "non-vacuousness: with require_vmm=0 a no-match pattern still succeeds" "$cont_rc" "0"
+  check "  ...reporting pssBytes 0, which is correct for an arm with no VMM" \
+    "$(printf '%s' "$cont_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pssBytes"])' 2>&1)" "0"
+
+  # --- The fix: the same sample with require_vmm=1 refuses, printing no JSON.
+  vmm_rc=0
+  vmm_out="$(snapshot_with "__e11_no_such_process__" 1 2>"$vmm_tmpdir/err")" || vmm_rc=$?
+  check "with require_vmm=1, no matching VMM process is a REFUSAL (nonzero)" \
+    "$([ "$vmm_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "  ...and it prints no JSON, so no rung can record pssBytes: 0" "$vmm_out" ""
+  case "$(cat "$vmm_tmpdir/err")" in *"__e11_no_such_process__"*) vmm_named=yes ;; *) vmm_named=no ;; esac
+  check "  ...and the refusal names the pattern that matched nothing" "$vmm_named" "yes"
+
+  # --- And a matched process whose rollups sum to 0 is refused too: pids present is not
+  # the same claim as memory measured.
+  sh -c 'sleep 5' &
+  zero_pid=$!
+  mkdir -p "$vmm_proc/$zero_pid"
+  printf 'Pss:                   0 kB\n' >"$vmm_proc/$zero_pid/smaps_rollup"
+  zero_rc=0
+  zero_out="$(snapshot_with "sleep 5" 1 2>/dev/null)" || zero_rc=$?
+  check "a matched VMM whose PSS sums to 0 is refused as well" \
+    "$([ "$zero_rc" -ne 0 ] && echo yes || echo no)" "yes"
+  check "  ...printing no JSON" "$zero_out" ""
+  # ...while a real, nonzero reading for that same pid is accepted, so the check above is
+  # about the VALUE being zero and not about the pattern matching at all.
+  printf 'Pss:                 512 kB\n' >"$vmm_proc/$zero_pid/smaps_rollup"
+  nz_rc=0
+  nz_json="$(snapshot_with "sleep 5" 1 2>/dev/null)" || nz_rc=$?
+  check "a nonzero PSS for the same matched pid IS accepted with require_vmm=1" "$nz_rc" "0"
+  check "  ...and reports the real total" \
+    "$(printf '%s' "$nz_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pssBytes"])' 2>&1)" "524288"
+  kill "$zero_pid" 2>/dev/null
+  wait "$zero_pid" 2>/dev/null
+
+  rm -rf "$vmm_tmpdir"
+fi
+
+check "the in-rung microvm snapshot is the one that requires a VMM" \
+  "$(grep -c 'host_signals_snapshot "\$require_vmm"' "$SCRIPT")" "1"
+# The idle-residency poll must NOT require one: watching standbys be reclaimed to zero is
+# spec section 7.4 prediction 5's predicted outcome, not a sampling failure.
+check "the idle-residency poll deliberately does NOT require a VMM" \
+  "$(grep -c 'host_signals_snapshot 0' "$SCRIPT")" "1"
+
+# ---------------------------------------------------------------------------
+# The EXIT trap (review 4001908613), exercised rather than grepped.
+# ---------------------------------------------------------------------------
+echo "== an EXIT trap tears the arm's stack down on every die/exit path"
+check "a trap is installed at all (there were zero before)" \
+  "$(grep -c '^trap cleanup_on_exit EXIT' "$SCRIPT")" "1"
+
+trap_body="$(extract_fn cleanup_on_exit || true)"
+check "cleanup_on_exit is extractable" "$([ -n "$trap_body" ] && echo yes || echo no)" "yes"
+
+if [ -n "$trap_body" ]; then
+  tr_tmpdir="$(mktemp -d)"
+  tr_probe="$tr_tmpdir/probe.sh"
+  tr_order="$tr_tmpdir/order"
+  doomed="$tr_tmpdir/doomed"
+  mkdir -p "$doomed/slots-container-d--ram--c1"
+  : >"$doomed/slots-container-d--ram--c1/slot-1.times"
+  {
+    echo 'set -uo pipefail'
+    echo 'stop_container_stack() { echo container >>"$ORDER"; }'
+    echo 'stop_microvm_stack() { echo microvm >>"$ORDER"; }'
+    printf '%s\n' "$trap_body"
+    echo 'trap cleanup_on_exit EXIT'
+    echo 'exit 7'
+  } >"$tr_probe"
+  tr_rc=0
+  ORDER="$tr_order" E11_TMPDIR="$doomed" bash "$tr_probe" || tr_rc=$?
+  check "the trap does not swallow the script's exit status" "$tr_rc" "7"
+  check "it kills BOTH arms' stacks (kill before remove, as build-snapshot.sh does)" \
+    "$(tr '\n' ' ' <"$tr_order")" "container microvm "
+  check "and it removes the temp root, so no mktemp -d slot dir survives a die" \
+    "$([ -e "$doomed" ] && echo survived || echo gone)" "gone"
+
+  # Non-vacuousness for the removal: the same probe WITHOUT the trap leaves the dir behind,
+  # so "gone" above is the trap's doing and not the shell's.
+  mkdir -p "$doomed/slots-container-d--ram--c1"
+  tr_probe2="$tr_tmpdir/probe-no-trap.sh"
+  {
+    echo 'set -uo pipefail'
+    echo 'exit 7'
+  } >"$tr_probe2"
+  bash "$tr_probe2" || true
+  check "non-vacuousness: without the trap the same dir survives the same exit" \
+    "$([ -e "$doomed" ] && echo survived || echo gone)" "survived"
+
+  rm -rf "$tr_tmpdir"
+fi
+
+check "every temp path lives under the trap-owned root, not a bare mktemp local" \
+  "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -cE 'mktemp( -d)? *$|mktemp( -d)?\)')" "0"
+check "the temp root itself is created once, at script scope" \
+  "$(grep -c '^E11_TMPDIR="\$(mktemp -d' "$SCRIPT")" "1"
+
 echo "== RSS is never read as a fallback anywhere pss_bytes_for_pids or its callers run"
 # Comment lines (the header's own disclosure that RSS/VmRSS is deliberately
 # avoided) are stripped first, so this targets actual code, not prose that
@@ -368,8 +749,13 @@ check "build_converge_script exists (harness/src/converge.ts's script, reproduce
   "$(grep -c '^build_converge_script() {' "$SCRIPT")" "1"
 check "converge_slot times it host-side, separately" \
   "$(grep -c '^converge_slot() {' "$SCRIPT")" "1"
+# Matched on the JSON KEY, not on every mention of the name: the refusals that keep a
+# converge timing from being fabricated name the field in their messages too, and counting
+# mentions made this assertion go red on code that got stricter.
 check "converge result lands in its own JSON field (convergeMsP50), not p95Ms" \
-  "$(grep -c 'convergeMsP50' "$SCRIPT")" "2"
+  "$(grep -c "'convergeMsP50':" "$SCRIPT")" "1"
+check "  ...and p95Ms is a separate key, not the same one" \
+  "$(grep -c "'p95Ms':" "$SCRIPT")" "1"
 # Structural: converge_slot must be invoked BEFORE the Exec-mix while-loop within
 # run_density_rung, not after -- extract the function and check line order.
 rdr_body="$(extract_fn run_density_rung || true)"
@@ -475,10 +861,12 @@ check "the header comment explains WHY this is a declared bias, not a fix" \
 echo "== the container and microvm arms are driven by ONE function, not two"
 check "run_density_rung is defined exactly once" \
   "$(grep -c '^run_density_rung() {' "$SCRIPT")" "1"
+# Comments stripped: dimension_literal's own comment quotes the container call site
+# verbatim (it is where the "-" dashes come from), and counting prose broke this check.
 check "main() calls run_density_rung for the container arm" \
-  "$(grep -c 'run_density_rung container' "$SCRIPT")" "1"
+  "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c 'run_density_rung container')" "1"
 check "main() calls run_density_rung for the microvm arm" \
-  "$(grep -c 'run_density_rung microvm' "$SCRIPT")" "1"
+  "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c 'run_density_rung microvm')" "1"
 check "no second, arm-specific Exec-driving function exists" \
   "$(grep -Ec '^run_density_rung_(container|microvm)\(\)' "$SCRIPT")" "0"
 check "grpc_exec_record (the actual RPC call) is defined exactly once, used by both arms" \
