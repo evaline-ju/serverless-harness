@@ -57,10 +57,49 @@ echo "== both unit files exist"
 check "microvm-worker.service present" "$([ -f "$SERVICE" ] && echo yes || echo no)" "yes"
 check "microvm-vms.slice present" "$([ -f "$SLICE" ] && echo yes || echo no)" "yes"
 
-if command -v systemd-analyze >/dev/null && systemd-analyze verify "$SERVICE" >/dev/null 2>&1; then
-  check "systemd-analyze verify microvm-worker.service" "0" "0"
+echo "== the shipped unit files actually pass systemd-analyze verify"
+# This is the only check in this suite that evaluates the units rather than grepping
+# their text, and it used to be structurally unable to fail: `systemd-analyze verify`
+# was INSIDE the `if` condition, so a unit that failed verification took the else
+# branch and was reported as a skip, and when it passed the assertion was
+# check ... "0" "0" -- a literal compared with itself.
+#
+# Asserting on the exit status alone does not work either, and this is measured, not
+# assumed: on ubuntu:24.04 (systemd 255) `systemd-analyze verify` exits 1 for this unit
+# exactly as shipped, with one diagnostic --
+#
+#   microvm-worker.service: Command /usr/local/bin/microvm-worker is not executable:
+#   No such file or directory
+#
+# -- which is a fact about the CHECKING host, not about the unit. CI (ubuntu-latest,
+# where systemd-analyze exists and is the reason this check matters) is such a host, so
+# `check "$rc" "0"` would be red on every PR and would get deleted again.
+#
+# So: assert that every diagnostic OTHER than that one is absent. Everything the unit
+# itself can get wrong -- an unknown key, an unparsable value, a bad section header, a
+# unit that fails to load -- prints its own line and fails this. The exit status IS
+# asserted directly wherever it is meaningful: for the slice (which has no ExecStart),
+# and for the service on a host that actually has the binary installed.
+if command -v systemd-analyze >/dev/null 2>&1; then
+  sa_out="$(systemd-analyze verify "$SERVICE" 2>&1)"
+  sa_rc=$?
+  sa_exec_start="$(grep -oE '^ExecStart=[^ ]+' "$SERVICE" | head -n1 | cut -d= -f2-)"
+  sa_real="$(printf '%s\n' "$sa_out" | grep -vF 'is not executable: No such file or directory' | grep -v '^$')"
+  check "systemd-analyze verify microvm-worker.service reports nothing about the unit itself" \
+    "$sa_real" ""
+  if [ -n "$sa_exec_start" ] && [ -x "$sa_exec_start" ]; then
+    check "systemd-analyze verify microvm-worker.service exits 0" "$sa_rc" "0"
+  else
+    echo "  (exit status not asserted for the service: $sa_exec_start is not installed on this host,"
+    echo "   which systemd-analyze reports as an error by itself -- the diagnostic check above is"
+    echo "   what covers the unit here)"
+  fi
+  systemd-analyze verify "$SLICE" >/dev/null 2>&1
+  slice_rc=$?
+  check "systemd-analyze verify microvm-vms.slice exits 0 (no ExecStart, so nothing host-specific to excuse)" \
+    "$slice_rc" "0"
 else
-  echo "  (skip: systemd-analyze unavailable or non-Linux -- not run, not claimed verified)"
+  echo "  (skip: systemd-analyze is not installed here -- not run, not claimed verified)"
 fi
 
 echo "== the crash-leak mitigation itself (spec §6's #1 practical failure)"
