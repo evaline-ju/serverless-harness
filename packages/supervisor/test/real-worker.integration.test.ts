@@ -42,6 +42,8 @@ async function withRealWorker(
    * `process.env`.
    */
   workerEnv: Record<string, string> = {},
+  /** Captures the pool's log lines; the boot-failure test reads `worker_exit` out of them. */
+  log: (line: Record<string, unknown>) => void = () => {},
 ): Promise<{ sup: Supervisor; restore: () => void }> {
   const savedArgv = process.execArgv;
   const savedEnv = Object.keys(workerEnv).map((k) => [k, process.env[k]] as const);
@@ -65,7 +67,7 @@ async function withRealWorker(
         ...config,
       } as NodeJS.ProcessEnv),
       // workerEntry deliberately OMITTED: this is the point of the file.
-      log: () => {},
+      log,
     });
     return { sup, restore };
   } catch (err) {
@@ -161,6 +163,35 @@ describe('the real worker, forked from DEFAULT_WORKER_ENTRY', () => {
     // pool stops routing to it without killing it.
     sup!.pool.drainAll();
     await vi.waitFor(() => expect(sup!.pool.views()[0]!.healthy).toBe(false), { timeout: 15_000 });
+  }, 60_000);
+
+  it('refuses to boot on a malformed keyset instead of 503ing every turn', async () => {
+    // #249's regression, reopened by this deployment shape. `startServer` calls
+    // `assertKeysetUsable(process.env)` "before anything binds" (server.ts:657), and this path
+    // deliberately never goes through `startServer` -- it builds a bare `createServer(handler)` and
+    // never listens. So a malformed SH_SESSION_TOKEN_PUBLIC_KEYS stopped being a boot failure: every
+    // worker reported `ready`, served `GET /health`, and 503'd every authenticated `/turn`. The
+    // "healthy-looking deployment, per-request failure" shape #249 closed, on the one runtime whose
+    // workers bypass the boot check.
+    //
+    // Driven against the REAL worker because the boot block only runs under the main-module guard;
+    // no `.mjs` fixture has one.
+    const logs: Array<Record<string, unknown>> = [];
+    ({ sup, restore } = await withRealWorker(
+      { SH_TURNS_PER_WORKER: '8' },
+      { SH_SESSION_TOKEN_PUBLIC_KEYS: 'garbage' },
+      (line) => logs.push(line),
+    ));
+
+    // exit 2, the boot-failure code this block already uses for SH_SANDBOX_DISCOVERY -- so systemd
+    // sees a crashloop with the reason in the journal, via the pool's restart backoff.
+    await vi.waitFor(
+      () =>
+        expect(logs.filter((l) => l.event === 'worker_exit' && l.code === 2)).not.toHaveLength(0),
+      { timeout: 30_000 },
+    );
+    // And it must never have looked healthy on the way down.
+    expect(sup!.pool.views().filter((v) => v.healthy)).toHaveLength(0);
   }, 60_000);
 
   it('does not wedge into permanent 429s after non-turn connections at S=1', async () => {

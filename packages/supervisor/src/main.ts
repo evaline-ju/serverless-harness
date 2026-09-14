@@ -80,9 +80,9 @@ export async function startSupervisor(opts: {
     });
     // Same failure class as the 'error' listener above, by a different door. `route` is async, so
     // anything it throws is a rejected promise; a bare `void` declines to handle it, and Node's
-    // default unhandledRejection mode throws -- ending the process. KillMode=control-group in the
-    // unit then takes every worker with it, and Restart=always brings back a supervisor that has
-    // lost every in-flight turn. Today's body is safe (handOff catches its own send failures,
+    // default unhandledRejection mode throws -- ending the process. Every worker then exits on its
+    // own 'disconnect' handler as the IPC channels close, and Restart=always brings back a
+    // supervisor that has lost every in-flight turn. Today's body is safe (handOff catches its own send failures,
     // readHead only resolves, socket.end() on a dead socket does not throw), but `config.policy.pick`
     // is injected and a future policy could throw -- and the whole reason this callback is a one-line
     // dispatcher is that a supervisor must survive anything one connection can do.
@@ -108,6 +108,22 @@ export async function startSupervisor(opts: {
     let sessionId: string | undefined;
     if (config.policy.needsHead) {
       const read = await readHead(socket);
+      // A peer that hung up or RST'd during the pre-read leaves nothing to hand off, and handing it
+      // off anyway KILLED A WORKER. Measured, because it is worse than it looks:
+      // `child.send(msg, deadSocket)` does not throw, so `handOff`'s catch never runs and the two
+      // counters that would have shown it stay at zero (`handoff_retries: 0`,
+      // `handoff_failures: 0`). The child receives a `conn` whose handle is a socket it cannot use
+      // and exits -- one abandoned connection produced `worker_exit code: 1` and `restarts: 1`,
+      // taking every turn that worker was multiplexing with it. That is the same class as the
+      // handle-less-`conn` defect `pool.ts`'s send comment exists for, reached from the other end,
+      // and client-side abandonment is commonest at exactly the saturation knee E8 measures.
+      if (read.outcome === 'closed') {
+        // Destroyed rather than merely dropped. With `allowHalfOpen` false the socket usually
+        // tears itself down on 'end' already, but "never leave an fd to chance" is the same rule
+        // `handOff` applies to a hand-off it could not complete, and destroy() is idempotent.
+        socket.destroy();
+        return;
+      }
       head = read.bytes;
       // An incomplete head still routes: the supervisor does not adjudicate HTTP, so the
       // worker's parser issues the 400 (or completes the request) as it would have anyway.

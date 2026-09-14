@@ -20,6 +20,7 @@ function readInt(
   bounds: { min: number; max?: number },
 ): number {
   const raw = env[name]?.trim();
+  const max = bounds.max ?? Number.MAX_SAFE_INTEGER;
   if (!raw) {
     // Expressing "no default" as `undefined` rather than a number means no reader has to work
     // out whether the value in that slot is a legal one for the variable. `SH_TURNS_PER_WORKER`
@@ -27,14 +28,38 @@ function readInt(
     // blank check in readConfig() says. That check fires first, so this branch is unreachable
     // for it; it is a real net for anything else declared required later.
     if (fallback === undefined) throw new Error(`${name} is required and has no default`);
+    // `bounds` apply to the fallback too, or the sentence above is only true of values an
+    // OPERATOR typed. `SH_WORKERS` passes a COMPUTED one (`cpus().length`), and `os.cpus()` is
+    // documented as possibly returning an empty array: an unchecked 0 there booted a supervisor
+    // that logged `supervisor_listening ... workers: 0`, forked nothing, and answered 429 to
+    // everything forever, since `isSaturated([])` is true by design -- with no error anywhere.
+    // `defaultWorkers` now makes that particular value legal by construction, so this branch is
+    // unreachable for it, exactly as the blank check above makes the `undefined` throw
+    // unreachable for `SH_TURNS_PER_WORKER`. Both are nets for the next default, not dead code.
+    if (!Number.isInteger(fallback) || fallback < bounds.min || fallback > max) {
+      throw new Error(`${name} default ${fallback} is not an integer in [${bounds.min}, ${max}]`);
+    }
     return fallback;
   }
   const n = Number(raw);
-  const max = bounds.max ?? Number.MAX_SAFE_INTEGER;
   if (!Number.isInteger(n) || n < bounds.min || n > max) {
     throw new Error(`${name}='${raw}' must be an integer in [${bounds.min}, ${max}]`);
   }
   return n;
+}
+
+/**
+ * W's default, from a CPU count that may legitimately be 0.
+ *
+ * `os.cpus()` is documented as possibly returning an empty array, and 0 is not a legal W: the
+ * supervisor forks nothing, and `isSaturated([])` is `true` by design, so it answers 429 to every
+ * request for the lifetime of the process. Clamped rather than thrown, because failed CPU detection
+ * is a property of the host and not an operator error -- one worker is a working deployment, and a
+ * supervisor that refuses to boot over it would be a worse answer than a quiet one. An operator who
+ * wants more sets `SH_WORKERS`, which is validated as an operator value like every other knob.
+ */
+export function defaultWorkers(cpuCount: number): number {
+  return Math.max(1, cpuCount);
 }
 
 export function readConfig(env: NodeJS.ProcessEnv): SupervisorConfig {
@@ -62,7 +87,7 @@ export function readConfig(env: NodeJS.ProcessEnv): SupervisorConfig {
   // `assertKeysetUsable` -- the precedent for "validate at boot, not per request" -- already lives.
   return {
     port,
-    workers: readInt(env, 'SH_WORKERS', cpus().length, { min: 1 }),
+    workers: readInt(env, 'SH_WORKERS', defaultWorkers(cpus().length), { min: 1 }),
     turnsPerWorker: readInt(env, 'SH_TURNS_PER_WORKER', undefined, { min: 1 }),
     policy: policyFromName(env.SH_ROUTING_POLICY),
     restartBackoffMs: readInt(env, 'SH_WORKER_RESTART_BACKOFF_MS', 250, { min: 0 }),

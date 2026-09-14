@@ -215,6 +215,66 @@ describe('sticky routing is connection-scoped (§3.4, §7)', () => {
     expect(sup.pool.counters.handoffFailures).toBe(0);
   }, 20_000);
 
+  it('does not hand off a connection the peer abandoned during the pre-read', async () => {
+    // `readHead` reports WHY it stopped, and `'closed'` -- a peer that hung up or RST'd mid-head --
+    // used to be ignored: only `'cap'` was consulted, so the dead socket went on to `handOff`.
+    //
+    // The cost is not what it looks like from `handOff`'s catch. `child.send(msg, deadSocket)` does
+    // NOT throw, so nothing is caught, nothing is retried, and BOTH hand-off counters stay at zero
+    // -- measured. The child receives a `conn` whose handle it cannot use and exits: this test
+    // against the reverted fix produced `worker_exit code: 1` and `restarts: 1` from one abandoned
+    // connection, i.e. every turn that worker was multiplexing died with it. Same class as the
+    // handle-less-`conn` defect, reached from the other end. So `restarts` is what this pins;
+    // the two counters are asserted as well precisely because they are the ones that DON'T move.
+    sup = await startSupervisor({
+      config: readConfig(env({ SH_WORKERS: '2', SH_ROUTING_POLICY: 'stickyBySession' })),
+      workerEntry: sseWorker,
+      log: () => {},
+      shutdownGraceMs: 500,
+    });
+    await waitReady(sup, 2);
+
+    // A live sticky request first, so "the counters stayed at zero" cannot pass vacuously: it
+    // proves this policy really does pre-read and hand off on this supervisor.
+    const ok = await speak(
+      sup.port,
+      'GET /ping HTTP/1.1\r\nHost: x\r\nX-SH-Session-Id: sess-live\r\n\r\n',
+      (t) => t.includes('{"pid"'),
+    );
+    expect(ok.text).toContain('{"pid"');
+    ok.socket.destroy();
+    expect(sup.pool.counters.handoffRetries).toBe(0);
+    expect(sup.pool.counters.handoffFailures).toBe(0);
+
+    // Now an abandoned one: an UNTERMINATED head, so `readHead` is still waiting, then an RST.
+    // `resetAndDestroy` rather than `destroy` so the server side sees ECONNRESET deterministically
+    // -- that destroys the socket as it reports the error, which is the state that made the send
+    // throw. A plain FIN can leave the fd alive just long enough for the send to succeed, so the
+    // defect would only fire sometimes.
+    const abandoned = connect(sup.port, '127.0.0.1');
+    await once(abandoned, 'connect');
+    abandoned.on('error', () => {});
+    abandoned.write('GET /ping HTTP/1.1\r\nHost: x\r\nX-SH-Session-Id: sess-gone\r\n');
+    // Let the partial head actually reach the supervisor before the reset, so this exercises the
+    // real shape (a peer that abandons a head already in flight) rather than an empty connection.
+    await new Promise((r) => setTimeout(r, 50));
+    abandoned.resetAndDestroy();
+
+    // Slept rather than polled: the property is that NOTHING happens, and a `waitFor` on a
+    // negative passes on its first tick whether or not the route callback has run yet. 250ms is
+    // comfortably past the restart backoff (250ms) a dying worker would schedule.
+    await new Promise((r) => setTimeout(r, 250));
+    // THE pin: no worker died over an abandoned connection.
+    expect(sup.pool.counters.restarts).toBe(0);
+    expect(sup.pool.views().every((v) => v.healthy)).toBe(true);
+    // Zero here is the measured pre-fix value too -- kept so a future change that makes this path
+    // throw instead cannot quietly start charging E8's counters for a client's behaviour.
+    expect(sup.pool.counters.handoffRetries).toBe(0);
+    expect(sup.pool.counters.handoffFailures).toBe(0);
+    // And no phantom turn on either slot's estimate, which is what a hand-off credits.
+    expect(sup.pool.views().map((v) => v.inFlight)).toEqual([0, 0]);
+  }, 20_000);
+
   it('does NOT re-route a second request on the same connection', async () => {
     // §7 requires this pinned by test. Affinity is decided ONCE per connection, keyed by the
     // first request; a second session id on the same socket is neither seen nor re-routable,

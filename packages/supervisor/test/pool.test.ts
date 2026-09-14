@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { harness, fakeSocket } from './helpers/fake-worker.js';
 
 describe('WorkerPool lifecycle', () => {
@@ -155,18 +155,46 @@ describe('WorkerPool hand-off', () => {
     expect(h.pool.views()[0]!.inFlight).toBe(0);
   });
 
-  it('closes the socket rather than leaking it when nobody can take it', () => {
-    // The alternative — returning undefined and forgetting the socket — leaks a fd per
-    // occurrence, and on a saturation ladder that is the leak that ends the run.
+  it('answers 429 rather than resetting or leaking when nobody can take it', () => {
+    // Two properties in one place, because the first used to be satisfied by breaking the second.
+    //
+    // The socket must not be forgotten -- that leaks a fd per occurrence, and on a saturation
+    // ladder that is the leak that ends the run. But it was closed with a bare `destroy()`, which
+    // gives the client an ECONNRESET for a condition `main.ts` answers with a clean 429 one branch
+    // earlier: every healthy worker gone between `pick` and the send, i.e. a restart window. A
+    // driver cannot tell that reset apart from the supervisor having crashed, and on an E8 rung
+    // that is a different data point. `refuse()` writes the 429 and bounds the fd with its own
+    // linger, so the leak stays closed by another route.
     const h = harness();
     h.forked[0]!.ready();
     h.forked[1]!.ready();
+    // Two successful hand-offs first, so the refusal below has a non-zero estimate to stamp.
+    h.pool.handOff(0, fakeSocket());
+    h.pool.handOff(0, fakeSocket());
+    expect(h.pool.views()[0]!.inFlight).toBe(2);
+
+    // Now nobody can take one: a disconnected channel on the pick, a throwing one on the retry.
     h.forked[0]!.connected = false;
     h.forked[1]!.sendThrows = true;
     const sock = fakeSocket();
     expect(h.pool.handOff(0, sock)).toBeUndefined();
-    expect(sock.destroy).toHaveBeenCalled();
     expect(h.pool.counters.handoffFailures).toBe(1);
+    expect(h.logs.some((l) => l.event === 'handoff_failed')).toBe(true);
+
+    const written = vi
+      .mocked(sock.end)
+      .mock.calls.map(([chunk]) => String(chunk))
+      .join('');
+    expect(written).toContain('429 Too Many Requests');
+    expect(written).toContain('Retry-After:');
+    expect(sock.destroy).not.toHaveBeenCalled(); // ended, not reset
+
+    // And the refusal is STAMPED, which is the half `destroy()` silently skipped: a later `load`
+    // reporting lower than the estimate at refusal is what makes it countable as spurious. Without
+    // `noteRefusal()` this branch's refusals were invisible to the counter designed to find them.
+    expect(h.pool.counters.spuriousRefusals).toBe(0);
+    h.forked[0]!.load(0);
+    expect(h.pool.counters.spuriousRefusals).toBe(1);
   });
 });
 
@@ -304,6 +332,43 @@ describe('WorkerPool drain', () => {
         { msg: { type: 'drain' }, hasHandle: false },
       ]);
     }
+  });
+
+  it('does not drain a channel that is already gone', () => {
+    // `ChildProcess.send()` to a closed channel does NOT throw, so `drainAll`'s try/catch never saw
+    // it: Node's no-callback branch does `process.nextTick(() => this.emit('error', …))`. Checking
+    // `connected` -- the same signal `handOff` consults -- turns the common case (a worker that
+    // already exited) into a no-op rather than an asynchronous error nothing was catching.
+    const h = harness();
+    h.forked[0]!.ready();
+    h.forked[1]!.ready();
+    h.forked[0]!.connected = false; // exited: crashloop, OOM kill, or a boot-validation exit
+    h.pool.drainAll();
+    expect(h.forked[0]!.sent.filter((s) => s.msg.type === 'drain')).toEqual([]);
+    // ...and every LATER worker is still drained, which is the whole first step of shutdown.
+    expect(h.forked[1]!.sent.filter((s) => s.msg.type === 'drain')).toHaveLength(1);
+  });
+
+  it('survives an async channel error instead of dying mid-shutdown', () => {
+    // The other half, and the one that was fatal. An 'error' event on a child with NO listener is an
+    // unhandled 'error' -- `EventEmitter.emit` throws it, which in production is an
+    // uncaughtException that ends the SUPERVISOR. It fired on the ordinary shutdown path: `close()`
+    // -> `drainAll()` -> send to a dead worker's channel -> the supervisor dies BEFORE `awaitIdle`,
+    // killing the in-flight turns on every other worker. Exactly what the ordered `close()` is for.
+    //
+    // Emitted directly here because that is faithfully what Node does a tick after such a send, and
+    // it is the same assertion either way: with no listener this line throws, with one it does not.
+    const h = harness();
+    h.forked[0]!.ready();
+    expect(() =>
+      h.forked[0]!.emit(
+        'error',
+        Object.assign(new Error('channel closed'), {
+          code: 'ERR_IPC_CHANNEL_CLOSED',
+        }),
+      ),
+    ).not.toThrow();
+    expect(h.logs.some((l) => l.event === 'worker_channel_error' && l.id === 0)).toBe(true);
   });
 
   it('awaitIdle resolves at once when no worker has a turn in flight', async () => {

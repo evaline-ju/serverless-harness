@@ -150,7 +150,36 @@ start_redis() {
   # The invariant was already written down for the admin listener (setup-vm.test.sh asserts it binds
   # 127.0.0.1 *because* it is unauthenticated). It simply had not been applied to the listener that
   # exposes session state, the ownership index, the lease store and sh:sandbox:records.
-  podman run -d --name sh-redis --replace -p 127.0.0.1:6379:6379 docker.io/redis:7-alpine
+  #
+  # NO VOLUME, deliberately for this round: session state, the ownership index and the lease store
+  # are lost on every reboot and on every `podman rm` of this container. That is acceptable only
+  # because this deployment exists to run E8 rungs, where each run starts from an empty Redis
+  # anyway. It is stated here (and in README.md's "What round one does not claim") rather than left
+  # for an operator to discover after a reboot: --restart=always below brings the container back,
+  # not the data that was in it.
+  podman run -d --name sh-redis --replace --restart=always \
+    -p 127.0.0.1:6379:6379 docker.io/redis:7-alpine
+}
+
+# Podman's --restart=always covers a container that exits, but explicitly NOT a host reboot:
+# podman-run(1) says "--restart will not restart containers after a system reboot", and points at
+# podman-restart.service as the supported way to get that. Without it, the units come back on boot
+# (both are WantedBy=multi-user.target) while Redis and every sandbox container do not --
+# sh:sandbox:records is empty and every turn fails until somebody re-runs this script, which is a
+# far worse failure than a unit that refuses to start, because everything looks healthy.
+#
+# Not fatal if it is unavailable: this is one podman package's unit name, and a host where it is
+# missing is a host with a working bring-up and a documented reboot gap, not a host that should
+# refuse to install. Warn with the consequence named, since `set -e` would otherwise abort the whole
+# script here on an older podman.
+enable_container_restart() {
+  log "enabling podman-restart.service (containers do not survive a reboot without it)"
+  if ! systemctl enable podman-restart.service; then
+    echo "WARNING: could not enable podman-restart.service. --restart=always still restarts a" \
+      "container that exits, but podman-run(1) is explicit that it does NOT survive a host" \
+      "reboot. After a reboot, re-run this script (or start sh-redis and the sh-sandbox-*" \
+      "containers by hand) before expecting any turn to succeed." >&2
+  fi
 }
 
 # remote-worker/cmd/worker/main.go:93-105 reads RELAY_ADDR (default localhost:8443),
@@ -247,7 +276,7 @@ start_sandboxes() {
     # running `ps` in a loop reads the token that require_relay_token just insisted must be a real
     # secret. The token is the whole of the relay's authentication (makeDefaultValidateToken is
     # fail-closed), so holding it means being able to attach as a sandbox, i.e. to become an executor.
-    SANDBOX_TOKEN="$token" podman run -d --name "sh-sandbox-$i" --replace \
+    SANDBOX_TOKEN="$token" podman run -d --name "sh-sandbox-$i" --replace --restart=always \
       --add-host host.containers.internal:host-gateway \
       -e "SANDBOX_ID=sh-sandbox-$i" \
       -e "RELAY_ADDR=$addr" \
@@ -277,6 +306,8 @@ main() {
   install_env
   require_relay_token
   install_units
+  # Before the containers, so a `podman run` that lands between the two is already covered.
+  enable_container_restart
   start_redis
   start_sandboxes
   start_services

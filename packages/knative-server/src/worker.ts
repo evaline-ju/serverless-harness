@@ -5,6 +5,9 @@ import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { handler } from './server.js';
 // Boot-time validation of the sandbox-discovery enum; see its use below.
 import { resolveDiscoverySource } from '@sh/harness/select-sandbox';
+// Boot-time validation of the token keyset -- #249's fix, which this path has to call itself
+// because it never goes through startServer. See its use below.
+import { assertKeysetUsable } from './turn-auth.js';
 
 /**
  * Worker → supervisor. Four rows: the first three are exactly P6 §3.9's; the fourth, `stats`,
@@ -124,13 +127,6 @@ export function createWorkerRuntime(opts: {
     server,
     counter,
     accept(socket: Socket, head?: Buffer): void {
-      // Defence against a handle-less `conn`. Node can deliver a queued handle-send with no
-      // handle attached (if the descriptor was consumed elsewhere first), and the parameter is
-      // typed `Socket` only because `process.on('message')` casts what it is given. Emitting
-      // `undefined` as a connection throws `TypeError: Cannot convert undefined or null to
-      // object` out of the message handler, uncaught -- killing a worker that may be
-      // multiplexing S turns. A supervisor bug must cost one connection, not the process.
-      if (socket === undefined || socket === null) return;
       // The supervisor credits its estimate +1 for EVERY connection it hands off (§3.9's
       // optimistic increment), but `load` is only ever sent from the turn counter above, and a
       // non-turn request -- GET /health, POST /runs, a monitoring probe, a port scan -- returns
@@ -166,6 +162,22 @@ export function createWorkerRuntime(opts: {
       // unbounded, uninstrumented, and clears only on a crash. Keeping the 'close' report as well
       // costs one message per connection and keeps the keep-alive-with-turns case exact.
       send({ type: 'load', inFlight: counter.inFlight });
+      // Defence against a handle-less `conn`. Node can deliver a queued handle-send with no
+      // handle attached (if the descriptor was consumed elsewhere first), and the parameter is
+      // typed `Socket` only because `process.on('message')` casts what it is given. Emitting
+      // `undefined` as a connection throws `TypeError: Cannot convert undefined or null to
+      // object` out of the message handler, uncaught -- killing a worker that may be
+      // multiplexing S turns. A supervisor bug must cost one connection, not the process.
+      //
+      // Deliberately BELOW the report above, not before it. `handOff` credits `slot.inFlight += 1`
+      // for every `conn` it sends, INCLUDING one that arrives with no handle, so returning ahead of
+      // the report left that credit in place permanently -- the same unbounded wedge the comment
+      // above closes, reached by a different door: at S=1 one handle-less `conn` saturates the slot,
+      // every later connection is refused before hand-off, no turn arrives, so no `load` arrives to
+      // reconcile, and `spurious_refusals` cannot fire for the reason given above. Ordering it this
+      // way costs nothing: the value reported is the ABSOLUTE current turn count, which does not
+      // depend on whether this particular handle arrived.
+      if (socket === undefined || socket === null) return;
       socket.once('close', () => send({ type: 'load', inFlight: counter.inFlight }));
       // The socket arrived as a file descriptor, which carries no JS-side buffer: bytes the
       // supervisor read to make its routing decision are gone from the kernel buffer too.
@@ -257,7 +269,16 @@ if (isMainModule) {
   // crashloop with the reason in the journal, via the supervisor's restart backoff. The records-
   // without-SH_REMOTE_SANDBOX=1 combination is covered by the same call, and deserves to be: it is a
   // static property of the unit file, and discovering it on the first turn wastes a whole bring-up.
+  //
+  // The keyset is the other half of the same argument, and it needs an explicit call here rather
+  // than inheriting one: `startServer` runs `assertKeysetUsable(process.env)` "before anything
+  // binds" (server.ts:657), and this path deliberately bypasses `startServer` altogether -- bare
+  // `createServer(handler)`, never `listen()`. So under the supervisor a malformed
+  // SH_SESSION_TOKEN_PUBLIC_KEYS stopped being a boot failure: every worker reported `ready`,
+  // served GET /health, and 503'd every authenticated /turn. Citing #249's fix as this block's own
+  // precedent while not calling it left the regression it closed open on exactly this deployment.
   try {
+    assertKeysetUsable(process.env);
     resolveDiscoverySource(process.env, process.env.SH_REMOTE_SANDBOX === '1');
   } catch (err) {
     console.error(String(err instanceof Error ? err.message : err));

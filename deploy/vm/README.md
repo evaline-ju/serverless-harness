@@ -35,18 +35,36 @@ cd /opt/serverless-harness   # this checkout, on the VM, already built (see Prer
 sudo ./deploy/vm/setup-vm.sh
 ```
 
-That one command — run _after_ the build above, not instead of it — does the following:
+**A first run takes two invocations, by design.** The script installs the env files and then
+refuses to go further until `SH_RELAY_TOKEN` is set in the `relay.env` it just wrote (the relay's
+token validation is fail-closed, so starting containers before that guarantees sandboxes that can
+never attach — see "Sandbox container networking and the relay token" below). So on a fresh VM:
+
+```bash
+sudo ./deploy/vm/setup-vm.sh        # writes the env files, then stops at the token check
+sudoedit /etc/serverless-harness/relay.env   # set SH_RELAY_TOKEN=<a shared secret>
+sudo ./deploy/vm/setup-vm.sh        # installs units, starts containers, enables the services
+```
+
+The first invocation exits non-zero with a message naming `SH_RELAY_TOKEN` and the file. That is
+the expected first-run path, not a failure to debug. The second invocation keeps the env file you
+edited (`install_env` never clobbers an existing one) and continues past the check.
+
+Across those two runs, the script does the following, in this order:
 
 1. Writes `/etc/serverless-harness/supervisor.env` and `relay.env` from their `env/*.example`
    templates — only the first time each; an operator-edited env file is never clobbered on a
    re-run.
-2. Installs `systemd/sh-supervisor.service` and `systemd/sh-relay.service` into
-   `/etc/systemd/system` and reloads the daemon.
-3. Starts a Redis container and `SH_SANDBOX_COUNT` (default 2) sandbox containers via podman,
+2. **Checks `relay.env` for a non-empty `SH_RELAY_TOKEN`, and stops here if there is none.**
+   Everything below runs only once that is set — which is why a fresh VM needs the second
+   invocation above.
+3. Installs `systemd/sh-supervisor.service` and `systemd/sh-relay.service` into
+   `/etc/systemd/system`, reloads the daemon, and enables `podman-restart.service` so the
+   containers below come back after a reboot (see "Reboots" below).
+4. Starts a Redis container and `SH_SANDBOX_COUNT` (default 2) sandbox containers via podman,
    each wired to reach the relay and to authenticate to it (see "Sandbox container networking
-   and the relay token" below) — but only once `SH_RELAY_TOKEN` is set in `relay.env`, which
-   the script checks before starting any of them.
-4. Enables **and starts** `sh-relay.service`, but only **enables** `sh-supervisor.service` — it
+   and the relay token" below).
+5. Enables **and starts** `sh-relay.service`, but only **enables** `sh-supervisor.service` — it
    is deliberately not started yet (see below).
 
 `SH_TURNS_PER_WORKER` ships empty on purpose (see below), and `readConfig` throws on blank, so
@@ -95,15 +113,24 @@ relay; every container would share one `SANDBOX_ID` and collide on the same
 `relay.env.example` ships it commented out on purpose (it is an operator secret, not a
 default), so `setup-vm.sh` checks the _installed_ `relay.env` for a non-empty
 `SH_RELAY_TOKEN` before starting any sandbox container, and refuses to continue with a clear
-message if it is missing, rather than starting containers that can never attach. Set it before
-running `setup-vm.sh`:
+message if it is missing, rather than starting containers that can never attach.
+
+`/etc/serverless-harness/relay.env` is created by `setup-vm.sh` itself, so on a fresh VM there is
+nothing to edit until the script has run once — this is the two-invocation first run described under
+"Bring it up". After that first run:
 
 ```bash
-echo 'SH_RELAY_TOKEN=<a shared secret>' | sudo tee -a /etc/serverless-harness/relay.env
+sudoedit /etc/serverless-harness/relay.env   # set SH_RELAY_TOKEN=<a shared secret>
+sudo ./deploy/vm/setup-vm.sh                 # re-run; the edited file is preserved
 ```
 
-(or edit the file directly — `install_env` will have already written it from the template on
-a prior run, and never clobbers it on a later one).
+Appending instead of editing works equally well once the file exists
+(`echo 'SH_RELAY_TOKEN=…' | sudo tee -a /etc/serverless-harness/relay.env`) — but only then, since
+the directory and file do not exist before `install_env` creates them.
+
+Whichever way you set it, the value must match each sandbox worker's `SANDBOX_TOKEN`;
+`setup-vm.sh` reads it back out of `relay.env` and passes exactly that to every container it
+starts, so editing this one file is enough.
 
 **Reaching the host from a container.** `host.containers.internal` is podman's documented
 analogue of Docker's `host.docker.internal` (`podman-run(1)`'s `host-gateway` special value).
@@ -123,6 +150,27 @@ host's bound port in ways a unit test cannot see. If a sandbox container cannot 
 real VM, `SH_SANDBOX_RELAY_ADDR` (or, if podman itself cannot resolve
 `host.containers.internal`, the VM's actual gateway or bridge IP) is the override to reach for
 first.
+
+## Reboots
+
+Both units are `WantedBy=multi-user.target`, so systemd brings the relay and the supervisor back
+on boot. The podman containers need one extra thing: `--restart=always` (which `setup-vm.sh` now
+passes to Redis and to every sandbox container) covers a container that _exits_, but
+`podman-run(1)` is explicit that it does **not** cover a host reboot. `setup-vm.sh` therefore also
+enables `podman-restart.service`, podman's own supported mechanism for that. Without it the units
+would come back while Redis and every sandbox container stayed down — `sh:sandbox:records` empty
+and every turn failing, on a VM that otherwise looks healthy.
+
+If `podman-restart.service` is not available on your podman build, `setup-vm.sh` warns rather than
+failing (it is one package's unit name, not a hard requirement of the bring-up) and the bring-up
+still completes. On such a host, re-run `setup-vm.sh` after a reboot before expecting turns to
+work.
+
+**Redis state does not survive a reboot either way.** The Redis container runs with no volume, so
+sessions, the ownership index and the lease store are lost on reboot and on any `podman rm` of it.
+That is a deliberate round-one choice, not an oversight: this deployment exists to run E8 rungs,
+and each run starts from an empty Redis anyway. `--restart=always` and `podman-restart.service`
+bring the container back, not the data that was in it.
 
 ## Where the env file lives
 

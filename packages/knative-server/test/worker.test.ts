@@ -286,6 +286,22 @@ describe('createWorkerRuntime', () => {
     expect(() => rt.accept(undefined as unknown as Socket)).not.toThrow();
   });
 
+  it('still reports load for a handle-less conn, so the credit for it is not permanent', () => {
+    // The guard above used to return BEFORE the reconciliation report. `handOff` credits
+    // `slot.inFlight += 1` for every `conn` it sends -- including one that arrives with no handle,
+    // which is precisely the case the fd hand-off's destructiveness produces -- so surviving the
+    // handle-less conn still left the supervisor's estimate one higher forever. At
+    // SH_TURNS_PER_WORKER=1 one of them saturates the slot: every later connection is refused
+    // before hand-off, so no turn can arrive, so no `load` can arrive to reconcile, and
+    // `spurious_refusals` cannot fire either (it only rises on a `load`). Same unbounded wedge as
+    // the held-connection case, through a different door.
+    const send = vi.fn<(msg: WorkerToSupervisor) => void>();
+    const rt = createWorkerRuntime({ send, requestHandler: () => {} });
+    send.mockClear(); // drop the constructor's `ready`
+    rt.accept(undefined as unknown as Socket);
+    expect(send.mock.calls.map(([m]) => m)).toEqual([{ type: 'load', inFlight: 0 }]);
+  });
+
   it('drain announces draining exactly once and is idempotent', () => {
     const send = vi.fn<(msg: WorkerToSupervisor) => void>();
     const rt = createWorkerRuntime({ send, requestHandler: () => {} });

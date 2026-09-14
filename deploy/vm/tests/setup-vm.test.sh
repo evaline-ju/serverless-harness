@@ -98,6 +98,46 @@ for pair in "${UNIT_PACKAGES[@]}"; do
 done
 pass "both units: correct ExecStart/WorkingDirectory, §4.3 hardening present, no dangling Requires="
 
+# --- the supervisor unit must not SIGTERM its own workers -------------------------------------
+# KillMode=control-group makes systemd's stop job deliver SIGTERM to EVERY process in the cgroup.
+# worker.ts installs no SIGTERM handler, so on `systemctl stop`/`restart` all W workers died
+# immediately on Node's default disposition -- and main.ts::close()'s ordered drainAll() -> stop
+# accepting -> awaitIdle(SHUTDOWN_GRACE_MS) then drained a pool that was already gone. §3.9's
+# "in-flight turns run to completion" never happened on the real deployment, only in the tests.
+# `mixed` sends SIGTERM to the main process only (what the drain assumes) and still SIGKILLs the
+# whole tree at TimeoutStopSec, which is what control-group was here for.
+grep -qE '^KillMode=mixed$' "$UNIT_SUPERVISOR" ||
+  fail "sh-supervisor.service must use KillMode=mixed: control-group SIGTERMs every worker" \
+    "alongside the supervisor, so the ordered drain in main.ts::close() has nothing left to drain"
+if grep -qE '^KillMode=control-group$' "$UNIT_SUPERVISOR"; then
+  fail "sh-supervisor.service is back on KillMode=control-group (see above)"
+fi
+pass "supervisor unit uses KillMode=mixed, so its own drain can actually run"
+
+# --- the supervisor unit must set HOME -------------------------------------------------------
+# deploy/knative/service.yaml, leaf-scaledjob.yaml and control-plane.yaml all set HOME=/tmp for
+# this same harness code, each with a writable path behind it. This unit runs as User=harness
+# (README: useradd --no-create-home) under ProtectHome=true and ProtectSystem=strict, so $HOME is
+# nonexistent or masked and the only writable places are PrivateTmp's /tmp and StateDirectory. Any
+# turn writing agent/session state under $HOME fails at runtime, after a green bring-up -- and the
+# hardening loop above could not see it, because it only asserts what IS present.
+grep -qE '^Environment=HOME=' "$UNIT_SUPERVISOR" ||
+  fail "sh-supervisor.service must set Environment=HOME= (every Knative manifest running this" \
+    "code sets HOME=/tmp; here ProtectHome=true and a --no-create-home user leave \$HOME unusable)"
+HOME_PATH="$(grep -oE '^Environment=HOME=.*' "$UNIT_SUPERVISOR" | head -1 | cut -d= -f3-)"
+# Whatever it is set to must be writable under this unit's own sandboxing: PrivateTmp gives /tmp,
+# StateDirectory gives /var/lib/serverless-harness. Anything else is a path ProtectSystem=strict
+# masks, i.e. the same runtime failure with an extra step.
+case "$HOME_PATH" in
+/tmp | /tmp/* | /var/lib/serverless-harness | /var/lib/serverless-harness/*)
+  pass "supervisor unit sets HOME=$HOME_PATH, writable under its own PrivateTmp/StateDirectory"
+  ;;
+*)
+  fail "sh-supervisor.service sets HOME=$HOME_PATH, which ProtectSystem=strict/ProtectHome=true" \
+    "leave unwritable -- use /tmp (PrivateTmp) or /var/lib/serverless-harness (StateDirectory)"
+  ;;
+esac
+
 # --- every EnvironmentFile= has a shipped template (general form of the relay.env gap) -----
 # Derive the env names from the units themselves, not by hard-coding "supervisor"/"relay" --
 # that is what makes this catch the next env file somebody adds.
@@ -331,6 +371,72 @@ fi
 if grep -vE '^[[:space:]]*#' "$SCRIPT" | grep -qE '\-p +6379:6379'; then
   fail "start_redis still publishes Redis on all interfaces (-p 6379:6379)"
 fi
+
+# --- containers must come back after a reboot -------------------------------------------------
+# Both units are WantedBy=multi-user.target, so systemd brings the supervisor and relay back on
+# boot. Nothing brought the CONTAINERS back: `podman run -d` with no --restart and no generated
+# unit means that after a reboot sh:sandbox:records is empty and every turn fails until an operator
+# re-runs this script -- on a VM where `systemctl status` looks perfectly healthy. The unit's own
+# comment ("the client retries on connect, so ordering against Redis is not load-bearing") is true
+# of ORDERING and says nothing about a container that never starts at all.
+#
+# Two halves, because either alone is insufficient: --restart=always covers a container that exits,
+# and podman-run(1) is explicit that it does NOT cover a host reboot -- podman-restart.service is
+# the documented mechanism for that.
+: >"$MOCK_LOG"
+start_redis
+start_sandboxes
+run_lines="$(grep -c 'podman run ' "$MOCK_LOG")"
+restart_lines="$(grep -c 'podman run .*--restart=always' "$MOCK_LOG")"
+# Non-zero guard: without it, "all N of N carry the flag" passes vacuously if the mock ever stops
+# recording podman invocations at all.
+((run_lines >= 4)) ||
+  fail "expected at least 4 podman run invocations (Redis + 3 sandboxes), got $run_lines"
+[[ "$run_lines" == "$restart_lines" ]] ||
+  fail "every podman run must carry --restart=always ($restart_lines of $run_lines do):" \
+    "$(cat "$MOCK_LOG")"
+pass "Redis and every sandbox container run with --restart=always"
+
+: >"$MOCK_LOG"
+enable_container_restart
+grep -qE '^systemctl enable podman-restart\.service$' "$MOCK_LOG" ||
+  fail "setup-vm.sh must enable podman-restart.service -- podman-run(1): --restart does NOT" \
+    "restart containers after a system reboot: $(cat "$MOCK_LOG")"
+pass "podman-restart.service enabled, so the containers survive a reboot"
+
+# ...and it must not be fatal when that unit is unavailable: it is one podman package's unit name,
+# and a host without it still has a working bring-up plus a documented reboot gap. `set -e` would
+# otherwise abort the whole script on an older podman.
+cat >"$TMP/bin/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s %s\n' "$(basename "$0")" "$*" >>"$MOCK_LOG"
+[[ "$*" != *podman-restart* ]] || exit 1
+MOCK
+chmod +x "$TMP/bin/systemctl"
+: >"$MOCK_LOG"
+if ! warn_out=$(enable_container_restart 2>&1); then
+  fail "enable_container_restart must not fail the bring-up when podman-restart.service is absent"
+fi
+echo "$warn_out" | grep -qi 'reboot' ||
+  fail "the warning must name the reboot consequence, not just the failed command: $warn_out"
+pass "a missing podman-restart.service warns about the reboot gap instead of aborting"
+# Restore the plain mock for the rest of the file (main() below asserts on systemctl argv).
+cat >"$TMP/bin/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s %s\n' "$(basename "$0")" "$*" >>"$MOCK_LOG"
+MOCK
+chmod +x "$TMP/bin/systemctl"
+
+# --- Redis's missing volume is stated, not left to be discovered on a reboot -------------------
+# start_redis runs with no -v, so sessions, the ownership index and the lease store are lost on
+# every reboot and every `podman rm`. That is a deliberate round-one choice (E8 rungs start from an
+# empty Redis), but --restart=always above brings the CONTAINER back and not the data in it, which
+# is exactly the kind of gap an operator should read rather than find.
+grep -qi 'no volume' "$SCRIPT" ||
+  fail "start_redis must state that Redis runs with no volume (state is lost on reboot)"
+grep -qi 'does not survive a reboot' "$VM_DIR/README.md" ||
+  fail "README.md must state that Redis state does not survive a reboot"
+pass "Redis's lack of a volume is documented in both the script and the README"
 
 # --- admin listener (Task 11): loopback only -------------------------------------------------
 # Unauthenticated, and it echoes configuration. Bound to 0.0.0.0 on a cloud VM it is a

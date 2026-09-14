@@ -103,4 +103,19 @@ export function harness(overrides: Partial<PoolOptions> = {}, workers = 2): Harn
   return { pool, forked, timers, logs, clock, runTimers };
 }
 
-export const fakeSocket = (): Socket => ({ destroy: vi.fn(), pause: vi.fn() }) as unknown as Socket;
+/**
+ * The narrow slice of `Socket` the pool touches. `resume`/`end`/`once` are here because a
+ * hand-off that finds no worker now answers with `refuse()` (§3.5's 429) instead of a bare
+ * `destroy()` -- see `handOff`'s tail. `once` returns the socket so `refuse`'s
+ * `socket.once('close', ...)` chains as it does on a real one.
+ */
+export const fakeSocket = (): Socket => {
+  const s = {
+    destroy: vi.fn(),
+    pause: vi.fn(),
+    resume: vi.fn(),
+    end: vi.fn(),
+    once: vi.fn(() => s),
+  };
+  return s as unknown as Socket;
+};

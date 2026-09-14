@@ -1,4 +1,5 @@
 import type { Socket } from 'node:net';
+import { refuse } from './admission.js';
 import { pickLeastLoaded, type WorkerView } from './routing.js';
 
 /**
@@ -61,6 +62,8 @@ export interface WorkerHandle {
   kill(signal?: NodeJS.Signals): boolean;
   on(event: 'message', listener: (msg: WorkerToSupervisor) => void): this;
   on(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+  /** `ChildProcess`'s own error channel. See `spawn()` for why the pool must listen to it. */
+  on(event: 'error', listener: (err: Error) => void): this;
 }
 
 export interface PoolOptions {
@@ -228,9 +231,20 @@ export class WorkerPool {
     }
     // Never just drop it: a forgotten socket is a leaked fd, and on a saturation ladder that
     // is the leak that ends the run.
+    //
+    // Answered with back-pressure rather than a bare reset, because reaching here IS the state
+    // `main.ts` answers 429 for one branch earlier: every healthy worker gone in the window
+    // between `policy.pick()` and the send, i.e. a restart. `socket.destroy()` gave the client an
+    // ECONNRESET/empty reply for a condition the same supervisor answers cleanly a few lines up,
+    // and a driver cannot tell that apart from the supervisor having crashed -- on an E8 rung a
+    // bare reset is a different data point from a back-pressure signal. It also skipped
+    // `noteRefusal()`, so the refusal was never stamped and `reconcile()` could never later count
+    // it as spurious. `refuse()` ends the socket and bounds the fd with its own linger (see
+    // REFUSAL_LINGER_MS), so the leak this comment is about is still closed.
     this.tally.handoffFailures += 1;
     this.opts.log({ event: 'handoff_failed', preferred });
-    socket.destroy();
+    this.noteRefusal();
+    refuse(socket);
     return undefined;
   }
 
@@ -294,11 +308,18 @@ export class WorkerPool {
     for (const slot of this.slots) {
       if (slot.drained) continue;
       slot.drained = true;
+      // `connected` FIRST, the same real failure signal `handOff` consults. It is not merely an
+      // optimisation: `ChildProcess.send()` to a closed channel does not throw, so the catch below
+      // never sees it -- it reports asynchronously as `emit('error', ERR_IPC_CHANNEL_CLOSED)` on the
+      // child (node:internal/child_process, the no-callback branch). A dead worker is already
+      // drained by virtue of being dead, so skipping the send is also the honest description.
+      if (!slot.handle.connected) continue;
       try {
         slot.handle.send({ type: 'drain' });
       } catch {
         // A channel that is already gone needs no drain, and must not abandon the drain of
-        // every later worker -- this is the first step of shutdown.
+        // every later worker -- this is the first step of shutdown. Kept for the SYNCHRONOUS
+        // throws; the asynchronous ones are handled by the 'error' listener in spawn().
       }
     }
   }
@@ -322,6 +343,26 @@ export class WorkerPool {
       fileOpP95Ms: NaN,
     };
     this.slots[id] = slot;
+
+    // Required, not defensive. `ChildProcess.send()` does NOT throw when the channel is closed: with
+    // no callback it does `process.nextTick(() => this.emit('error', ERR_IPC_CHANNEL_CLOSED))`. On a
+    // child with no 'error' listener that is an unhandled 'error' event, i.e. an uncaughtException
+    // that ends the SUPERVISOR -- so every `try { handle.send(...) } catch` in this file was
+    // protecting against the one shape this failure never takes.
+    //
+    // Reachable on the ordinary shutdown path, not a corner: whenever any worker is already dead (a
+    // crashloop, an OOM kill, a boot-validation exit), `close()` calls `drainAll()`, which sent to
+    // that dead channel -- and the supervisor died mid-drain, before `awaitIdle`, taking every
+    // in-flight turn on every OTHER worker with it. Precisely the outcome the ordered `close()`
+    // exists to prevent. `drainAll` now checks `connected` as well; this listener closes the race
+    // between that check and the send, and any other async child error.
+    //
+    // Logged and otherwise ignored: 'exit' is the event that carries meaning for a gone worker, and
+    // it already restarts the slot with backoff. This exists so the absence of a listener cannot be
+    // fatal.
+    handle.on('error', (err) => {
+      this.opts.log({ event: 'worker_channel_error', id, err: String(err) });
+    });
 
     handle.on('message', (msg) => {
       if (msg.type === 'ready') {

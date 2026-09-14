@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { cpus } from 'node:os';
-import { readConfig } from '../src/config.js';
+import { defaultWorkers, readConfig } from '../src/config.js';
 
 const base = { SH_TURNS_PER_WORKER: '8' } as NodeJS.ProcessEnv;
 const env = (extra: Record<string, string> = {}) => ({ ...base, ...extra }) as NodeJS.ProcessEnv;
@@ -9,7 +9,7 @@ describe('readConfig', () => {
   it('fills the defaults spec §3.8 names', () => {
     const c = readConfig(env());
     expect(c.port).toBe(8080);
-    expect(c.workers).toBe(cpus().length);
+    expect(c.workers).toBe(defaultWorkers(cpus().length));
     expect(c.restartBackoffMs).toBe(250);
     expect(c.policy.name).toBe('leastInFlight');
   });
@@ -49,6 +49,22 @@ describe('readConfig', () => {
 
   it('rejects a non-positive worker count', () => {
     expect(() => readConfig(env({ SH_WORKERS: '0' }))).toThrow(/SH_WORKERS='0'/);
+  });
+
+  it('never defaults W to 0, however many CPUs the host reports', () => {
+    // `readInt` returned its `fallback` unchecked, and `SH_WORKERS`'s fallback is COMPUTED:
+    // `cpus().length`, where `os.cpus()` is documented as possibly returning an empty array. With
+    // `SH_WORKERS` unset on such a host the supervisor booted successfully, logged
+    // `supervisor_listening ... workers: 0`, forked nothing, and then answered 429 to every request
+    // for the life of the process -- `isSaturated([])` is `true` by design -- with no error
+    // anywhere to say why. 0 is not a legal W, and the host is not the operator's mistake, so the
+    // default is clamped rather than made a boot failure.
+    expect(defaultWorkers(0)).toBe(1);
+    expect(defaultWorkers(1)).toBe(1);
+    expect(defaultWorkers(8)).toBe(8);
+    // And the bounds now cover the fallback path too, so the next computed default that is out of
+    // range is a boot failure naming itself rather than a silently wedged supervisor.
+    expect(readConfig(env()).workers).toBeGreaterThanOrEqual(1);
   });
 
   it('allows a zero restart backoff but not a negative one', () => {

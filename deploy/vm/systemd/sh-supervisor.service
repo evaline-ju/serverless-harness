@@ -17,11 +17,29 @@ Group=harness
 # ERR_MODULE_NOT_FOUND 'tsx'. Do not "simplify" this back to the repo root.
 WorkingDirectory=/opt/serverless-harness/packages/supervisor
 EnvironmentFile=/etc/serverless-harness/supervisor.env
+# Every manifest that runs this same harness code sets HOME explicitly with a writable path
+# behind it (deploy/knative/service.yaml:33, leaf-scaledjob.yaml:39, control-plane.yaml:190 all
+# use /tmp; relay-deployment.yaml does not, consistent with this being a harness-side need
+# rather than the relay's). This unit runs as User=harness -- which the README has the operator
+# create with --no-create-home -- under ProtectHome=true and ProtectSystem=strict, so $HOME is a
+# nonexistent or masked path and the only writable locations are PrivateTmp's /tmp and
+# StateDirectory. Without this, any turn that writes agent or session state under $HOME fails at
+# runtime, after a completely green bring-up. PrivateTmp=true below is what makes /tmp writable
+# and per-unit, so this is the same pairing the manifests use, not a bare env var.
+Environment=HOME=/tmp
 ExecStart=/usr/bin/node --import tsx src/main.ts
 Restart=always
 RestartSec=2
-# The supervisor forks W workers; systemd must account for the whole tree.
-KillMode=control-group
+# SIGTERM to the MAIN PROCESS ONLY, then SIGKILL to whatever is left in the cgroup at
+# TimeoutStopSec. That is what the supervisor's own shutdown assumes: main.ts::close() runs an
+# ordered drainAll() -> stop accepting -> awaitIdle(SHUTDOWN_GRACE_MS), and workers exit on their
+# own via the 'disconnect' handler once it finishes. Under the previous KillMode=control-group,
+# systemd's stop job delivered SIGTERM to EVERY process in the cgroup, so on `systemctl
+# stop`/`restart` all W workers died immediately on Node's default disposition (worker.ts installs
+# no SIGTERM handler) and close() then drained a pool that was already gone -- §3.9's "in-flight
+# turns run to completion" never happened on the real deployment. `mixed` still accounts for the
+# whole tree at the deadline, which is what control-group was here for.
+KillMode=mixed
 # §3.7: SIGTERM starts the drain. The deadline must exceed the longest turn E6 measured.
 TimeoutStopSec=120
 
