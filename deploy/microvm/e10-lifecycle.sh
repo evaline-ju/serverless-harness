@@ -120,6 +120,13 @@ RUNG1_RELAY_TOKEN="${SH_E10_RELAY_TOKEN:-e10-dev-token}"
 RUNG1_SANDBOX_ID="${SH_E10_SANDBOX_ID:-e10-rung1}"
 RUNG1_START_STACK="${SH_E10_START_STACK:-1}" # set 0 to reuse an already-running stack
 
+# The redis image, overridable so an operator can PIN A DIGEST
+# (SH_E10_REDIS_IMAGE=redis@sha256:...) for a reproducible run. `redis:7` is a
+# floating tag; it is kept as the default because it is what the rest of this repo
+# already pulls (deploy/knative/README-worker.md), and because a digest this script
+# has never actually pulled would be a guess, not a pin.
+RUNG1_REDIS_IMAGE="${SH_E10_REDIS_IMAGE:-redis:7}"
+
 die() { echo "e10: $*" >&2; exit 1; }
 log() { echo "e10: $*" >&2; }
 
@@ -189,8 +196,16 @@ start_rung1_stack() {
     log "rung1: SH_E10_START_STACK=0, reusing an already-running stack on port $RUNG1_RELAY_PORT"
     return 0
   fi
-  log "rung1: starting redis on :$RUNG1_REDIS_PORT"
-  docker run --rm -d -p "${RUNG1_REDIS_PORT}:6379" --name "sh-e10-redis-$$" redis:7 >/dev/null
+  # LOOPBACK ONLY. `-p "${PORT}:6379"` binds 0.0.0.0, which on the documented rig (an
+  # EC2 m8i.xlarge with a public interface) publishes an unauthenticated Redis to the
+  # internet -- and an open Redis is a standard host-takeover path: CONFIG SET dir +
+  # dbfilename, then write an authorized_keys or a cron file. Nothing outside this host
+  # has any business reaching a benchmark's scratch redis; the relay and the worker both
+  # connect over 127.0.0.1. `--save ''` additionally disables RDB snapshots, so the
+  # container never writes a dump file at all.
+  log "rung1: starting redis on 127.0.0.1:$RUNG1_REDIS_PORT (loopback only)"
+  docker run --rm -d -p "127.0.0.1:${RUNG1_REDIS_PORT}:6379" --name "sh-e10-redis-$$" \
+    "$RUNG1_REDIS_IMAGE" --save '' >/dev/null
 
   log "rung1: starting the relay on :$RUNG1_RELAY_PORT"
   (

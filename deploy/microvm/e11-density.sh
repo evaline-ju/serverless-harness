@@ -183,6 +183,12 @@ E11_RELAY_PORT="${SH_E11_RELAY_PORT:-8444}"
 E11_RELAY_TOKEN="${SH_E11_RELAY_TOKEN:-e11-dev-token}"
 E11_START_STACK="${SH_E11_START_STACK:-1}"
 
+# The redis image, overridable so an operator can PIN A DIGEST
+# (SH_E11_REDIS_IMAGE=redis@sha256:...) for a reproducible run. `redis:7` is a floating
+# tag; it stays the default because it is what the rest of this repo already pulls, and
+# because a digest this script has never pulled would be a guess, not a pin.
+E11_REDIS_IMAGE="${SH_E11_REDIS_IMAGE:-redis:7}"
+
 die() { echo "e11: $*" >&2; exit 1; }
 log() { echo "e11: $*" >&2; }
 
@@ -510,6 +516,24 @@ shuffle_e11_arms() {
   printf 'container\nmicrovm\n' | awk -v seed="$(($$ + $(date +%s)))" 'BEGIN{srand(seed)} {print rand()"\t"$0}' | sort -n | cut -f2-
 }
 
+# start_redis_loopback publishes this driver's scratch redis on LOOPBACK ONLY, and is
+# the single place either arm starts one (both arms had the same `docker run` line).
+#
+# It was `-p "${PORT}:6379"`, which binds 0.0.0.0. On the documented rig -- an EC2
+# m8i.xlarge with a public interface, running microvm-worker as root -- that publishes
+# an UNAUTHENTICATED redis to the internet, and an open redis is a standard
+# host-takeover path: CONFIG SET dir + dbfilename, then write an authorized_keys or a
+# cron file. Nothing outside this host needs to reach a benchmark's scratch redis: the
+# relay and the worker both connect over 127.0.0.1 (see REDIS_URL below). `--save ''`
+# additionally disables RDB snapshots, so the container writes no dump file at all.
+start_redis_loopback() {
+  local arm="$1"
+  log "$arm: starting redis on 127.0.0.1:$E11_REDIS_PORT (loopback only)"
+  docker run --rm -d -p "127.0.0.1:${E11_REDIS_PORT}:6379" --name "sh-e11-redis-$$" \
+    "$E11_REDIS_IMAGE" --save '' >/dev/null ||
+    die "could not start the scratch redis on 127.0.0.1:$E11_REDIS_PORT for the $arm arm - the relay has nowhere to publish its presence record, so every Exec in this arm would fail for a reason that has nothing to do with density"
+}
+
 E11_WORKER_PID=""
 E11_RELAY_PID=""
 E11_WORKER_BIN=""
@@ -519,8 +543,9 @@ start_container_stack() {
     log "container stack: SH_E11_START_STACK=0, reusing an already-running stack"
     return 0
   }
-  log "container: starting redis on :$E11_REDIS_PORT"
-  docker run --rm -d -p "${E11_REDIS_PORT}:6379" --name "sh-e11-redis-$$" redis:7 >/dev/null
+  # LOOPBACK ONLY -- see start_redis_loopback's own comment for why 0.0.0.0 is a
+  # host-takeover path on the documented rig.
+  start_redis_loopback container
 
   log "container: starting the relay on :$E11_RELAY_PORT"
   (
@@ -566,8 +591,7 @@ start_microvm_stack() {
     log "microvm stack: SH_E11_START_STACK=0, reusing an already-running stack"
     return 0
   }
-  log "microvm: starting redis on :$E11_REDIS_PORT"
-  docker run --rm -d -p "${E11_REDIS_PORT}:6379" --name "sh-e11-redis-$$" redis:7 >/dev/null
+  start_redis_loopback microvm
 
   log "microvm: starting the relay on :$E11_RELAY_PORT"
   (

@@ -538,6 +538,41 @@ check "the header states it is not invoked by any automated test" \
 check "source-only guard exists (E11_DENSITY_SOURCE_ONLY), matching e10's own pattern" \
   "$(grep -c 'E11_DENSITY_SOURCE_ONLY' "$SCRIPT")" "1"
 
+echo "== security: the scratch redis is published on loopback, never on all interfaces"
+# unbound_publishes prints every `docker run -p <host>:6379` publish in $1 whose host side
+# is not explicitly bound to 127.0.0.1. `-p "6381:6379"` binds 0.0.0.0, which on the
+# documented rig (an EC2 m8i.xlarge with a public interface, running microvm-worker as
+# root) publishes an unauthenticated redis to the internet -- a standard host-takeover
+# path via CONFIG SET dir + dbfilename.
+unbound_publishes() {
+  # Comment lines are stripped first (the same convention this file's VmRSS checks use):
+  # the fix's own comments quote the pre-fix `-p "${PORT}:6379"` line by name, and a
+  # whole-file grep would flag the explanation of the defect as the defect.
+  grep -v '^[[:space:]]*#' "$1" | grep -nE -- '-p +"?[^ "]+:6379' | grep -v '127\.0\.0\.1' || true
+}
+
+# Non-vacuousness FIRST: the detector must flag the exact pre-fix line. Without this, an
+# empty result below could mean "no publish is unbound" or "the regex matches nothing".
+pub_fixture="$(mktemp)"
+printf 'docker run --rm -d -p "${E11_REDIS_PORT}:6379" --name x redis:7 >/dev/null\n' >"$pub_fixture"
+check "non-vacuousness: the detector DOES flag the pre-fix 0.0.0.0 publish" \
+  "$([ -n "$(unbound_publishes "$pub_fixture")" ] && echo yes || echo no)" "yes"
+rm -f "$pub_fixture"
+
+check "no docker run publishes 6379 on all interfaces" \
+  "$([ -z "$(unbound_publishes "$SCRIPT")" ] && echo yes || echo no)" "yes"
+# The complement, so the check above cannot pass merely because the redis went away.
+check "the redis publish is explicitly bound to 127.0.0.1" \
+  "$([ "$(grep -c -- '-p "127.0.0.1:' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "both arms start redis through ONE helper (a second docker run cannot drift)" \
+  "$(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -c 'docker run')" "1"
+check "start_redis_loopback is called by both arms" \
+  "$(grep -c '^  start_redis_loopback ' "$SCRIPT")" "2"
+check "the redis image is overridable so an operator can pin a digest" \
+  "$(grep -c 'SH_E11_REDIS_IMAGE' "$SCRIPT")" "2"
+check "redis is started with RDB snapshots disabled (--save '')" \
+  "$([ "$(grep -c -- "--save ''" "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
 echo
 echo "Total failures: $fails"
 exit "$fails"
