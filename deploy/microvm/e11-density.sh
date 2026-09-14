@@ -122,7 +122,18 @@ set -uo pipefail
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-RESULTS="${RESULTS:-deploy/microvm/.results}"
+# ABSOLUTE, always, because two callers `cd` elsewhere before using it: both
+# `go build -o "$RESULTS/..."` calls run inside `(cd "$REMOTE_WORKER_DIR" && ...)`. With a
+# relative RESULTS they wrote the worker binaries to
+# remote-worker/deploy/microvm/.results/, a directory that does not exist, the build
+# failed, its exit status was unchecked, and the first symptom was a converge failure
+# naming neither the build nor the path. Found on E11's first-ever execution. The test
+# suite could not see it: it overrides RESULTS with an absolute /tmp path.
+#
+# A relative override is normalised rather than rejected, so `RESULTS=out ./e11-density.sh`
+# keeps working and means what it looks like.
+RESULTS="${RESULTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/deploy/microvm/.results}"
+case "$RESULTS" in /*) ;; *) RESULTS="$PWD/$RESULTS" ;; esac
 
 # Required, no default -- same reasoning e10-lifecycle.sh gives for SH_SUBSTRATE:
 # an explicit, operator-set label cannot silently mislabel a nested run as metal
@@ -175,6 +186,16 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 REMOTE_WORKER_DIR="$REPO_ROOT/remote-worker"
 EXPERIMENTS_DIR="$REPO_ROOT/experiments"
 PROTO_FILE="$REPO_ROOT/proto/sandbox/v1/sandbox.proto"
+# grpcurl REFUSES an absolute -proto path unless it is also given at least one
+# -import-path ("must specify at least one import path if any absolute file paths are
+# given"), and it fails at proto-parsing time — before it dials anything. So every RPC
+# this driver makes failed, in both arms, on any host: E11 could not measure a single
+# Exec. Found on its first-ever execution; it would have failed identically on metal.
+# The pair below is the form verified against the real grpcurl on the rig: import path at
+# the proto ROOT, file named relative to it. PROTO_FILE is kept for the existence check,
+# which is about the file being there rather than about how grpcurl is invoked.
+PROTO_IMPORT_PATH="$REPO_ROOT/proto"
+PROTO_REL_PATH="sandbox/v1/sandbox.proto"
 
 # Shared relay/redis stack knobs -- only ONE arm's stack is ever up at a time (each
 # arm is fully torn down before the next starts), so both arms reuse the same ports.
@@ -279,7 +300,31 @@ validate_repo_cache_shape() {
   esac
 }
 
+# require_tool refuses a MISSING external binary by name, in preflight, rather than
+# letting a rung "run" against a command that is not there -- the same guard, and the same
+# wording, e10-lifecycle.sh already carries. E11 had NO tool preflight at all, and that is
+# why its first-ever execution reported "converge FAILED after 35ms" three times over
+# instead of naming grpcurl, the worker build, or pnpm. A driver that cannot say which
+# tool is missing costs an operator a debugging session per missing tool.
+require_tool() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH: $2"
+}
+
 preflight() {
+  # Every one of these is a HARD requirement for at least one arm, and each was found the
+  # expensive way on the first execution. pnpm in particular is NOT optional: the container
+  # arm's relay is `pnpm --filter @sh/sandbox-relay start`, so without it that whole arm --
+  # the baseline the microvm arm is priced against -- cannot start.
+  require_tool grpcurl "both arms drive their Exec RPCs through grpcurl; without it every timing would measure a client-side error rather than a sandbox"
+  require_tool docker "both arms start their own scratch redis in a container; without it the relay has nowhere to publish its presence record"
+  require_tool go "both arms build their own worker binary from ./cmd/worker and ./cmd/microvm-worker"
+  require_tool pnpm "the container arm starts the real sandbox-relay via pnpm --filter @sh/sandbox-relay; without it the baseline arm cannot start at all"
+  # The proto must be PRESENT as a file, separately from how grpcurl is told to find it
+  # (PROTO_IMPORT_PATH/PROTO_REL_PATH): a missing proto is otherwise indistinguishable from
+  # a malformed grpcurl invocation, and both present as an unencodable Exec. e10 carries the
+  # same check for the same reason.
+  [ -f "$PROTO_FILE" ] ||
+    die "the sandbox proto is missing at $PROTO_FILE - grpcurl cannot encode an Exec request without it, so every rung would time a client-side error"
   check_kvm
   check_cgroups
   check_swap
@@ -533,7 +578,7 @@ grpc_exec_record() {
   local t0 t1 ms err_log cause status
   err_log="$(mktemp "$E11_TMPDIR/errlog.XXXXXX")"
   t0="$(date +%s%N)"
-  if grpcurl -plaintext -proto "$PROTO_FILE" \
+  if grpcurl -plaintext -import-path "$PROTO_IMPORT_PATH" -proto "$PROTO_REL_PATH" \
     -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":$req_id,\"command\":$(json_escape "$cmd"),\"timeout_s\":30,\"workspace_key\":$(json_escape "$workspace_key")}}" \
     "localhost:${relay_port}" sandbox.v1.SandboxExec/Exec >/dev/null 2>"$err_log"; then
     status="ok"
@@ -594,7 +639,7 @@ converge_slot() {
   local script t0 t1 rc=0
   script="$(build_converge_script "$CONVERGE_REPO_URL" "$CONVERGE_REF" "$run_id")"
   t0="$(date +%s%N)"
-  grpcurl -plaintext -proto "$PROTO_FILE" \
+  grpcurl -plaintext -import-path "$PROTO_IMPORT_PATH" -proto "$PROTO_REL_PATH" \
     -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":0,\"command\":$(json_escape "$script"),\"timeout_s\":300,\"workspace_key\":$(json_escape "$workspace_key")}}" \
     "localhost:${relay_port}" sandbox.v1.SandboxExec/Exec >/dev/null 2>>"$RESULTS/e11-converge.log" || rc=$?
   t1="$(date +%s%N)"
@@ -616,6 +661,28 @@ drop_caches() {
 # shuffle_e11_arms prints "container" and "microvm" in randomized order (spec
 # section 7.5: page-cache asymmetry between arms), same technique as
 # e10-lifecycle.sh's shuffle_arms.
+# wait_for_relay_port blocks until something is LISTENING on a loopback port, and dies
+# naming the log if it never happens. Both drivers previously did `sleep 2` and hoped.
+#
+# Found on E11's first execution: the relay crashed at startup (a missing package -- the
+# pi-fork submodule was not built), nothing was listening, the worker retried a refused
+# connection five times, and the first thing the operator saw was a converge TIMEOUT ten
+# seconds later. The cause was sitting in the relay log, which nothing pointed at. A stack
+# that did not come up must fail where it failed, not as a latency measurement downstream.
+wait_for_relay_port() {
+  local port="$1" logfile="$2" what="$3" deadline=$((SECONDS + 30))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "----- last 20 lines of $logfile -----" >&2
+  tail -n 20 "$logfile" >&2 2>/dev/null || echo "(no log at $logfile)" >&2
+  echo "-------------------------------------" >&2
+  die "$what never started listening on 127.0.0.1:$port within 30s - its log is above and in $logfile. Every Exec after this point would have measured a client-side dial failure, not a sandbox."
+}
+
 shuffle_e11_arms() {
   printf 'container\nmicrovm\n' | awk -v seed="$(($$ + $(date +%s)))" 'BEGIN{srand(seed)} {print rand()"\t"$0}' | sort -n | cut -f2-
 }
@@ -656,10 +723,12 @@ start_container_stack() {
     echo $! >"$RESULTS/.e11-relay.pid"
   )
   E11_RELAY_PID="$(cat "$RESULTS/.e11-relay.pid" 2>/dev/null || echo "")"
+  wait_for_relay_port "$E11_RELAY_PORT" "$RESULTS/e11-container-relay.log" "the container arm's sandbox-relay"
 
   E11_WORKER_BIN="$RESULTS/.e11-container-worker-bin"
   log "container: building the worker binary"
-  (cd "$REMOTE_WORKER_DIR" && go build -o "$E11_WORKER_BIN" ./cmd/worker)
+  (cd "$REMOTE_WORKER_DIR" && go build -o "$E11_WORKER_BIN" ./cmd/worker) ||
+    die "go build ./cmd/worker failed - the container arm has nothing to drive, so every Exec would time a missing binary rather than a container baseline"
 
   log "container: starting the worker"
   SANDBOX_ID="e11-container" RELAY_ADDR="localhost:${E11_RELAY_PORT}" \
@@ -704,10 +773,12 @@ start_microvm_stack() {
     echo $! >"$RESULTS/.e11-relay.pid"
   )
   E11_RELAY_PID="$(cat "$RESULTS/.e11-relay.pid" 2>/dev/null || echo "")"
+  wait_for_relay_port "$E11_RELAY_PORT" "$RESULTS/e11-microvm-relay-d${d}-ram${ram_mb}.log" "the microvm arm's sandbox-relay"
 
   E11_WORKER_BIN="$RESULTS/.e11-microvm-worker-bin"
   log "microvm: building the worker binary"
-  (cd "$REMOTE_WORKER_DIR" && go build -o "$E11_WORKER_BIN" ./cmd/microvm-worker)
+  (cd "$REMOTE_WORKER_DIR" && go build -o "$E11_WORKER_BIN" ./cmd/microvm-worker) ||
+    die "go build ./cmd/microvm-worker failed - the microvm arm has nothing to drive, so every Exec would time a missing binary rather than a density ceiling"
 
   log "microvm: starting the worker (D=$d guest=${ram_mb}MiB)"
   SH_VMM=firecracker SH_STANDBY_DEPTH="$d" SH_GUEST_RAM_MB="$ram_mb" \

@@ -59,7 +59,33 @@ against an absent `grpcurl` is a timing of `grpcurl` failing to launch.
 | `go`          | E10 rungs 2–4 (builds `vmpoolctl`), E11 (2 workers) | install it; both drivers build their own binaries                     |
 | `grpcurl`     | **E10 rung 1**, **all of E11**                      | E10: `SH_E10_RUNGS='2 3 4'` to skip rung 1. E11 cannot run at all     |
 | `docker`      | **E10 rung 1**, **all of E11** (Redis)              | as above, or `SH_E10_START_STACK=0` to reuse an already-running stack |
-| `pnpm`        | **E10 rung 1** (starts the real sandbox-relay)      | `SH_E10_RUNGS='2 3 4'`, or `SH_E10_START_STACK=0`                     |
+| `pnpm`        | **E10 rung 1**, **all of E11**                      | `SH_E10_RUNGS='2 3 4'`; E11 cannot run at all                         |
+
+### The relay stack: a workspace install and a BUILT pi-fork
+
+Any rung that goes through the relay — E10 rung 1 and **both** of E11's arms — starts it with
+`pnpm --filter @sh/sandbox-relay start`. That pulls in `harness/src/run-turn.ts`, which
+imports `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai`. Both are
+`link:../pi-fork/...` dependencies on the **pi-fork submodule**, so the relay cannot start
+until that submodule is present AND built:
+
+```bash
+git submodule update --init --recursive
+cd pi-fork && npm ci && npm run build && cd ..
+pnpm install
+```
+
+This is the same setup CLAUDE.md prescribes for the repo generally; it is repeated here
+because a missing pi-fork build presents only as the relay dying at startup, taking every
+downstream Exec with it. The drivers now fail at that point, naming the relay's log and
+printing its last 20 lines, rather than letting it surface ten seconds later as a converge
+timeout — but you still have to build it.
+
+Worth verifying before §4, since it costs nothing:
+
+```bash
+pnpm --filter @sh/sandbox-relay exec node -e 'console.log("relay deps resolve")'
+```
 
 If you skip rung 1 you lose the container baseline, and with it **sealed prediction 2**
 (warm hot path within 2x of the container baseline) — that prediction is a ratio against

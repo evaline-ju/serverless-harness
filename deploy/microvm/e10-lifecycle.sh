@@ -87,7 +87,16 @@ set -uo pipefail
 # full-size run (the script needs to work well at small ITERS/WARMUP for a short
 # validation pass, not only at the full 200x20).
 # ---------------------------------------------------------------------------
-RESULTS="${RESULTS:-deploy/microvm/.results}"
+# ABSOLUTE, always. rung 1's worker build runs inside `(cd "$REMOTE_WORKER_DIR" && go build
+# -o "$RUNG1_WORKER_BIN" ...)`, and RUNG1_WORKER_BIN is under RESULTS — so a relative
+# RESULTS wrote it to remote-worker/deploy/microvm/.results/, which does not exist. $VMPOOLCTL
+# escaped this only because it is built absolute (see its own definition below), which is
+# exactly why rungs 2-4 work and rung 1, never executed, does not. Found on E11's first run,
+# where the same construct appears twice; fixed in both drivers rather than in the one that
+# happened to be under the microscope. The test suite overrides RESULTS with an absolute
+# /tmp path, so it could not have caught this.
+RESULTS="${RESULTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/deploy/microvm/.results}"
+case "$RESULTS" in /*) ;; *) RESULTS="$PWD/$RESULTS" ;; esac
 ITERS="${ITERS:-200}"
 WARMUP="${WARMUP:-20}"
 GOVERNOR_PATH="${GOVERNOR_PATH:-/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor}"
@@ -182,6 +191,28 @@ trap cleanup_on_exit EXIT
 # a rung "run" against a command that is not there. Without this, a missing grpcurl still
 # produced a full set of rung-1 timings -- of grpcurl failing to launch -- and a container
 # baseline assembled from those is a fabricated number, not a measurement.
+# wait_for_relay_port blocks until something is LISTENING on a loopback port, and dies
+# naming the log if it never happens. Both drivers previously did `sleep 2` and hoped.
+#
+# Found on E11's first execution: the relay crashed at startup (a missing package -- the
+# pi-fork submodule was not built), nothing was listening, the worker retried a refused
+# connection five times, and the first thing the operator saw was a converge TIMEOUT ten
+# seconds later. The cause was sitting in the relay log, which nothing pointed at. A stack
+# that did not come up must fail where it failed, not as a latency measurement downstream.
+wait_for_relay_port() {
+  local port="$1" logfile="$2" what="$3" deadline=$((SECONDS + 30))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "----- last 20 lines of $logfile -----" >&2
+  tail -n 20 "$logfile" >&2 2>/dev/null || echo "(no log at $logfile)" >&2
+  echo "-------------------------------------" >&2
+  die "$what never started listening on 127.0.0.1:$port within 30s - its log is above and in $logfile. Every Exec after this point would have measured a client-side dial failure, not a sandbox."
+}
+
 require_tool() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH: $2"
 }
@@ -332,13 +363,15 @@ start_rung1_stack() {
     echo $! >"$RESULTS/.rung1-relay.pid"
   )
   RUNG1_RELAY_PID="$(cat "$RESULTS/.rung1-relay.pid" 2>/dev/null || echo "")"
+  wait_for_relay_port "$RUNG1_RELAY_PORT" "$RESULTS/e10-rung1-relay.log" "rung 1's sandbox-relay"
 
   # A binary is built and spawned directly rather than `go run`'d - `go run` forks a
   # child SIGKILL cannot reliably reach through the wrapper, which matters for clean
   # teardown here the same way it does in packages/k8s-sandbox/test/live-relay.test.ts.
   RUNG1_WORKER_BIN="$RESULTS/.rung1-worker-bin"
   log "rung1: building the worker binary"
-  (cd "$REMOTE_WORKER_DIR" && go build -o "$RUNG1_WORKER_BIN" ./cmd/worker)
+  (cd "$REMOTE_WORKER_DIR" && go build -o "$RUNG1_WORKER_BIN" ./cmd/worker) ||
+    die "go build ./cmd/worker failed - rung 1 is the baseline every microVM number is priced against, and a rung 1 assembled from a missing binary would time a shell error"
 
   log "rung1: starting the worker"
   SANDBOX_ID="$RUNG1_SANDBOX_ID" RELAY_ADDR="localhost:${RUNG1_RELAY_PORT}" \
@@ -377,7 +410,7 @@ json_escape() {
 grpc_exec_ms() {
   local cmd="$1" req_id="$2" t0 t1 rc=0
   t0="$(date +%s%N)"
-  grpcurl -plaintext -proto "$PROTO_FILE" \
+  grpcurl -plaintext -import-path "$PROTO_IMPORT_PATH" -proto "$PROTO_REL_PATH" \
     -d "{\"sandbox_id\":\"$RUNG1_SANDBOX_ID\",\"exec\":{\"req_id\":$req_id,\"command\":$(json_escape "$cmd"),\"timeout_s\":30}}" \
     "localhost:${RUNG1_RELAY_PORT}" sandbox.v1.SandboxExec/Exec >/dev/null 2>>"$RESULTS/e10-rung1-grpcurl.log" || rc=$?
   t1="$(date +%s%N)"
