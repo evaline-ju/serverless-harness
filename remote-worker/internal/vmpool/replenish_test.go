@@ -112,7 +112,11 @@ func TestConcurrentColdAcquiresShareOneWarming(t *testing.T) {
 	}
 	// Let the second goroutine reach the wait before releasing the first.
 	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return restores == 1 })
-	waitFor(t, func() bool { return p.Stats().InFlight >= 1 })
+	// A cold acquire in the middle of its restore is charged as WARMING, not as
+	// inFlight — inFlight is incremented only once the VM exists, so that one VM is not
+	// charged to the budget twice (see acquire). CommittedBytes covers both, so it is
+	// what this wait can observe; the assertion below is unchanged.
+	waitFor(t, func() bool { return p.Stats().CommittedBytes > 0 })
 	close(gate)
 	wg.Wait()
 	for i, err := range errs {

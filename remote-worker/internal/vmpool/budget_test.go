@@ -176,6 +176,59 @@ func mustFail(t *testing.T, p Pool, key string) error {
 	return err
 }
 
+// TestAColdAcquireIsChargedOnceNotTwice pins the accounting during the restore itself.
+// committedLocked sums ready + inFlight + warming, and the cold path used to increment
+// both warming AND inFlight for one VM, so every in-flight cold acquire was charged twice
+// for exactly the duration of the restore. The existing tests only sampled CommittedBytes
+// after a warm had completed, which is why nothing caught it.
+//
+// The equality — one VM's worth, not zero and not two — is the assertion: a "fix" that
+// dropped the charge instead of de-duplicating it would over-commit the host, which is
+// the dangerous direction rather than the pessimistic one.
+func TestAColdAcquireIsChargedOnceNotTwice(t *testing.T) {
+	const perVM = int64(288 << 20) // guest 256 MiB + overhead 32 MiB, as budgetPool sets them
+	p, lc, _ := budgetPool(t, 2, 100)
+
+	restoring := make(chan string, 4)
+	release := make(chan struct{})
+	lc.setBeforeRestore(func(r RestoreRequest) {
+		restoring <- r.Key
+		<-release
+	})
+	defer close(release)
+
+	go func() { _, _ = p.Exec(context.Background(), "run-a", Exec{Command: "true"}, &capturingSink{}) }()
+	<-restoring
+	if got := p.Stats().CommittedBytes; got != perVM {
+		t.Fatalf("CommittedBytes = %d during one cold acquire, want %d (exactly one VM)", got, perVM)
+	}
+
+	// The behavioural consequence, which is what shows up in E11: with a two-VM budget,
+	// a second run's cold acquire must be admitted while the first is still restoring.
+	// Double-charged, the first acquire filled the budget by itself and this was refused
+	// RefuseMemoryBudget at half the intended concurrency.
+	second := make(chan error, 1)
+	go func() {
+		_, err := p.Exec(context.Background(), "run-b", Exec{Command: "true"}, &capturingSink{})
+		second <- err
+	}()
+	select {
+	case <-restoring:
+	case err := <-second:
+		t.Fatalf("the second cold acquire never reached Restore: %v — a two-VM budget must admit two concurrent cold acquires", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second cold acquire neither reached Restore nor returned")
+	}
+	if got := p.Stats().CommittedBytes; got != 2*perVM {
+		t.Fatalf("CommittedBytes = %d with two cold acquires in flight, want %d", got, 2*perVM)
+	}
+
+	// And the ceiling still binds: a third run against a two-VM budget is refused.
+	if got := ReasonOf(mustFail(t, p, "run-c")); got != RefuseMemoryBudget {
+		t.Fatalf("third cold acquire: reason = %q, want %q — de-duplicating the charge must not remove the ceiling", got, RefuseMemoryBudget)
+	}
+}
+
 func TestStatsCommittedBytesTracksVMsInFlight(t *testing.T) {
 	p, lc, _ := budgetPool(t, 10, 10)
 	if got := p.Stats().CommittedBytes; got != 0 {

@@ -381,8 +381,17 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, *runPool, ColdCause
 			p.mu.Unlock()
 			return nil, nil, "", p.countRefusal(err)
 		}
+		// ONE charge for one VM. This used to increment inFlight here as well, and
+		// committedLocked sums ready + inFlight + warming — so every in-flight cold
+		// acquire was charged twice for exactly the duration of the restore, which is
+		// when it matters. At a budget of 8 VMs and 4 concurrent cold acquires,
+		// committed read as 8 VMs' worth while 4 existed and the 5th run was refused
+		// RefuseMemoryBudget at half the intended concurrency — spec §6's named
+		// cold-acquire-storm scenario, and an E11 density ceiling the tier does not
+		// actually have. It errs safe (over-refusal, not over-commit), which is why it
+		// was a suggestion rather than a must-fix, but a ceiling that reads low is still
+		// a measurement of the wrong thing.
 		rp.warming++
-		rp.inFlight++
 		dir, id := rp.dir, p.nextIDLocked()
 		p.mu.Unlock()
 
@@ -392,7 +401,6 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, *runPool, ColdCause
 		rp.warming--
 		rp.signalSettledLocked()
 		if err != nil {
-			rp.inFlight--
 			rp.backoff = nextBackoff(rp.backoff)
 			p.mu.Unlock()
 			if ctx.Err() != nil {
@@ -405,6 +413,15 @@ func (p *pool) acquire(ctx context.Context, key string) (VM, *runPool, ColdCause
 			}
 			return nil, nil, "", p.refuse(RefuseSpawn, "restore for %q: %v", key, err)
 		}
+		// The charge moves from warming to inFlight inside ONE critical section, so the
+		// VM is charged exactly once at every instant a reader of committedLocked could
+		// observe, and busy() never reads false in between — a gap there would let a
+		// sweep reclaim the workspace of a VM that is about to run in it.
+		// The charge moves from warming to inFlight inside ONE critical section, so the
+		// VM is charged exactly once at every instant a reader of committedLocked could
+		// observe, and busy() never reads false in between — a gap there would let a
+		// sweep reclaim the workspace of a VM that is about to run in it.
+		rp.inFlight++
 		rp.backoff = 0
 		p.mu.Unlock()
 		return vm, rp, cause, nil
