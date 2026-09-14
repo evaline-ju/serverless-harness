@@ -17,15 +17,32 @@ package vmpool
 // and violating it refuses work the harness believed it had capacity for, which is
 // P6 §3.9's spurious-429s-truncate-the-rungs failure one tier down.
 //
+// PARKED RUNS DO NOT COUNT, and that is what makes the condition above true rather
+// than aspirational. It used to count len(p.runs), which includes the parked entries
+// the sweep deliberately keeps for WorkspaceIdle (30 minutes by default) — and a
+// parked run holds ZERO VMs by construction, since sweepOnce only sets parked once
+// len(rp.ready) has reached zero on a run that is not busy. With the shipped
+// SH_MAX_RUNS=64, 64 short-lived sandboxes finishing inside a minute left 64
+// zero-VM parked entries, and the 65th lease the harness legitimately granted was
+// refused RefuseMaxRuns for the next ~29 minutes while nothing was resident. During
+// E11 that would read as back-pressure from the tier rather than as the bug it is.
+// Pool.Reclaim is the only thing that releases a key early and it has no production
+// caller, so nothing else was going to shorten that window.
+//
+// What still bounds the parked set is WorkspaceIdle, and what it costs is disk rather
+// than RAM (spec §4.4's whole reason for two thresholds). What bounds VMs is the
+// memory gate below, which counts every VM a parked run does not have.
+//
 // The memory gate exists so spec §7.4's prediction 1 ("replenishment binds on
 // process/memory count before CPU") is observable AS BACK-PRESSURE. Without it the
 // prediction would be "confirmed" by the host falling over, which is not a
 // measurement.
 func (p *pool) admitLocked(newRun bool) error {
-	if newRun && len(p.runs) >= p.cfg.MaxRuns {
+	if unparked := p.unparkedRunsLocked(); newRun && unparked >= p.cfg.MaxRuns {
 		return refusal(RefuseMaxRuns,
-			"MaxRuns=%d reached with %d active runs; the lease cap one tier up is primary "+
-				"admission control and this is its backstop (spec §6)", p.cfg.MaxRuns, len(p.runs))
+			"MaxRuns=%d reached with %d unparked runs (%d entries incl. parked); the lease cap "+
+				"one tier up is primary admission control and this is its backstop (spec §6)",
+			p.cfg.MaxRuns, unparked, len(p.runs))
 	}
 	committed := p.committedLocked()
 	budget := p.cfg.MaxCommittedBytes - p.cfg.MemoryReserveBytes
@@ -36,6 +53,23 @@ func (p *pool) admitLocked(newRun bool) error {
 			p.perVMBytes(), next, budget, p.cfg.MaxCommittedBytes, p.cfg.MemoryReserveBytes)
 	}
 	return nil
+}
+
+// unparkedRunsLocked counts the runs MaxRuns is about: those not sitting in RunParked
+// with zero VMs. Caller holds p.mu.
+//
+// Deliberately NOT the same quantity as Stats().ActiveRuns, which counts every map entry
+// and reports the parked subset separately — Stats describes what the host is holding
+// (including workspaces on disk), while this describes what the ceiling is for. The
+// relationship is ActiveRuns - ParkedRuns == this.
+func (p *pool) unparkedRunsLocked() int {
+	n := 0
+	for _, rp := range p.runs {
+		if !rp.parked {
+			n++
+		}
+	}
+	return n
 }
 
 // committedLocked is every VM this host is holding, in bytes. Caller holds p.mu.

@@ -3,6 +3,7 @@ package vmpool
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // budgetPool builds a pool whose memory budget admits exactly `vms` VMs, so a test
@@ -61,6 +62,39 @@ func TestMaxRunsRefusesOnlyNewRuns(t *testing.T) {
 	}
 	if n := lc.createdCount(); n != 3 {
 		t.Fatalf("created %d VMs, want 3 — the refused run must create none", n)
+	}
+}
+
+// TestMaxRunsDoesNotCountParkedRuns is the documented sufficient condition
+// (MaxRuns >= cap x records) actually holding. A parked run holds zero VMs — sweepOnce
+// only parks a run whose standbys have all gone — so counting parked entries meant a
+// worker at SH_MAX_RUNS=64 refused the 65th legitimate lease for ~29 minutes while
+// nothing at all was resident.
+//
+// The refusal is asserted FIRST, with both runs still holding standbys: an assertion
+// that a third run is admitted proves nothing unless the ceiling it is escaping can be
+// shown to bite.
+func TestMaxRunsDoesNotCountParkedRuns(t *testing.T) {
+	p, _, clk := budgetPool(t, 100, 2)
+	primed(t, p, clk, "run-a")
+	primed(t, p, clk, "run-b")
+	if got := ReasonOf(mustFail(t, p, "run-c")); got != RefuseMaxRuns {
+		t.Fatalf("a third run while two hold standbys: reason = %q, want %q", got, RefuseMaxRuns)
+	}
+
+	// Past StandbyIdle both runs are RunParked: workspace on disk, zero VMs, zero bytes
+	// committed. The ceiling is a VM/RAM backstop, so it must not bind on these.
+	clk.Advance(DefaultStandbyIdle + DefaultStandbyIdle/4 + time.Second)
+	waitFor(t, func() bool {
+		s := p.Stats()
+		return s.ParkedRuns == 2 && s.StandbysResident == 0
+	})
+	if got := p.Stats().CommittedBytes; got != 0 {
+		t.Fatalf("CommittedBytes = %d with both runs parked, want 0 — the premise of this test is that nothing is resident", got)
+	}
+
+	if _, err := p.Exec(context.Background(), "run-c", Exec{Command: "true"}, &capturingSink{}); err != nil {
+		t.Fatalf("Exec for a third key while the other two are parked: %v — a zero-VM parked run must not consume the MaxRuns backstop", err)
 	}
 }
 
