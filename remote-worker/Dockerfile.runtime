@@ -2,9 +2,57 @@
 # (produced by build-image.sh). No Go toolchain or module fetch happens here, so
 # the in-cluster OpenShift build needs no egress to module proxies.
 #
+# It DOES now need egress to github.com, for the pinned ripgrep tarball the `rg` stage below
+# fetches. That is a new requirement on the in-cluster build path and would fail in a disconnected
+# cluster; the alternative was leaving the agent's Grep and Find tools broken in every sandbox built
+# from this file. If a disconnected build is ever needed, have build-image.sh place `rg` in dist/
+# alongside the worker binary and COPY it, the way the binary itself already arrives.
+#
 # The base must provide bash + coreutils: the worker runs `bash -c <command>` and
 # the harness's ops call base64 and file (spec §3.3).
 #
+# ripgrep is vendored because it is the IMPLEMENTATION of two registered tools, not a scheduling
+# label. The Find/Glob tool runs `rg --files --hidden` (k8s-sandbox operations.ts:170) and the Grep
+# tool runs `rg` directly (grep-tool.ts), and both land in THIS container whenever a leased gRPC
+# presence record supplies a relay transport: extension.ts:47-49 overrides the fast AND the stream
+# transport, so every pod operation runs over the relay. Without `rg` on PATH the model's Glob
+# returns "glob failed in pod (rg exited 127)" and its Grep "rg failed in pod (exit 127)" -- the
+# same attached-and-healthy-yet-every-tool-fails signature as the /workspace bug below. Both other
+# sandbox images in the repo install it (sandbox.Dockerfile, k8s-sandbox/deploy/sandbox.yaml).
+#
+# It is genuinely not in the UBI 9 repositories (verified: `microdnf install ripgrep` -> "No package
+# matches"), and EPEL would add a third-party repository to an image that executes model-authored
+# commands. So: the upstream static musl build, pinned by version and checked against the sha256 the
+# release publishes. Static, so it needs no libc from this base. Fetched in its own stage, so the
+# tar/gzip needed to unpack it never reach the runtime image.
+#
+# To bump: change RG_VERSION and BOTH digests together. The digests are per-arch and `sha256sum -c`
+# fails the build closed if either is wrong. Arch comes from `uname -m` rather than TARGETARCH
+# because buildah / `oc new-build --strategy=docker` do not populate BuildKit's automatic args.
+# hadolint ignore=DL3007
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS rg
+ARG RG_VERSION=15.2.0
+ARG RG_SHA256_X86_64=33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
+ARG RG_SHA256_AARCH64=800b1e7206afe799dfb5a6901f23147cfaabe0e52210538100f61e86e1740915
+# hadolint ignore=DL3041
+RUN microdnf install -y --nodocs tar gzip \
+    && microdnf clean all
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64)  target=x86_64-unknown-linux-musl;  sha="$RG_SHA256_X86_64" ;; \
+      aarch64) target=aarch64-unknown-linux-musl; sha="$RG_SHA256_AARCH64" ;; \
+      *) echo "no pinned ripgrep build for $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    tarball="ripgrep-${RG_VERSION}-${target}.tar.gz"; \
+    curl -fsSL -o "/tmp/${tarball}" \
+      "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${tarball}"; \
+    printf '%s  %s\n' "${sha}" "/tmp/${tarball}" > /tmp/rg.sha256; \
+    sha256sum -c /tmp/rg.sha256; \
+    tar -xzf "/tmp/${tarball}" -C /tmp; \
+    install -m 755 "/tmp/ripgrep-${RG_VERSION}-${target}/rg" /usr/local/bin/rg; \
+    rm -rf "/tmp/${tarball}" /tmp/rg.sha256 "/tmp/ripgrep-${RG_VERSION}-${target}"; \
+    /usr/local/bin/rg --version
+
 # This is a standalone demo image that tracks the current UBI 9 minor; a pinned
 # digest would go stale silently, and microdnf package pinning breaks on minor
 # bumps for the same reason .hadolint.yaml already ignores DL3018 for Alpine.
@@ -12,15 +60,18 @@
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
 # git and python3: see the same block in ./Dockerfile. cmd/worker/main.go's `probed` list advertises
 # them as this worker's capabilities and they were not present, and a sandbox without git cannot run
-# a tool call resembling the workloads spec §2.3's duty bases were measured from. `rg` remains absent
-# (not in the UBI 9 repositories) — a known gap, not a silent one.
+# a tool call resembling the workloads spec §2.3's duty bases were measured from. With `rg` from the
+# stage above, all six probed tools now resolve; dockerfile_parity_test.go fails if that regresses.
 # hadolint ignore=DL3041
 RUN microdnf install -y --nodocs bash coreutils-single findutils file git python3 \
     && microdnf clean all
 COPY remote-worker /usr/local/bin/remote-worker
+COPY --from=rg /usr/local/bin/rg /usr/local/bin/rg
 # See the same block in ./Dockerfile: the harness execs tool calls from /workspace (the default
 # KAGENTI_SANDBOX_CWD), and without it every exec dies on `cd` before running the command, which
-# surfaces as a tool error from a sandbox that is attached and healthy.
-RUN mkdir -p /workspace && chown 1001:0 /workspace && chmod 775 /workspace
+# surfaces as a tool error from a sandbox that is attached and healthy. WORKDIR for the same reason
+# as there -- so a bare command, or an operator's `podman exec`, does not land in /.
+RUN install -d -o 1001 -g 0 -m 775 /workspace
+WORKDIR /workspace
 USER 1001
 ENTRYPOINT ["/usr/local/bin/remote-worker"]
