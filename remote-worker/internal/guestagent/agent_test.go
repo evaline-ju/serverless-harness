@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -269,6 +270,195 @@ func TestAgentCapsEachStreamAtSourceAndReportsDropped(t *testing.T) {
 	// agent rather than with `head -c` in the pipeline is what preserves it.
 	if end.ExitCode != 0 {
 		t.Fatalf("ExitCode = %d, want 0", end.ExitCode)
+	}
+}
+
+// serialisingConn is a ReadWriteCloser that hands ServeConn a canned request and then
+// watches HOW the replies are written rather than what they say. It exists because the
+// bug it pins is not visible in the frames' content: two goroutines writing the same
+// connection produce a correct-looking sequence right up to the moment a header lands
+// inside another frame's payload.
+//
+// It records two things, both properties of the production code rather than of this
+// test's timing: whether two Writes were ever in flight at once, and whether any
+// stdout/stderr frame was written after the terminal frame. Frames are identified by
+// their 5-byte header's kind byte (WriteFrame writes header then payload), which is
+// unambiguous here because this test's payloads are runs of 'x' and "ok\n".
+//
+// Every Write sleeps, which is what makes the window wide enough to observe instead of
+// something that shows up once in a thousand runs on a loaded machine.
+type serialisingConn struct {
+	r     io.Reader
+	delay time.Duration
+
+	mu                         sync.Mutex
+	inflight                   int
+	maxInflight                int
+	terminalKind               Kind
+	streamFramesBeforeTerminal int
+	streamFramesAfterTerminal  int
+}
+
+func (c *serialisingConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+func (c *serialisingConn) Close() error { return nil }
+
+func (c *serialisingConn) Write(p []byte) (int, error) {
+	header := len(p) == 5
+	streamHeader := header && (p[0] == byte(KindStdout) || p[0] == byte(KindStderr))
+	terminalHeader := header && (p[0] == byte(KindEnd) || p[0] == byte(KindError))
+
+	c.mu.Lock()
+	c.inflight++
+	if c.inflight > c.maxInflight {
+		c.maxInflight = c.inflight
+	}
+	if streamHeader {
+		if c.terminalKind == 0 {
+			c.streamFramesBeforeTerminal++
+		} else {
+			c.streamFramesAfterTerminal++
+		}
+	}
+	if terminalHeader {
+		c.terminalKind = Kind(p[0])
+	}
+	c.mu.Unlock()
+
+	time.Sleep(c.delay)
+
+	c.mu.Lock()
+	c.inflight--
+	c.mu.Unlock()
+	return len(p), nil
+}
+
+// TestServeConnSerialisesTheTerminalFrameAgainstALiveWriter pins the terminal frame
+// against a writer that is still running when it goes out — the review's finding that
+// KindEnd/KindError were written straight to the connection, past frameWriter's mutex,
+// while drain goroutines were still emitting through it.
+//
+// The arrangement is STRUCTURAL, not a timing coincidence, which matters: an earlier
+// version of this test flooded stderr and relied on runOnParkedShell's 1s fallthrough
+// firing while the stderr drain was behind. It passed in 1.07s — the fallthrough had
+// never fired at all. A pipe holds at most its capacity, so the parked shell's stderr
+// sentinel can only ever lag the flood by ~64 KiB and always arrives within a few drain
+// cycles; that path cannot be made deterministic from the outside. The fix covers it
+// (the seal is on the shared exit, and emit's own check is what makes an unjoinable
+// drain harmless), but this test earns its keep on a path that is reproducible every
+// run.
+//
+// That path is the timeout, which reaches the SAME site (ServeConn's `if err != nil`).
+// A stdin command runs on a fresh child, so its output flows through os/exec's copy
+// goroutine into the same frameWriter. On timeout runFreshChild kills the child only —
+// not its process group — so a backgrounded grandchild keeps the stdout pipe open, the
+// copy goroutine never sees EOF, cmd.Wait never returns (no WaitDelay is set) and the
+// pipes are never closed. The writer is therefore guaranteed live, for seconds, while
+// the terminal frame is written.
+//
+// Liveness is asserted, not assumed: the grandchild also appends to a file, so the test
+// can prove the writer was still producing output during the window in which no frames
+// were written. Without that, "zero frames after the terminal frame" would be
+// indistinguishable from "the writer had already finished".
+func TestServeConnSerialisesTheTerminalFrameAgainstALiveWriter(t *testing.T) {
+	a := newTestAgent(t)
+	liveFile := filepath.Join(a.WorkDir(), "live.txt")
+
+	var in bytes.Buffer
+	if err := WriteJSON(&in, KindRequest, Request{
+		// 200 iterations x 50ms bounds the grandchild at ~10s so the test leaks nothing
+		// long-lived; `sleep 30` in the foreground is what the 1s timeout interrupts.
+		Command:  "{ for i in $(seq 1 200); do printf 'spam-%s\\n' \"$i\"; printf 'x' >> live.txt; sleep 0.05; done; } & sleep 30",
+		HasStdin: true,
+		TimeoutS: 1,
+		CapBytes: 16 << 20,
+	}); err != nil {
+		t.Fatalf("encode request: %v", err)
+	}
+	if err := WriteFrame(&in, KindStdin, []byte("unused\n")); err != nil {
+		t.Fatalf("encode stdin: %v", err)
+	}
+	if err := WriteFrame(&in, KindStdinEOF, nil); err != nil {
+		t.Fatalf("encode stdin EOF: %v", err)
+	}
+
+	conn := &serialisingConn{r: bytes.NewReader(in.Bytes()), delay: 20 * time.Millisecond}
+	done := make(chan error, 1)
+	go func() { done <- a.ServeConn(conn) }()
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("ServeConn did not return within 60s")
+	}
+
+	sizeAtTerminal := fileSize(liveFile)
+	// Long enough for ~20 more grandchild iterations. Without the seal, each one is a
+	// frame written onto a connection whose terminal frame has already gone out.
+	time.Sleep(time.Second)
+	sizeAfter := fileSize(liveFile)
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if conn.terminalKind != KindError {
+		t.Fatalf("terminal frame kind = %#x, want KindError (%#x) from the timeout path",
+			byte(conn.terminalKind), byte(KindError))
+	}
+	if conn.streamFramesBeforeTerminal == 0 {
+		t.Fatal("no stdout frames before the terminal frame: the grandchild never produced output, " +
+			"so this test is not exercising a concurrent writer at all")
+	}
+	if sizeAfter <= sizeAtTerminal {
+		t.Fatalf("live.txt did not grow after the terminal frame (%d -> %d bytes): the writer had already "+
+			"stopped, so a zero count below would prove nothing", sizeAtTerminal, sizeAfter)
+	}
+	if conn.streamFramesAfterTerminal != 0 {
+		t.Fatalf("%d stdout/stderr frames were written AFTER the terminal frame: the host reads that as a "+
+			"spliced or trailing frame and reports a hard worker failure", conn.streamFramesAfterTerminal)
+	}
+	if conn.maxInflight != 1 {
+		t.Fatalf("%d writes were in flight at once: every write to the connection must hold frameWriter's "+
+			"one mutex, or a header lands inside another frame's payload", conn.maxInflight)
+	}
+}
+
+func fileSize(path string) int64 {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return -1
+	}
+	return fi.Size()
+}
+
+// TestFrameWriterSealsBothTerminalKinds locks the seal itself, for the End frame as well
+// as the Error frame: after either terminal write, a stream frame is COUNTED as dropped
+// and not written. The test above can only reach the Error path deterministically (see
+// its comment), and the success path is the common one in production.
+func TestFrameWriterSealsBothTerminalKinds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seal func(*frameWriter) error
+	}{
+		{"End", func(w *frameWriter) error { return w.sealAndWriteEnd(End{ExitCode: 3}) }},
+		{"Error", func(w *frameWriter) error { return w.sealAndWriteFrame(KindError, []byte("boom")) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			w := &frameWriter{rw: &buf, cap: 1 << 20}
+			w.stdout([]byte("before"))
+			if err := tc.seal(w); err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			sealedAt := buf.Len()
+			w.stdout([]byte("after"))
+			w.stderr([]byte("also after"))
+			if buf.Len() != sealedAt {
+				t.Fatalf("%d bytes were written after the terminal frame", buf.Len()-sealedAt)
+			}
+			if w.droppedStdout != int64(len("after")) || w.droppedStderr != int64(len("also after")) {
+				t.Fatalf("dropped counts = %d/%d, want %d/%d: post-seal bytes must be counted, not silently lost",
+					w.droppedStdout, w.droppedStderr, len("after"), len("also after"))
+			}
+		})
 	}
 }
 

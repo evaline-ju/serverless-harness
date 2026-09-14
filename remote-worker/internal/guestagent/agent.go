@@ -251,11 +251,27 @@ func (a *Agent) ServeConn(rw io.ReadWriteCloser) error {
 	} else {
 		end, err = a.runOnParkedShell(req, w)
 	}
+	// Both terminal frames go out through w, never straight to rw. From the moment the
+	// first drain goroutine starts, w's mutex is the ONLY thing serialising writes to
+	// this connection, and a frame is two Writes (header, then payload — see
+	// WriteFrame): a terminal frame written directly to rw could interleave with a
+	// drain's frame and hand the host a spliced header, which it reports as a hard
+	// worker failure for a command that exited 0. Both of these paths can reach here
+	// with a drain still live, by construction rather than by bad luck: the 1s
+	// fallthrough in runOnParkedShell exists precisely for a chatty background job
+	// still holding the stderr pipe, and killShell does not join the drains before the
+	// timeout error goes out.
+	//
+	// seal is what makes this airtight rather than merely narrower. JOINING the drains
+	// is not available on the fallthrough path — the whole reason that path exists is
+	// that the stderr drain may never return — so the writer is permanently disabled
+	// instead, under the same mutex, and any bytes an orphaned drain produces after
+	// that are counted, not written. The drop counts are read under that mutex too;
+	// reading them here without it was a plain data race against the drains.
 	if err != nil {
-		return WriteFrame(rw, KindError, []byte(err.Error()))
+		return w.sealAndWriteFrame(KindError, []byte(err.Error()))
 	}
-	end.DroppedStdout, end.DroppedStderr = w.droppedStdout, w.droppedStderr
-	return WriteJSON(rw, KindEnd, end)
+	return w.sealAndWriteEnd(end)
 }
 
 // readStdin drains stdin frames until KindStdinEOF, regardless of whether the request
@@ -478,6 +494,10 @@ func shouldSetClock(host, guest time.Time) bool {
 // Capping here rather than with `head -c` in the guest pipeline is deliberate: `head`
 // in a pipeline changes the command's exit status via SIGPIPE, and the exit code is
 // the one thing a worker must report faithfully. Same byte saving, no perturbation.
+// Every write to rw after the first drain goroutine starts goes through this one
+// mutex, terminal frames included (see ServeConn's comment on seal): it is the only
+// serialisation the connection has, and a frame is two Writes, so a second writer
+// splices a header into another frame's payload rather than merely reordering frames.
 type frameWriter struct {
 	rw            io.Writer
 	cap           int64
@@ -486,6 +506,12 @@ type frameWriter struct {
 	sentStderr    int64
 	droppedStdout int64
 	droppedStderr int64
+	// sealed is set by the two sealAndWrite* methods below, immediately before the
+	// terminal frame is written, and never cleared: one connection carries one
+	// command, so there is nothing to un-seal for. It is what lets a drain goroutine
+	// that this ServeConn could not join (the 1s fallthrough, or a timeout's orphan)
+	// keep running harmlessly instead of writing after the terminal frame.
+	sealed bool
 }
 
 func (w *frameWriter) stdout(b []byte) { w.emit(KindStdout, b, &w.sentStdout, &w.droppedStdout) }
@@ -495,6 +521,13 @@ func (w *frameWriter) stderr(b []byte) { w.emit(KindStderr, b, &w.sentStderr, &w
 func (w *frameWriter) emit(k Kind, b []byte, sent, dropped *int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.sealed {
+		// The terminal frame has already gone out. Counting rather than writing is the
+		// point: these bytes belong to a drain this command could not join, and the
+		// host has been told the command is over.
+		*dropped += int64(len(b))
+		return
+	}
 	room := w.cap - *sent
 	if room <= 0 {
 		*dropped += int64(len(b))
@@ -506,6 +539,28 @@ func (w *frameWriter) emit(k Kind, b []byte, sent, dropped *int64) {
 	}
 	*sent += int64(len(b))
 	_ = WriteFrame(w.rw, k, b)
+}
+
+// sealAndWriteFrame disables every further stream frame and writes one terminal frame,
+// both under the mutex the drain goroutines emit under. After it returns, no other
+// goroutine can write to the connection.
+func (w *frameWriter) sealAndWriteFrame(k Kind, payload []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sealed = true
+	return WriteFrame(w.rw, k, payload)
+}
+
+// sealAndWriteEnd is sealAndWriteFrame for the success frame, filling in the per-stream
+// drop counts from inside the lock — the drains mutate those fields under it, so
+// reading them anywhere else is a data race, and reading them BEFORE sealing would
+// report a count the host cannot reconcile with the frames it received.
+func (w *frameWriter) sealAndWriteEnd(end End) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sealed = true
+	end.DroppedStdout, end.DroppedStderr = w.droppedStdout, w.droppedStderr
+	return WriteJSON(w.rw, KindEnd, end)
 }
 
 func (w *frameWriter) stdoutWriter() io.Writer { return writerFunc(w.stdout) }
