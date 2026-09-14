@@ -8,6 +8,7 @@ import {
   createWorkerRuntime,
   parseRole,
   startStatsReporter,
+  statsIntervalMs,
   type WorkerToSupervisor,
 } from '../src/worker.js';
 
@@ -122,7 +123,13 @@ describe('createWorkerRuntime', () => {
 
     expect(seen).toEqual({ method: 'POST', url: '/turn', body });
     const loads = send.mock.calls.map(([m]) => m).filter((m) => m.type === 'load');
+    // The leading 0 is the ACCEPT-side report, which exists so a connection that never runs a turn
+    // still reconciles the supervisor's optimistic +1 — a held-open socket has no close to trigger
+    // it. It means a real turn's connection momentarily reports its pre-turn count, so the estimate
+    // dips for one IPC round trip; that over-admission window is bounded and already counted, where
+    // the wedge it prevents was unbounded and uninstrumented.
     expect(loads).toEqual([
+      { type: 'load', inFlight: 0 },
       { type: 'load', inFlight: 1 },
       { type: 'load', inFlight: 0 },
     ]);
@@ -171,7 +178,11 @@ describe('createWorkerRuntime', () => {
     const received: Buffer[] = [];
     client.on('data', (c: Buffer) => received.push(c));
     await vi.waitFor(() => expect(Buffer.concat(received).toString()).toContain('200'));
-    expect(send.mock.calls.map(([m]) => m).filter((m) => m.type === 'load')).toEqual([]);
+    // One accept-side report, and NO turn report: §3.5 caps turns, and a non-turn request still must
+    // not be counted as one. The 0 is the reconciliation signal, not a turn count.
+    expect(send.mock.calls.map(([m]) => m).filter((m) => m.type === 'load')).toEqual([
+      { type: 'load', inFlight: 0 },
+    ]);
     cleanup();
   });
 
@@ -196,12 +207,19 @@ describe('createWorkerRuntime', () => {
     const received: Buffer[] = [];
     client.on('data', (c: Buffer) => received.push(c));
     await vi.waitFor(() => expect(Buffer.concat(received).toString()).toContain('200'));
-    // Still not a turn: §3.5 caps TURNS, and "served but not counted" stays correct.
-    expect(loads()).toEqual([]);
+    // Still not a turn: §3.5 caps TURNS, and "served but not counted" stays correct. The one report
+    // present is the accept-side reconciliation, which is what makes a HELD connection safe.
+    expect(loads()).toEqual([{ type: 'load', inFlight: 0 }]);
 
     client.destroy();
-    // ...but the connection ending IS a reconciliation point.
-    await vi.waitFor(() => expect(loads()).toEqual([{ type: 'load', inFlight: 0 }]));
+    // ...and the connection ending is a second reconciliation point. Both are kept: accept covers the
+    // held-open case, close keeps a keep-alive socket carrying many turns exact.
+    await vi.waitFor(() =>
+      expect(loads()).toEqual([
+        { type: 'load', inFlight: 0 },
+        { type: 'load', inFlight: 0 },
+      ]),
+    );
     cleanup();
   });
 
@@ -224,7 +242,13 @@ describe('createWorkerRuntime', () => {
     const [turnServer, turnClient, cleanupTurn] = await socketPair();
     rt.accept(turnServer);
     turnClient.write('POST /turn HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n');
-    await vi.waitFor(() => expect(loads()).toEqual([{ type: 'load', inFlight: 1 }]));
+    // 0 from the accept-side reconciliation, then 1 when the turn starts.
+    await vi.waitFor(() =>
+      expect(loads()).toEqual([
+        { type: 'load', inFlight: 0 },
+        { type: 'load', inFlight: 1 },
+      ]),
+    );
 
     const [probeServer, probeClient, cleanupProbe] = await socketPair();
     rt.accept(probeServer);
@@ -236,8 +260,13 @@ describe('createWorkerRuntime', () => {
     probeClient.destroy();
     await vi.waitFor(() =>
       expect(loads()).toEqual([
+        { type: 'load', inFlight: 0 },
         { type: 'load', inFlight: 1 },
-        { type: 'load', inFlight: 1 }, // the turn on the OTHER socket survives the report
+        // The probe's own ACCEPT report already demonstrates the property this test is named for: it
+        // says 1, not 0, because a turn is live on the other socket. An absolute count cannot erase
+        // work the worker is really doing; a decrement would have.
+        { type: 'load', inFlight: 1 },
+        { type: 'load', inFlight: 1 }, // and again on close — the turn survives both reports
       ]),
     );
     cleanupProbe();
@@ -316,5 +345,33 @@ describe('parseRole', () => {
 
   it("returns '' when '--role' has no following value", () => {
     expect(parseRole(['--role'])).toBe('');
+  });
+});
+
+describe('statsIntervalMs', () => {
+  // The one numeric env parse that used to sit outside config.ts's readInt validation. A non-numeric
+  // value gave NaN, and setInterval(fn, NaN) coerces the delay to 0 -- a hot timer sending IPC
+  // messages as fast as the loop allows, inside the very process whose event-loop lag E8 measures.
+  it('defaults when unset or empty', () => {
+    expect(statsIntervalMs({} as NodeJS.ProcessEnv)).toBe(1000);
+    expect(statsIntervalMs({ SH_STATS_INTERVAL_MS: '' } as NodeJS.ProcessEnv)).toBe(1000);
+  });
+
+  it('accepts a positive integer', () => {
+    expect(statsIntervalMs({ SH_STATS_INTERVAL_MS: '250' } as NodeJS.ProcessEnv)).toBe(250);
+  });
+
+  it('falls back rather than producing a hot timer', () => {
+    // Each of these coerces to 0 or NaN through Number(), and setInterval treats both as "as fast as
+    // possible". 0 and a negative are rejected for the same reason a non-number is.
+    for (const raw of ['abc', 'NaN', '0', '-5', '1.5', '1e3x']) {
+      expect(statsIntervalMs({ SH_STATS_INTERVAL_MS: raw } as NodeJS.ProcessEnv), raw).toBe(1000);
+    }
+  });
+
+  it('proves the guard matters: the old expression really did yield a hot timer', () => {
+    // An absence-assertion that has never been shown capable of failing asserts nothing.
+    expect(Number('abc')).toBeNaN();
+    expect(Number('abc') > 0).toBe(false);
   });
 });

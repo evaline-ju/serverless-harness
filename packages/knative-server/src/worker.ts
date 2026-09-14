@@ -3,6 +3,8 @@ import type { Socket } from 'node:net';
 import { pathToFileURL } from 'node:url';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { handler } from './server.js';
+// Boot-time validation of the sandbox-discovery enum; see its use below.
+import { resolveDiscoverySource } from '@sh/harness/select-sandbox';
 
 /**
  * Worker → supervisor. Four rows: the first three are exactly P6 §3.9's; the fourth, `stats`,
@@ -77,6 +79,25 @@ export interface WorkerRuntime {
   drain(): void;
 }
 
+/**
+ * The stats interval, validated the way the supervisor's own `readInt` validates its knobs.
+ *
+ * This was `Number(env.SH_STATS_INTERVAL_MS ?? 1000)`, the one numeric env parse outside config.ts's
+ * validation. A non-numeric value yields NaN, and `setInterval(fn, NaN)` coerces the delay to 0 --
+ * a hot timer sending IPC messages as fast as the loop allows, inside the process whose event-loop
+ * lag E8 measures. The blast radius is small (advisory telemetry, and the timer is unref'd), but the
+ * guard costs one line and the failure is silent without it.
+ *
+ * Rejects non-integers and non-positives alike: 0 is the same hot timer by another route, and a
+ * negative is coerced to it too.
+ */
+export function statsIntervalMs(env: NodeJS.ProcessEnv, def = 1000): number {
+  const raw = env.SH_STATS_INTERVAL_MS;
+  if (raw === undefined || raw === '') return def;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : def;
+}
+
 export function createWorkerRuntime(opts: {
   send: (msg: WorkerToSupervisor) => void;
   requestHandler?: RequestListener;
@@ -124,6 +145,27 @@ export function createWorkerRuntime(opts: {
       // connection closing while turns are still in flight on other sockets reports the truth
       // instead of erasing them. Non-turn requests are still not counted as turns (§3.5) --
       // what this adds is a reconciliation signal, not a second count.
+      // Reported on ACCEPT as well as on close, because the close-only version closed the wedge
+      // only for a connection that ENDS, not for one that is HELD. S x W sockets that are handed
+      // off, issue no turn, and stay alive (a `GET /health` every few seconds is enough -- this
+      // server sets no timeouts, so keepAliveTimeout never fires on a socket that keeps making
+      // requests) drive every slot's estimate to S. main.ts then refuses every new connection
+      // BEFORE hand-off, so no turn can arrive, so no `load` can arrive, so nothing reconciles: the
+      // pool is wedged in 429s until a worker crashes. It needs no attacker -- a load balancer or a
+      // monitoring probe on persistent connections accumulates the same way, and S is meant to be
+      // small. At S=1 it is ONE held connection.
+      //
+      // It is also invisible while it happens: `spurious_refusals` can only be incremented by
+      // reconcile() on a `load` reporting lower than the refusal estimate, and the wedge is exactly
+      // the state where no `load` arrives, so the counter designed to detect it cannot fire.
+      //
+      // The trade, stated plainly because it inverts a deliberate bias: reporting on accept means a
+      // real turn's connection momentarily reports its PRE-turn count, so the estimate dips for one
+      // IPC round trip and the pool can over-admit. That over-admission is bounded by the round
+      // trip, is already accepted by §3.9, and is already counted (`over_admission`). The wedge is
+      // unbounded, uninstrumented, and clears only on a crash. Keeping the 'close' report as well
+      // costs one message per connection and keeps the keep-alive-with-turns case exact.
+      send({ type: 'load', inFlight: counter.inFlight });
       socket.once('close', () => send({ type: 'load', inFlight: counter.inFlight }));
       // The socket arrived as a file descriptor, which carries no JS-side buffer: bytes the
       // supervisor read to make its routing decision are gone from the kernel buffer too.
@@ -199,6 +241,28 @@ if (isMainModule) {
     console.error('sh-worker must be forked by @sh/supervisor (no IPC channel available)');
     process.exit(2);
   }
+  // Validate SH_SANDBOX_DISCOVERY at BOOT, not on the first turn. resolveDiscoverySource throws on
+  // an unrecognised value, but its only other caller is selectPoolSandbox on the turn path -- so
+  // `SH_SANDBOX_DISCOVERY=record` (or `grpc`) used to boot cleanly, pass /health, and fail every
+  // turn. SH_ROUTING_POLICY, added by the same change, is validated at boot by policyFromName; this
+  // is the same kind of enum with the opposite failure mode.
+  //
+  // Not hypothetical here: deploy/vm/env/supervisor.env.example sets it explicitly, so it is a value
+  // an operator edits rather than inherits. It is also the shape #249 closed as a must-fix -- a
+  // keyset parsed per request rather than at boot, giving "failure arrives per request on a
+  // healthy-looking deployment" -- and assertKeysetUsable, the fix there, lives in this same package.
+  //
+  // In the worker rather than the supervisor because resolveDiscoverySource is in @sh/harness and
+  // packages/supervisor ships `dependencies: {}` deliberately. A throw here still surfaces as a
+  // crashloop with the reason in the journal, via the supervisor's restart backoff. The records-
+  // without-SH_REMOTE_SANDBOX=1 combination is covered by the same call, and deserves to be: it is a
+  // static property of the unit file, and discovering it on the first turn wastes a whole bring-up.
+  try {
+    resolveDiscoverySource(process.env, process.env.SH_REMOTE_SANDBOX === '1');
+  } catch (err) {
+    console.error(String(err instanceof Error ? err.message : err));
+    process.exit(2);
+  }
   // process.send is overloaded three ways in @types/node; pin the signature we actually use
   // before .call() so tsc doesn't resolve .call to a differently-shaped overload.
   const sendToSupervisor = channel as (this: NodeJS.Process, msg: WorkerToSupervisor) => boolean;
@@ -208,7 +272,7 @@ if (isMainModule) {
   const runtime = createWorkerRuntime({ send });
   const stopStats = startStatsReporter({
     send,
-    intervalMs: Number(process.env.SH_STATS_INTERVAL_MS ?? 1000),
+    intervalMs: statsIntervalMs(process.env),
   });
   process.on('message', (msg: SupervisorToWorker, handle) => {
     if (msg.type === 'conn') {

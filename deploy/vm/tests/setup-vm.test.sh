@@ -21,6 +21,19 @@ printf '%s %s\n' "$(basename "$0")" "$*" >>"$MOCK_LOG"
 MOCK
   chmod +x "$TMP/bin/$cmd"
 done
+# podman gets a richer mock than the log-only loop above: it records its own SANDBOX_TOKEN
+# environment as well as its argv. Both halves are needed to assert the secret is passed BY NAME --
+# that the value is absent from the command line (where /proc/<pid>/cmdline would expose it to any
+# local user) while the container still receives it. Logging only argv could not tell "passed safely"
+# apart from "not passed at all".
+export MOCK_ENV_LOG="$TMP/mock-env.log"
+cat >"$TMP/bin/podman" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s %s\n' "$(basename "$0")" "$*" >>"$MOCK_LOG"
+printf 'podman-env SANDBOX_TOKEN=%s\n' "${SANDBOX_TOKEN-<unset>}" >>"$MOCK_ENV_LOG"
+MOCK
+chmod +x "$TMP/bin/podman"
+
 # id needs real stdout (the caller parses `id -u`), not just a log line, so it gets its own
 # mock rather than joining the log-only loop above. It reports uid 0 -- main() end to end
 # below is standing in for a `sudo ./setup-vm.sh` invocation (B3).
@@ -218,9 +231,20 @@ grep -q -- '-e SANDBOX_ID=sh-sandbox-1' "$MOCK_LOG" ||
 grep -q -- '-e RELAY_ADDR=host.containers.internal:9443' "$MOCK_LOG" ||
   fail "start_sandboxes must set RELAY_ADDR to the host's relay port, taken from" \
     "SH_RELAY_PORT in relay.env: $(cat "$MOCK_LOG")"
-grep -q -- '-e SANDBOX_TOKEN=s3cr3t' "$MOCK_LOG" ||
-  fail "start_sandboxes must set SANDBOX_TOKEN to match the relay's SH_RELAY_TOKEN:" \
-    "$(cat "$MOCK_LOG")"
+# The token must reach the container WITHOUT appearing in argv. `-e SANDBOX_TOKEN` (no `=`) tells
+# podman to take the value from its own environment; `-e SANDBOX_TOKEN=<value>` would put the secret
+# in this process's command line, and /proc/<pid>/cmdline is world-readable on Linux unless hidepid
+# is set. Three assertions, because any two of them alone would pass a broken implementation:
+# by-name present, value absent from argv, value actually delivered.
+grep -q -- '-e SANDBOX_TOKEN$\|-e SANDBOX_TOKEN ' "$MOCK_LOG" ||
+  fail "start_sandboxes must pass SANDBOX_TOKEN by NAME (-e SANDBOX_TOKEN, no '='), so the secret" \
+    "never enters argv: $(cat "$MOCK_LOG")"
+grep -q -- 'SANDBOX_TOKEN=s3cr3t' "$MOCK_LOG" &&
+  fail "the relay token appears in podman's argv, where /proc/<pid>/cmdline exposes it to any local" \
+    "user: $(cat "$MOCK_LOG")"
+grep -q -- 'podman-env SANDBOX_TOKEN=s3cr3t' "$MOCK_ENV_LOG" ||
+  fail "the container does not actually receive SANDBOX_TOKEN: passing by name only works if the" \
+    "value is in podman's own environment: $(cat "$MOCK_ENV_LOG")"
 grep -q -- '--add-host host.containers.internal:host-gateway' "$MOCK_LOG" ||
   fail "start_sandboxes must map host.containers.internal explicitly (podman-run(1)" \
     "host-gateway), not rely on implicit netavark DNS: $(cat "$MOCK_LOG")"
@@ -285,6 +309,28 @@ if require_root 1000 2>/dev/null; then
 fi
 require_root 0 || fail "require_root should pass for uid 0"
 pass "require_root rejects non-root, accepts uid 0"
+
+# --- Redis publishes on loopback only --------------------------------------------------------
+# The same invariant the admin listener check below asserts, applied to the listener that matters
+# more. `-p 6379:6379` binds 0.0.0.0 in podman, and this image runs with no --requirepass, no ACL and
+# no TLS -- so on a cloud VM it is unauthenticated read/write access to the session log, the ownership
+# index, the lease store and sh:sandbox:records.
+#
+# On THIS deployment that is the execution path, not data at rest: supervisor.env.example ships
+# SH_SANDBOX_DISCOVERY=records, and select-sandbox.ts then never lists pods, so the only inventory of
+# executors is a set of Redis records. Whoever writes them chooses the sandbox every turn dispatches
+# to. Admission control, the fail-closed relay token and RestrictAddressFamilies are all bypassed
+# because none of them sits in that path.
+if grep -qE '\-p +127\.0\.0\.1:6379:6379' "$SCRIPT"; then
+  pass "Redis publishes on 127.0.0.1 only"
+else
+  fail "start_redis must publish Redis on 127.0.0.1 (found: $(grep -n 'sh-redis' "$SCRIPT"))"
+fi
+# Comment lines are stripped first: setup-vm.sh deliberately quotes the unsafe form in a comment to
+# explain why the bind is what it is, and without this the guard fires on its own documentation.
+if grep -vE '^[[:space:]]*#' "$SCRIPT" | grep -qE '\-p +6379:6379'; then
+  fail "start_redis still publishes Redis on all interfaces (-p 6379:6379)"
+fi
 
 # --- admin listener (Task 11): loopback only -------------------------------------------------
 # Unauthenticated, and it echoes configuration. Bound to 0.0.0.0 on a cloud VM it is a
@@ -371,9 +417,11 @@ relay_enable_line=$(grep -n 'systemctl enable --now sh-relay.service' "$MOCK_LOG
   fail "main() must install units (daemon-reload) before starting Redis"
 ((redis_line < relay_enable_line)) ||
   fail "main() must start Redis before enabling the relay unit"
-grep -q -- '-e SANDBOX_TOKEN=e2e-token' "$MOCK_LOG" ||
+grep -q -- 'podman-env SANDBOX_TOKEN=e2e-token' "$MOCK_ENV_LOG" ||
   fail "main() did not pass the pre-seeded SH_RELAY_TOKEN through to the sandbox containers" \
-    "(B5 / require_relay_token wiring): $(cat "$MOCK_LOG")"
+    "(B5 / require_relay_token wiring): $(cat "$MOCK_ENV_LOG")"
+grep -q -- 'SANDBOX_TOKEN=e2e-token' "$MOCK_LOG" &&
+  fail "the relay token leaked into podman's argv on the end-to-end path: $(cat "$MOCK_LOG")"
 pass "main() end to end: harness-account check, both units, both env files, correct ordering"
 
 # The closing message must match the behaviour we actually land on: the supervisor is enabled

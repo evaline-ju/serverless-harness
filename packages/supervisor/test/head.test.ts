@@ -128,3 +128,54 @@ describe('readHead', () => {
     expect(MAX_HEAD_BYTES).toBe(16384);
   });
 });
+
+describe('readHead scans incrementally', () => {
+  // The accumulation used to be `headerBlockEnd(Buffer.concat(chunks))` on every 'data' event: the
+  // whole buffer re-concatenated and re-scanned from byte 0, with the PEER choosing the chunking. At
+  // one byte per packet up to MAX_HEAD_BYTES that is ~134 MB touched for 16 KB of input, reachable
+  // BEFORE admission and with nothing capping concurrency. Now each chunk is scanned once with a
+  // <=3-byte carry, which makes the straddling terminator the only case that can regress.
+
+  it('finds a terminator split one byte per packet across the boundary', async () => {
+    const [server, client, cleanup] = await socketPair();
+    const pending = readHead(server);
+    // Every byte of CRLFCRLF in its own packet, so the terminator exists only across four carries.
+    client.write('GET /turn HTTP/1.1\r\nX-SH-Session-Id: split-1\r');
+    await new Promise((r) => setTimeout(r, 10));
+    for (const b of ['\n', '\r', '\n']) {
+      client.write(b);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const head = await pending;
+    expect(head.complete, 'a straddling terminator must still be found').toBe(true);
+    expect(sessionIdFromHead(head.bytes)).toBe('split-1');
+    cleanup();
+  });
+
+  it('finds a terminator whose halves land in different packets', async () => {
+    const [server, client, cleanup] = await socketPair();
+    const pending = readHead(server);
+    client.write('GET /turn HTTP/1.1\r\nX-SH-Session-Id: split-2\r\n');
+    await new Promise((r) => setTimeout(r, 10));
+    client.write('\r\n'); // the second CRLF alone completes the block
+    const head = await pending;
+    expect(head.complete).toBe(true);
+    expect(sessionIdFromHead(head.bytes)).toBe('split-2');
+    cleanup();
+  });
+
+  it('still forwards every byte, and still caps, when fed one byte at a time', async () => {
+    // The cap path keeps what it has: the bytes are already out of the kernel buffer, so discarding
+    // them would corrupt the request the worker sees. Scanning incrementally must not change that.
+    const [server, client, cleanup] = await socketPair();
+    const pending = readHead(server, { maxBytes: 64 });
+    const noTerminator = 'x'.repeat(200);
+    for (const ch of noTerminator) client.write(ch);
+    const head = await pending;
+    expect(head.complete).toBe(false);
+    expect(head.outcome).toBe('cap');
+    expect(head.bytes.length).toBeGreaterThanOrEqual(64);
+    expect(head.bytes.toString()).toMatch(/^x+$/);
+    cleanup();
+  });
+});

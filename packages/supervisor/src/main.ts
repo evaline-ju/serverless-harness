@@ -78,7 +78,20 @@ export async function startSupervisor(opts: {
     socket.on('error', () => {
       /* peer gone; there is nothing to write and nothing useful to log per connection */
     });
-    void route(socket);
+    // Same failure class as the 'error' listener above, by a different door. `route` is async, so
+    // anything it throws is a rejected promise; a bare `void` declines to handle it, and Node's
+    // default unhandledRejection mode throws -- ending the process. KillMode=control-group in the
+    // unit then takes every worker with it, and Restart=always brings back a supervisor that has
+    // lost every in-flight turn. Today's body is safe (handOff catches its own send failures,
+    // readHead only resolves, socket.end() on a dead socket does not throw), but `config.policy.pick`
+    // is injected and a future policy could throw -- and the whole reason this callback is a one-line
+    // dispatcher is that a supervisor must survive anything one connection can do.
+    void route(socket).catch((err) => {
+      // destroy() rather than leaving it: a forgotten socket is a leaked fd, the same reasoning
+      // handOff applies to a hand-off it could not complete.
+      log({ event: 'route_failed', err: String(err) });
+      socket.destroy();
+    });
   });
 
   async function route(socket: Socket): Promise<void> {
@@ -174,7 +187,19 @@ if (entry !== undefined && import.meta.url === pathToFileURL(entry).href) {
     // signal is asking for.
     if (stopping) return;
     stopping = true;
-    void supervisor.close().then(() => process.exit(0));
+    // Same reasoning as `route`'s catch above: an unhandled rejection here would end the process
+    // via the default handler instead of via this exit path -- and on the shutdown path that means
+    // skipping the drain the close() is FOR, killing in-flight turns systemd was willing to wait
+    // for. Exit non-zero so a failed drain is distinguishable in the journal from a clean stop.
+    void supervisor.close().then(
+      () => process.exit(0),
+      (err: unknown) => {
+        // console.log rather than startSupervisor's injected `log`, which is not in scope here --
+        // this is the module's own entry path, and it matches that logger's default anyway.
+        console.log(JSON.stringify({ event: 'shutdown_failed', err: String(err) }));
+        process.exit(1);
+      },
+    );
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);

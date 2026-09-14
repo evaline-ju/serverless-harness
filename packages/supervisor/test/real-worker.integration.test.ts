@@ -182,4 +182,35 @@ describe('the real worker, forked from DEFAULT_WORKER_ENTRY', () => {
       await vi.waitFor(() => expect(sup!.pool.views()[0]!.inFlight).toBe(0), { timeout: 5000 });
     }
   }, 60_000);
+
+  it('does not wedge on a connection that is HELD open and never runs a turn', async () => {
+    // The close-only report closed the wedge for a connection that ENDS. This is the case it did
+    // not close: a socket handed off, issuing no turn, and kept ALIVE. Nothing then lowers the
+    // supervisor's optimistic +1 -- pool.ts only lowers on a `load` or on worker exit -- so at S=1
+    // one held connection saturates the only slot, every later connection is refused BEFORE
+    // hand-off, no turn can arrive, no `load` can arrive, and the pool stays in 429s until a worker
+    // crashes. A load balancer or monitoring probe on a persistent connection does this by accident.
+    //
+    // It is invisible in /metrics while it happens: `spurious_refusals` can only rise on a `load`
+    // reporting lower than the refusal estimate, and the wedge is precisely the state where no
+    // `load` arrives.
+    ({ sup, restore } = await withRealWorker({ SH_TURNS_PER_WORKER: '1' }));
+    await waitReady(sup!);
+
+    // Keep-alive, and deliberately NOT read to completion: the socket stays open with no turn on it.
+    const held = connect(sup!.port, '127.0.0.1');
+    await once(held, 'connect');
+    held.write('GET /health HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n');
+    await once(held, 'data'); // the response arrived, so the hand-off completed
+    try {
+      // The reconciliation must have happened on ACCEPT; there is no close to trigger it.
+      await vi.waitFor(() => expect(sup!.pool.views()[0]!.inFlight).toBe(0), { timeout: 5000 });
+      // And the slot must still be usable, which is the property an operator actually notices.
+      expect(await speak(sup!.port, HEALTH), 'second connection while the first is held').toContain(
+        '200 OK',
+      );
+    } finally {
+      held.destroy();
+    }
+  }, 60_000);
 });

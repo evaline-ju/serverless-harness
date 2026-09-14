@@ -20,6 +20,8 @@ import type { Socket } from 'node:net';
 export const MAX_HEAD_BYTES = maxHeaderSize;
 
 const TERMINATOR = Buffer.from('\r\n\r\n');
+/** Shared zero-length carry for the first chunk, so the common path allocates nothing. */
+const EMPTY = Buffer.alloc(0);
 
 /** Index just past the terminating CRLFCRLF, or -1 if the header block is incomplete. */
 export function headerBlockEnd(buf: Buffer): number {
@@ -96,13 +98,38 @@ export function readHead(
       });
     };
 
+    // The tail of the previous chunk, at most TERMINATOR.length - 1 bytes. Carried so a terminator
+    // that STRADDLES a chunk boundary is still found without re-examining anything already scanned --
+    // the only subtlety in scanning incrementally.
+    // Annotated: `subarray` widens the backing store to ArrayBufferLike, which does not assign to
+    // the ArrayBuffer that Buffer.alloc's return type infers.
+    let carry: Buffer<ArrayBufferLike> = EMPTY;
+
     const onData = (chunk: Buffer): void => {
       chunks.push(chunk);
       total += chunk.length;
-      if (headerBlockEnd(Buffer.concat(chunks)) !== -1) {
+      // Each chunk is scanned ONCE, with a <=3-byte carry, so the work here is linear in the bytes
+      // received. It used to be `headerBlockEnd(Buffer.concat(chunks))`: that re-concatenated the
+      // whole accumulation and re-scanned it from byte 0 on every 'data' event, and the PEER chooses
+      // the chunking. With maxBytes at Node's 16384 and one byte per packet that is 1+2+...+16384
+      // bytes copied and about as many scanned -- roughly 134 MB touched, plus a 16384-entry array,
+      // for 16 KB of input.
+      //
+      // Two reasons it mattered rather than being merely untidy. It is reachable BEFORE admission:
+      // main.ts decides saturation before awaiting readHead, and the estimate only rises at hand-off,
+      // so any number of connections can sit in this loop at once with nothing capping them. And it
+      // lands in the number E8 measures -- CPU burned on the routing hop, in the arm whose whole
+      // purpose is comparing sticky routing against leastInFlight, scaling with the peer's packet
+      // size. Only the stickyBySession arm reaches it (needsHead), which is why it survived.
+      //
+      // `chunks` is deliberately left untouched: finish() concatenates it exactly once, and the
+      // over-cap bytes must be kept (see the 'cap' comment below).
+      const probe = carry.length === 0 ? chunk : Buffer.concat([carry, chunk]);
+      if (probe.indexOf(TERMINATOR) !== -1) {
         finish('complete');
         return;
       }
+      carry = probe.subarray(Math.max(0, probe.length - (TERMINATOR.length - 1)));
       // Over the cap we stop reading but keep what we have: the bytes are already out of the
       // kernel buffer, so discarding them would corrupt the request the worker sees.
       if (total >= maxBytes) finish('cap');

@@ -132,7 +132,25 @@ install_env() {
 
 start_redis() {
   log "starting Redis container"
-  podman run -d --name sh-redis --replace -p 6379:6379 docker.io/redis:7-alpine
+  # LOOPBACK ONLY, and this is the execution path rather than a data-at-rest concern.
+  #
+  # `-p 6379:6379` binds 0.0.0.0 in podman, and this image runs with no --requirepass, no ACL and no
+  # TLS. On THIS deployment the supervisor ships SH_SANDBOX_DISCOVERY=records
+  # (env/supervisor.env.example), and select-sandbox.ts honours that by never listing pods:
+  # `const pods = source === 'records' ? [] : await list(...)`. So the only inventory of executors is
+  # a set of Redis records. Anyone who can write to Redis chooses the sandbox every turn dispatches
+  # to -- receiving the user's prompts and repository contents and returning whatever they like as
+  # the agent's output. Admission control, the fail-closed relay token and RestrictAddressFamilies on
+  # both units are all bypassed, because none of them is in that path.
+  #
+  # Nothing loses access: both env templates already point at redis://127.0.0.1:6379, and the sandbox
+  # containers reach the RELAY, not Redis -- start_sandboxes hands them RELAY_ADDR, SANDBOX_TOKEN and
+  # SANDBOX_ID and nothing else.
+  #
+  # The invariant was already written down for the admin listener (setup-vm.test.sh asserts it binds
+  # 127.0.0.1 *because* it is unauthenticated). It simply had not been applied to the listener that
+  # exposes session state, the ownership index, the lease store and sh:sandbox:records.
+  podman run -d --name sh-redis --replace -p 127.0.0.1:6379:6379 docker.io/redis:7-alpine
 }
 
 # remote-worker/cmd/worker/main.go:93-105 reads RELAY_ADDR (default localhost:8443),
@@ -222,11 +240,18 @@ start_sandboxes() {
   token="$(relay_token)"
   addr="$(sandbox_relay_addr)"
   for ((i = 0; i < SH_SANDBOX_COUNT; i++)); do
-    podman run -d --name "sh-sandbox-$i" --replace \
+    # SANDBOX_TOKEN is passed BY NAME (`-e SANDBOX_TOKEN`, no `=`), so podman takes the value from
+    # its own environment and the secret never enters argv. `-e "SANDBOX_TOKEN=$token"` would put it
+    # in this process's command line, and /proc/<pid>/cmdline is world-readable on Linux unless
+    # hidepid is set -- so for the lifetime of each of these invocations any unprivileged local user
+    # running `ps` in a loop reads the token that require_relay_token just insisted must be a real
+    # secret. The token is the whole of the relay's authentication (makeDefaultValidateToken is
+    # fail-closed), so holding it means being able to attach as a sandbox, i.e. to become an executor.
+    SANDBOX_TOKEN="$token" podman run -d --name "sh-sandbox-$i" --replace \
       --add-host host.containers.internal:host-gateway \
       -e "SANDBOX_ID=sh-sandbox-$i" \
       -e "RELAY_ADDR=$addr" \
-      -e "SANDBOX_TOKEN=$token" \
+      -e SANDBOX_TOKEN \
       "$SANDBOX_IMAGE"
   done
 }
