@@ -225,15 +225,61 @@ describe('renderPreflight / hasErrors', () => {
 
 describe('checkMemoryLinks ReDoS resistance', () => {
   // CodeQL flagged both link regexes as polynomial on uncontrolled data, and it was right:
-  // measured on the unbounded forms, 40 KB of '[' took 2281 ms and 80 KB of '[[' took 9186 ms,
-  // growing quadratically -- a crafted MEMORY.md in a third-party plugin skill would hang the
-  // promote CLI for minutes. Bounded, the same inputs take 33 ms and 62 ms.
-  // The budget is ~25x the fixed cost and ~1/6 of the broken cost, so it cannot pass unfixed.
-  it('does not blow up on pathological bracket runs', () => {
-    for (const evil of ['['.repeat(40000), '[['.repeat(40000), '[](' + '[(](('.repeat(8000)]) {
-      const t = performance.now();
-      checkMemoryLinks(evil, ['a.md']);
-      expect(performance.now() - t).toBeLessThan(1500);
+  // measured on the unbounded forms, 40 KB of '[' took 2281 ms and 80 KB of '[[' took 9186 ms
+  // -- input doubled, time QUADRUPLED. Bounded, the same inputs took 33 ms and 62 ms: input
+  // doubled, time doubled. A crafted MEMORY.md in a third-party plugin skill would otherwise
+  // hang the promote CLI for minutes.
+  //
+  // This asserts that SHAPE rather than a wall-clock budget. The previous form gave each
+  // input 1500 ms, and it failed in CI at 1624 ms -- not because the bound regressed but
+  // because `make test` runs the workspaces in parallel, so this CPU-bound regex test
+  // competes with six other vitest suites on a two-core runner. Locally the slowest input
+  // takes ~128 ms; under that contention it stretched past the budget. A wall-clock
+  // assertion measures the machine and its load, not the code.
+  //
+  // A ratio does not. Contention slows both measurements, so it cancels to first order,
+  // while the linear-vs-quadratic signal survives: doubling the input costs ~2x bounded and
+  // ~4x unbounded. The threshold sits between them.
+  const RATIO_LIMIT = 3;
+  // Backstop only, deliberately far above any plausible bounded cost: catches a true hang
+  // (or a regression so severe the ratio is moot) without being the primary assertion.
+  const ABSOLUTE_CEILING_MS = 30_000;
+
+  const median = (xs: number[]): number => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+  const timeOnce = (evil: string): number => {
+    const t = performance.now();
+    checkMemoryLinks(evil, ['a.md']);
+    return performance.now() - t;
+  };
+
+  // Interleaved so a drifting machine (thermal throttling, a neighbour waking up) biases
+  // both series together rather than only the second one.
+  const timePair = (build: (reps: number) => string, reps: number) => {
+    const small: number[] = [];
+    const large: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      small.push(timeOnce(build(reps)));
+      large.push(timeOnce(build(reps * 2)));
     }
-  });
+    return { small: median(small), large: median(large) };
+  };
+
+  const shapes: [string, (reps: number) => string, number][] = [
+    ["a run of '['", (n) => '['.repeat(n), 20_000],
+    ["a run of '[['", (n) => '[['.repeat(n), 20_000],
+    ["nested '[(](('", (n) => '[](' + '[(](('.repeat(n), 8_000],
+  ];
+
+  for (const [label, build, reps] of shapes) {
+    it(`scales linearly, not quadratically, on ${label}`, () => {
+      const { small, large } = timePair(build, reps);
+      expect(large).toBeLessThan(ABSOLUTE_CEILING_MS);
+      // Guard the ratio against a denominator so small that noise dominates it. If the
+      // bounded implementation is fast enough that the base case is sub-millisecond, the
+      // ceiling above is the only meaningful claim -- say so rather than asserting on noise.
+      if (small >= 1) {
+        expect(large / small).toBeLessThan(RATIO_LIMIT);
+      }
+    });
+  }
 });
