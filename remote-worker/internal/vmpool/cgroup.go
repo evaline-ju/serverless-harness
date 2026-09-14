@@ -120,7 +120,68 @@ const (
 
 	// chvScopeDirSuffix is the suffix systemd gives a scope unit's cgroup directory.
 	chvScopeDirSuffix = ".scope"
+
+	// Cgroup2Root is where the unified hierarchy is mounted. SH_PARENT_CGROUP is
+	// SLICE-RELATIVE (see DefaultParentCgroup), so this is what turns it into a
+	// filesystem path for the sweep.
+	Cgroup2Root = "/sys/fs/cgroup"
+
+	// DefaultParentCgroup is the ONE default both consumers share, so they cannot
+	// drift apart again. It is deliberately slice-RELATIVE and deliberately spells the
+	// full systemd hierarchy, because both of those were wrong before and each was
+	// wrong in a way that looked right:
+	//
+	// Verified on hardware (m8i.xlarge, jailer v1.17.0, cgroup v2), three ways:
+	//
+	//	--parent-cgroup /sys/fs/cgroup/microvm.slice/microvm-vms.slice
+	//	    REFUSED: "Parent cgroup path is invalid. Path should not be absolute or
+	//	    contain '..' or '.'" / CgroupInvalidParentPath. No cgroup created. So an
+	//	    absolute value can never work for the Firecracker arm, however correct the
+	//	    path is — which is why ValidateParentCgroup refuses one at start.
+	//	--parent-cgroup microvm-vms.slice
+	//	    Created /sys/fs/cgroup/microvm-vms.slice/vm-N — a NEW TOP-LEVEL cgroup
+	//	    OUTSIDE systemd's slice. memory.max was set on it, so it looked correct,
+	//	    while the slice's own accounting and limits covered none of it and a sweep
+	//	    pointed at the systemd slice could never see it.
+	//	--parent-cgroup microvm.slice/microvm-vms.slice
+	//	    Created /sys/fs/cgroup/microvm.slice/microvm-vms.slice/vm-N, inside the
+	//	    slice, memory.max correct. This one.
+	//
+	// The two-segment form is not redundancy: systemd expands a DASHED slice name into
+	// a hierarchy, so the unit "microvm-vms.slice" lives at
+	// microvm.slice/microvm-vms.slice. `systemctl show microvm-vms.slice -p
+	// ControlGroup` reports /microvm.slice/microvm-vms.slice, and
+	// /sys/fs/cgroup/microvm-vms.slice does not exist at all.
+	DefaultParentCgroup = "microvm.slice/microvm-vms.slice"
 )
+
+// ValidateParentCgroup rejects a SH_PARENT_CGROUP that jailer itself would reject, at
+// start rather than at the first Restore. The rule is jailer's own, quoted from its
+// error text: not absolute, no "." or ".." component. Spec §6's posture is to fail at
+// start for a misconfiguration that makes the tier unusable, and an absolute value
+// makes every Firecracker restore fail.
+func ValidateParentCgroup(rel string) error {
+	if rel == "" {
+		return fmt.Errorf("vmpool: SH_PARENT_CGROUP is empty (want a slice-relative path such as %q)", DefaultParentCgroup)
+	}
+	if filepath.IsAbs(rel) {
+		return fmt.Errorf("vmpool: SH_PARENT_CGROUP=%q is absolute, and jailer refuses an absolute "+
+			"--parent-cgroup (jailer: Path should not be absolute or contain a dot component), so every Firecracker "+
+			"restore would fail. Give it slice-relative, e.g. %q — %s is prepended for the orphan sweep",
+			rel, DefaultParentCgroup, Cgroup2Root)
+	}
+	for _, seg := range strings.Split(rel, "/") {
+		if seg == "." || seg == ".." {
+			return fmt.Errorf("vmpool: SH_PARENT_CGROUP=%q contains a %q component, which jailer refuses", rel, seg)
+		}
+	}
+	return nil
+}
+
+// ParentCgroupPath turns the slice-relative SH_PARENT_CGROUP into the cgroupfs path the
+// orphan sweep walks. The launcher passes the relative form to jailer verbatim; only the
+// sweep needs it absolute, and deriving it here is what stops the two from disagreeing.
+func ParentCgroupPath(rel string) string { return filepath.Join(Cgroup2Root, rel) }
 
 // chvScopeUnitName is the systemd-run --scope unit name the Cloud Hypervisor arm gives
 // one VM. Called by that launcher's Restore, and reversed by isPoolVMCgroupDirName below

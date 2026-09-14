@@ -435,3 +435,54 @@ func TestFirecrackerJailerCgroupMemoryMaxAgreesWithPerVMBytes(t *testing.T) {
 		t.Fatalf("jailer args %q do not contain %q — the cgroup bound has drifted from PerVMBytes(cfg) = %d", joined, wantFlag, want)
 	}
 }
+
+// TestParentCgroupIsSliceRelativeAndDerivable pins the three hardware facts that made
+// the shipped systemd unit non-functional. Each was verified on an m8i.xlarge with
+// jailer v1.17.0 under cgroup v2 -- none of them is inferred from documentation.
+func TestParentCgroupIsSliceRelativeAndDerivable(t *testing.T) {
+	// FACT 1: jailer refuses an absolute --parent-cgroup outright, so an absolute value
+	// can never work however correct the path is. Refuse it at start, not at the first
+	// Restore. Both the "right" absolute path and a wrong one must be refused -- the
+	// property is absoluteness, not correctness.
+	for _, abs := range []string{
+		"/sys/fs/cgroup/microvm.slice/microvm-vms.slice",
+		"/sys/fs/cgroup/microvm-vms.slice",
+	} {
+		if err := ValidateParentCgroup(abs); err == nil {
+			t.Errorf("ValidateParentCgroup(%q) = nil; jailer refuses an absolute --parent-cgroup", abs)
+		}
+	}
+	// FACT 2: the value jailer accepts, and which lands the VM cgroup INSIDE the slice
+	// systemd accounts, is the slice-relative full hierarchy. Non-vacuousness for the
+	// checks above: this must PASS, or they would be satisfied by refusing everything.
+	if err := ValidateParentCgroup(DefaultParentCgroup); err != nil {
+		t.Fatalf("ValidateParentCgroup(%q) = %v; want nil", DefaultParentCgroup, err)
+	}
+	// FACT 3: systemd expands a dashed slice name into a hierarchy, so the unit
+	// "microvm-vms.slice" lives under microvm.slice. A bare slice name is what created a
+	// separate top-level cgroup outside the slice, so the default must not be bare.
+	if !strings.Contains(DefaultParentCgroup, "/") {
+		t.Errorf("DefaultParentCgroup = %q; a bare slice name creates a cgroup OUTSIDE the "+
+			"systemd slice (systemd nests a dashed name: microvm-vms.slice is under microvm.slice)",
+			DefaultParentCgroup)
+	}
+	// The sweep needs the absolute path, and it must be DERIVED rather than configured a
+	// second time -- two independent settings is what let them point at different places.
+	if got, want := ParentCgroupPath(DefaultParentCgroup), Cgroup2Root+"/"+DefaultParentCgroup; got != want {
+		t.Errorf("ParentCgroupPath(%q) = %q, want %q", DefaultParentCgroup, got, want)
+	}
+	// And the Cloud Hypervisor arm takes the slice UNIT NAME off the same value, so a
+	// multi-segment path must still yield the bare unit name for systemd-run --slice=.
+	if got := chvCgroupSliceName(DefaultParentCgroup); got != "microvm-vms.slice" {
+		t.Errorf("chvCgroupSliceName(%q) = %q, want %q", DefaultParentCgroup, got, "microvm-vms.slice")
+	}
+	// An empty value must not silently mean "cgroup root".
+	if err := ValidateParentCgroup(""); err == nil {
+		t.Error("ValidateParentCgroup(\"\") = nil; empty must be refused, not treated as the cgroup root")
+	}
+	for _, dotted := range []string{"microvm.slice/../escape", "./microvm.slice"} {
+		if err := ValidateParentCgroup(dotted); err == nil {
+			t.Errorf("ValidateParentCgroup(%q) = nil; jailer refuses a dot component", dotted)
+		}
+	}
+}

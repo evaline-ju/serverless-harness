@@ -77,7 +77,16 @@ Environment=SH_VMM=firecracker
 Environment=SH_SNAPSHOT_DIR=/srv/snapshots
 Environment=SH_WORKSPACE_ROOT=/srv/workspaces
 Environment=SH_CHROOT_BASE=/srv/jail
-Environment=SH_PARENT_CGROUP=/sys/fs/cgroup/microvm-vms.slice
+# Slice-RELATIVE, and spelling the full systemd hierarchy. Both halves were wrong
+# before, each in a way that looked right. Verified on hardware (jailer v1.17.0,
+# cgroup v2): jailer REFUSES an absolute --parent-cgroup ("Path should not be
+# absolute"), so every restore failed; and a bare "microvm-vms.slice" created a new
+# top-level cgroup OUTSIDE this slice, with memory.max set on it so it looked correct
+# while the slice accounted none of it. systemd expands a dashed slice name into a
+# hierarchy, so this unit's own Slice=microvm-vms.slice lives at
+# /sys/fs/cgroup/microvm.slice/microvm-vms.slice -- and /sys/fs/cgroup/microvm-vms.slice
+# does not exist at all, which is why the orphan sweep silently swept nothing.
+Environment=SH_PARENT_CGROUP=microvm.slice/microvm-vms.slice
 Environment=SH_STANDBY_DEPTH=2
 Environment=SH_GUEST_RAM_MB=256
 Environment=SH_MAX_RUNS=64

@@ -392,7 +392,34 @@ func main() {
 	// the shipped unit's own Slice=microvm-vms.slice guarantees at least one skip
 	// (microvm-worker.service, this process's own cgroup), so an EMPTY skip list on a
 	// systemd-started worker is itself the anomaly worth seeing.
-	if res, err := vmpool.SweepOrphans(env(get, "SH_PARENT_CGROUP", "/sys/fs/cgroup/microvm-vms.slice")); err != nil {
+	//
+	// SH_PARENT_CGROUP is slice-RELATIVE, because jailer refuses an absolute
+	// --parent-cgroup outright (verified on hardware; see vmpool.DefaultParentCgroup).
+	// Only the sweep needs it absolute, and deriving it here rather than configuring it
+	// twice is what stops the sweep and the launcher from pointing at different places --
+	// which is exactly what shipped: the sweep at a path that did not exist, so it
+	// no-oped silently, and the launcher at a bare slice name, so every VM cgroup landed
+	// OUTSIDE the slice systemd accounts.
+	parentCgroup := env(get, "SH_PARENT_CGROUP", vmpool.DefaultParentCgroup)
+	if err := vmpool.ValidateParentCgroup(parentCgroup); err != nil {
+		log.Fatalf("microvm-worker: %v", err)
+	}
+	sweepPath := vmpool.ParentCgroupPath(parentCgroup)
+	// Under systemd the slice is created before this unit starts, so an absent path is a
+	// misconfiguration and the sweep would silently do nothing -- section 6's #1
+	// mitigation disabled without a word. Outside systemd (gates, vmpoolctl, a dev box)
+	// absence is normal, so it is a warning there. systemd sets INVOCATION_ID for every
+	// unit it starts.
+	if _, statErr := os.Stat(sweepPath); statErr != nil {
+		if get("INVOCATION_ID") != "" {
+			log.Fatalf("microvm-worker: SH_PARENT_CGROUP=%q resolves to %s, which does not exist, "+
+				"so the orphan sweep would do nothing and crash-leaked VMs from a previous "+
+				"incarnation would stay resident against the memory gate. Note systemd expands a "+
+				"dashed slice name into a hierarchy, so the unit microvm-vms.slice lives at %q",
+				parentCgroup, sweepPath, vmpool.DefaultParentCgroup)
+		}
+		log.Printf("microvm-worker: orphan sweep skipped: %s does not exist (normal outside systemd)", sweepPath)
+	} else if res, err := vmpool.SweepOrphans(sweepPath); err != nil {
 		log.Printf("microvm-worker: orphan sweep: %v", err)
 	} else {
 		log.Printf("microvm-worker: orphan sweep: swept %d VM cgroup(s) from a previous incarnation; left alone %d non-VM cgroup(s) %v",
