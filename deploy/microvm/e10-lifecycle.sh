@@ -100,7 +100,16 @@ GOVERNOR_PATH="${GOVERNOR_PATH:-/sys/devices/system/cpu/cpu0/cpufreq/scaling_gov
 # a substrate; an explicit, required flag cannot silently default to the wrong one.
 SUBSTRATE="${SH_SUBSTRATE:?set SH_SUBSTRATE (e.g. nested-m8i, nested-c8i, or metal) - spec section 6 requires the substrate in every run record, and E9 requires it be labeled by rig, not bare nested}"
 
-SNAPSHOT_DIR="${SH_SNAPSHOT_DIR:?set SH_SNAPSHOT_DIR - the same env var name microvm-worker requires, see cmd/microvm-worker/main.go}"
+SNAPSHOT_PARENT="${SH_SNAPSHOT_DIR:?set SH_SNAPSHOT_DIR - the same env var name microvm-worker requires, see cmd/microvm-worker/main.go}"
+# SH_SNAPSHOT_DIR is the PARENT, and SH_SNAPSHOT_IMAGE names the golden snapshot inside it --
+# the same split cmd/microvm-worker/main.go makes (filepath.Join of the two, image defaulting
+# to "default"). vmpoolctl's --snapshot-dir does NOT append an image name, so this script must
+# join them itself; passing the parent straight through made vmpoolctl look for memfile one
+# directory too high. One variable, one meaning, in both drivers and the unit.
+SNAPSHOT_IMAGE="${SH_SNAPSHOT_IMAGE:-default}"
+SNAPSHOT_DIR="$SNAPSHOT_PARENT/$SNAPSHOT_IMAGE"
+[ -f "$SNAPSHOT_DIR/manifest.json" ] ||
+  die "no manifest.json under $SNAPSHOT_DIR - SH_SNAPSHOT_DIR is the PARENT of the golden snapshot and SH_SNAPSHOT_IMAGE names it (currently '$SNAPSHOT_IMAGE'). A golden snapshot built by build-snapshot.sh has manifest.json, vmstate, memfile, kernel and rootfs in it."
 WORKSPACE_ROOT="${SH_WORKSPACE_ROOT:?set SH_WORKSPACE_ROOT - the same env var name microvm-worker requires, see cmd/microvm-worker/main.go}"
 
 # E8: the brief hardcodes ARMS=(firecracker cloud-hypervisor). On this rig the

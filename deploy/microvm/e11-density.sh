@@ -712,7 +712,8 @@ start_microvm_stack() {
   log "microvm: starting the worker (D=$d guest=${ram_mb}MiB)"
   SH_VMM=firecracker SH_STANDBY_DEPTH="$d" SH_GUEST_RAM_MB="$ram_mb" \
     SH_MAX_RUNS=$((max_c + d + 2)) SH_MAX_COMMITTED_MB="$MAX_COMMITTED_MB" \
-    SH_SNAPSHOT_DIR="$SNAPSHOT_DIR" SH_WORKSPACE_ROOT="$WORKSPACE_ROOT" \
+    SH_SNAPSHOT_DIR="$SNAPSHOT_DIR" SH_SNAPSHOT_IMAGE="${SH_SNAPSHOT_IMAGE:-default}" \
+    SH_WORKSPACE_ROOT="$WORKSPACE_ROOT" \
     SANDBOX_ID="e11-microvm-d${d}-ram${ram_mb}" RELAY_ADDR="localhost:${E11_RELAY_PORT}" \
     SANDBOX_TOKEN="$E11_RELAY_TOKEN" \
     "$E11_WORKER_BIN" >"$RESULTS/e11-microvm-worker-d${d}-ram${ram_mb}.log" 2>&1 &
