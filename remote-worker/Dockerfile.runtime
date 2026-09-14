@@ -14,5 +14,9 @@ FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
 RUN microdnf install -y --nodocs bash coreutils-single findutils file \
     && microdnf clean all
 COPY remote-worker /usr/local/bin/remote-worker
+# See the same block in ./Dockerfile: the harness execs tool calls from /workspace (the default
+# KAGENTI_SANDBOX_CWD), and without it every exec dies on `cd` before running the command, which
+# surfaces as a tool error from a sandbox that is attached and healthy.
+RUN mkdir -p /workspace && chown 1001:0 /workspace && chmod 775 /workspace
 USER 1001
 ENTRYPOINT ["/usr/local/bin/remote-worker"]
