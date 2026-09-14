@@ -12,13 +12,14 @@
 # the harness's ops call base64 and file (spec §3.3).
 #
 # ripgrep is vendored because it is the IMPLEMENTATION of two registered tools, not a scheduling
-# label. The Find/Glob tool runs `rg --files --hidden` (k8s-sandbox operations.ts:170) and the Grep
-# tool runs `rg` directly (grep-tool.ts), and both land in THIS container whenever a leased gRPC
-# presence record supplies a relay transport: extension.ts's `opts?.transport ??` overrides the fast
-# AND the stream transport, so every pod operation runs over the relay. Without `rg` on PATH the model's Glob
-# returns "glob failed in pod (rg exited 127)" and its Grep "rg failed in pod (exit 127)" -- the
-# same attached-and-healthy-yet-every-tool-fails signature as the /workspace bug below. Both other
-# sandbox images in the repo install it (sandbox.Dockerfile, k8s-sandbox/deploy/sandbox.yaml).
+# label. The Find/Glob tool runs `rg --files --hidden` (k8s-sandbox `createPodFindOps`.glob) and the
+# Grep tool runs `rg` directly (`createPodGrepTool`), and both land in THIS container whenever a
+# leased gRPC presence record supplies a relay transport: extension.ts's `opts?.transport ??`
+# overrides the fast AND the stream transport, so every pod operation runs over the relay. Without
+# `rg` on PATH the model's Glob returns "glob failed in pod (rg exited 127)" and its Grep "rg failed
+# in pod (exit 127)" -- the same attached-and-healthy-yet-every-tool-fails signature as the
+# /workspace bug below. Both other sandbox images in the repo install it (sandbox.Dockerfile,
+# k8s-sandbox/deploy/sandbox.yaml).
 #
 # It is genuinely not in the UBI 9 repositories (verified: `microdnf install ripgrep` -> "No package
 # matches"), and EPEL would add a third-party repository to an image that executes model-authored
@@ -26,9 +27,24 @@
 # release publishes. Static, so it needs no libc from this base. Fetched in its own stage, so the
 # tar/gzip needed to unpack it never reach the runtime image.
 #
-# To bump: change RG_VERSION and BOTH digests together. The digests are per-arch and `sha256sum -c`
-# fails the build closed if either is wrong. Arch comes from `uname -m` rather than TARGETARCH
-# because buildah / `oc new-build --strategy=docker` do not populate BuildKit's automatic args.
+# The version is not free to choose. `createPodFindOps`.glob leans on two documented .gitignore
+# nuances -- gitignored DIRECTORIES stay pruned even when `-g` matches inside them, while an
+# individually-gitignored FILE matching a positive `-g` IS re-included -- and those were originally
+# characterised on rg 14.1.0, the version alpine:3.20 ships and therefore the one both other sandbox
+# images and the k8s-sandbox SMOKE.md run used. 15.2.0 crosses a major boundary, so if it diverged
+# there, Glob's ignore semantics would differ by which sandbox image an operator happened to build --
+# silently, and only for gitignored paths. Both nuances were re-verified against these exact pinned
+# tarballs, on both arches, before pinning: they hold unchanged. operations.ts and the M3 spec's D5
+# note record that.
+#
+# Pinning back to 14.1.0 instead is NOT available: that release publishes no
+# aarch64-unknown-linux-musl asset (only -gnu), so it would either break the arm64 build or give up
+# the static property this stage exists for.
+#
+# To bump: change RG_VERSION and BOTH digests together, AND re-check those two nuances on the new
+# version. The digests are per-arch and `sha256sum -c` fails the build closed if either is wrong.
+# Arch comes from `uname -m` rather than TARGETARCH because buildah / `oc new-build
+# --strategy=docker` do not populate BuildKit's automatic args.
 # hadolint ignore=DL3007
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS rg
 ARG RG_VERSION=15.2.0
