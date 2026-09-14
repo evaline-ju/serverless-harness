@@ -260,6 +260,16 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 		}
 		return Result{}, err
 	}
+	// One identical teardown for abort, timeout and success (spec §4.1). Named rather
+	// than written inline as a defer because the gate below has one path that must run
+	// it before any defer of its own is registered.
+	destroy := func() {
+		t0 := p.clk.Now()
+		p.destroy(key, vm)
+		if ph != nil {
+			ph.Destroy = p.clk.Now().Sub(t0)
+		}
+	}
 	if p.serialize {
 		// Firecracker arm only. The workspace's ext4 image is not a shared-disk
 		// filesystem: two guests mounting it rw at once would corrupt it, so
@@ -268,18 +278,26 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 		// (spec §4.3). Registered BEFORE the destroy defer below so that, on
 		// unwind, this VM is fully destroyed (and its mount released) before the
 		// gate opens for the next command — see rp.execGate's doc comment.
-		rp.execGate.Lock()
-		defer rp.execGate.Unlock()
-	}
-	// One identical teardown for abort, timeout and success (spec §4.1), and no
-	// early return below can leak a VM.
-	defer func() {
-		t0 := p.clk.Now()
-		p.destroy(key, vm)
-		if ph != nil {
-			ph.Destroy = p.clk.Now().Sub(t0)
+		//
+		// The WAIT is selectable on runCtx: a VM is already acquired and charged at
+		// this point, and an unselectable wait meant an abort or a timeout could not
+		// release either while a wedged guest held the gate.
+		select {
+		case rp.execGate <- struct{}{}:
+			defer func() { <-rp.execGate }()
+		case <-runCtx.Done():
+			// The gate is NOT held and the destroy defer is not registered yet, so
+			// this VM is torn down here — the one path in this function that does its
+			// own teardown, and the reason destroy is a named closure.
+			destroy()
+			if cErr := p.classify(ctx, &timedOut, timeoutS); cErr != nil {
+				return Result{}, cErr
+			}
+			return Result{}, ErrAborted
 		}
-	}()
+	}
+	// No early return below can leak a VM.
+	defer destroy()
 
 	if vm.Key() != key {
 		return Result{}, fmt.Errorf("%w: popped %q for %q", ErrKeyMismatch, vm.Key(), key)
@@ -474,7 +492,13 @@ func (p *pool) runLocked(key string) (*runPool, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	rp := &runPool{key: key, dir: dir, settled: make(chan struct{}), lastExec: p.clk.Now()}
+	rp := &runPool{
+		key: key, dir: dir,
+		settled: make(chan struct{}),
+		// Capacity 1: the gate admits one Exec per run at a time (see execGate).
+		execGate: make(chan struct{}, 1),
+		lastExec: p.clk.Now(),
+	}
 	p.runs[key] = rp
 	return rp, true, nil
 }

@@ -1,9 +1,6 @@
 package vmpool
 
-import (
-	"sync"
-	"time"
-)
+import "time"
 
 // runPool is one workspace_key's state — spec §4.2's second state machine:
 //
@@ -39,16 +36,26 @@ type runPool struct {
 	// them; a timer that fires into a reclaimed run would resurrect it.
 	pending []Timer
 
-	// execGate is the ONE field here that is NOT guarded by pool.mu and takes a
-	// lock of its own — deliberately, because what it protects (a VM's Resume and
-	// Run, which dial vsock and block on a guest) must never happen while pool.mu
-	// is held. ExecPhased holds it from a successful acquire until this VM is
+	// execGate is the ONE field here that is NOT guarded by pool.mu and synchronizes
+	// on its own — deliberately, because what it protects (a VM's Resume and Run,
+	// which dial vsock and block on a guest) must never happen while pool.mu is
+	// held. ExecPhased holds it from a successful acquire until this VM is
 	// destroyed, but only when the Launcher reports SerializesExecsPerRun():
 	// Firecracker's ext4 workspace is not a shared-disk filesystem, so a second
 	// guest mounting it rw while the first still holds it would corrupt it
-	// (spec §4.3). Zero value is an unlocked Mutex, so a run's first Exec needs no
-	// separate initialization.
-	execGate sync.Mutex
+	// (spec §4.3).
+	//
+	// A ONE-SLOT CHANNEL, NOT A MUTEX, because a mutex acquisition is not selectable
+	// on a context. A waiter parked on sync.Mutex.Lock held an acquired VM with the
+	// budget charged and no destroy defer registered yet, and cancelling its context
+	// did not release any of it — so one wedged guest blocked every subsequent Exec
+	// for that run indefinitely, each waiter's VM charged against
+	// MaxCommittedBytes and each keeping rp.busy() true so the sweep could not
+	// reclaim the workspace either. A send that can lose the race to runCtx.Done()
+	// lets an aborted or timed-out waiter unwind instead of queueing behind a guest
+	// that is never going to answer. Created in runLocked: unlike a zero Mutex, a
+	// nil channel would block forever.
+	execGate chan struct{}
 }
 
 func (rp *runPool) signalSettledLocked() {

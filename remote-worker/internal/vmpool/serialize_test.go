@@ -2,6 +2,7 @@ package vmpool
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -100,6 +101,113 @@ func TestExecSerializesRunsPerKeyWhenLauncherRequiresIt(t *testing.T) {
 	}
 	release <- struct{}{}
 	<-done
+}
+
+// TestAnExecWaitingOnTheRunGateCanStillBeCancelled pins the wait itself. A waiter that
+// has reached the gate already holds an acquired VM with the budget charged and no
+// destroy defer registered yet, so an unselectable sync.Mutex.Lock meant that neither
+// the VM, its MaxCommittedBytes reservation, nor the run's workspace could be released
+// while a wedged guest held the gate: one hung Exec blocked every subsequent Exec for
+// that run indefinitely.
+//
+// That the gate really does hold a waiter is asserted by
+// TestExecSerializesRunsPerKeyWhenLauncherRequiresIt above — this test would pass
+// trivially against a pool that never serialized anything, so the two belong together.
+// Both unwind paths are covered, because they classify differently: an abort must report
+// ErrAborted and a TimeoutS expiry must report ErrTimeout, from the same select.
+func TestAnExecWaitingOnTheRunGateCanStillBeCancelled(t *testing.T) {
+	// holdFirstExec starts an Exec that occupies the gate and stays inside Run, and
+	// returns a release for it. Every subtest needs the same setup: a wedged guest is
+	// the only situation in which the gate is held long enough to matter.
+	holdFirstExec := func(t *testing.T, p Pool, lc *fakeLauncher) (release func()) {
+		t.Helper()
+		// Buffered and sent to, not closed: if the gate ever lets the second Exec
+		// through — which is exactly what a regression here would do once the first is
+		// released — a second entrant must report that, not panic on a closed channel.
+		entered := make(chan struct{}, 4)
+		gate := make(chan struct{})
+		lc.setRunFn(func(_ *fakeVM, c Command, _ Sink) (Result, error) {
+			entered <- struct{}{}
+			<-gate
+			return Result{ExitCode: 0}, nil
+		})
+		go func() {
+			_, _ = p.Exec(context.Background(), "run-a", Exec{ReqID: 1, Command: "wedged", TimeoutS: 300}, discardingSink{})
+		}()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the first Exec never entered Run")
+		}
+		return func() { close(gate) }
+	}
+
+	// waitingOnTheGate asserts the second Exec is parked on the gate rather than in Run,
+	// the same bounded negative check the serialization test uses.
+	waitingOnTheGate := func(t *testing.T, done <-chan error) {
+		t.Helper()
+		select {
+		case err := <-done:
+			t.Fatalf("the second Exec returned %v instead of waiting on the gate", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	t.Run("abort", func(t *testing.T) {
+		p, lc, _ := testSerializingPool(t)
+		release := holdFirstExec(t, p, lc)
+		defer release()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, err := p.Exec(ctx, "run-a", Exec{ReqID: 2, Command: "queued", TimeoutS: 300}, discardingSink{})
+			done <- err
+		}()
+		waitingOnTheGate(t, done)
+
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, ErrAborted) {
+				t.Fatalf("err = %v, want ErrAborted", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("a cancelled Exec never unwound from the gate — it is still queued behind a guest that will not answer")
+		}
+		// Its VM and its budget charge are released, not held until the wedged guest
+		// finishes: the first Exec's VM is the only one that may still be alive.
+		waitFor(t, func() bool { return lc.liveCount() == 1 })
+		waitFor(t, func() bool { return p.Stats().InFlight == 1 })
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		p, lc, clk := testSerializingPool(t)
+		release := holdFirstExec(t, p, lc)
+		defer release()
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := p.Exec(context.Background(), "run-a", Exec{ReqID: 2, Command: "queued", TimeoutS: 5}, discardingSink{})
+			done <- err
+		}()
+		waitingOnTheGate(t, done)
+
+		clk.Advance(6 * time.Second)
+		select {
+		case err := <-done:
+			// Not ErrAborted: the timer cancels runCtx, so classify must report the
+			// timeout it is, or the worker emits a terminal signal frame where the wire
+			// contract wants ExecError{"timeout:<n>"}.
+			if !errors.Is(err, ErrTimeout) {
+				t.Fatalf("err = %v, want ErrTimeout", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("a timed-out Exec never unwound from the gate")
+		}
+		waitFor(t, func() bool { return lc.liveCount() == 1 })
+		waitFor(t, func() bool { return p.Stats().InFlight == 1 })
+	})
 }
 
 // TestExecDoesNotSerializeAcrossDifferentKeys proves the gate above is scoped to
