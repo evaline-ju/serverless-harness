@@ -117,6 +117,17 @@ SNAPSHOT_PARENT="${SH_SNAPSHOT_DIR:?set SH_SNAPSHOT_DIR - the same env var name 
 # directory too high. One variable, one meaning, in both drivers and the unit.
 SNAPSHOT_IMAGE="${SH_SNAPSHOT_IMAGE:-default}"
 SNAPSHOT_DIR="$SNAPSHOT_PARENT/$SNAPSHOT_IMAGE"
+# Defined HERE, above the first caller, not further down with the other helpers. The
+# snapshot guard below is the first thing in this script that calls die, and it runs at load
+# time -- so with the definition further down, bash printed "die: command not found" and,
+# because this script sets -uo pipefail but NOT -e, CARRIED ON. Verified: a bogus
+# SH_SNAPSHOT_DIR produced exactly that line and then continued into preflight. On a host
+# with /dev/kvm it would have gone on to run the whole rung-1 container baseline (200x7 Execs
+# through a real relay) before finally failing at rung 2 on a vmpoolctl snapshot error --
+# the entire baseline thrown away on a config typo this one line exists to catch instantly.
+die() { echo "e10: $*" >&2; exit 1; }
+log() { echo "e10: $*" >&2; }
+
 [ -f "$SNAPSHOT_DIR/manifest.json" ] ||
   die "no manifest.json under $SNAPSHOT_DIR - SH_SNAPSHOT_DIR is the PARENT of the golden snapshot and SH_SNAPSHOT_IMAGE names it (currently '$SNAPSHOT_IMAGE'). A golden snapshot built by build-snapshot.sh has manifest.json, vmstate, memfile, kernel and rootfs in it."
 WORKSPACE_ROOT="${SH_WORKSPACE_ROOT:?set SH_WORKSPACE_ROOT - the same env var name microvm-worker requires, see cmd/microvm-worker/main.go}"
@@ -171,8 +182,6 @@ wants_rung() { case " $RUNGS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 # has never actually pulled would be a guess, not a pin.
 RUNG1_REDIS_IMAGE="${SH_E10_REDIS_IMAGE:-redis:7}"
 
-die() { echo "e10: $*" >&2; exit 1; }
-log() { echo "e10: $*" >&2; }
 
 # ---------------------------------------------------------------------------
 # Teardown, armed BEFORE anything is started (review 4001908613).
@@ -365,8 +374,13 @@ start_rung1_stack() {
   # connect over 127.0.0.1. `--save ''` additionally disables RDB snapshots, so the
   # container never writes a dump file at all.
   log "rung1: starting redis on 127.0.0.1:$RUNG1_REDIS_PORT (loopback only)"
+  # || die, matching e11's own redis start. Without it a failed pull, a name collision or a
+  # stopped daemon left redis absent, the relay started anyway, and the failure surfaced 20
+  # tolerated warmup Execs later as "Exec #21 failed" -- pointing at the grpcurl log rather
+  # than at docker.
   docker run --rm -d -p "127.0.0.1:${RUNG1_REDIS_PORT}:6379" --name "sh-e10-redis-$$" \
-    "$RUNG1_REDIS_IMAGE" --save '' >/dev/null
+    "$RUNG1_REDIS_IMAGE" --save '' >/dev/null ||
+    die "could not start rung 1's redis on 127.0.0.1:$RUNG1_REDIS_PORT - the relay has nowhere to publish its presence record, so every Exec in the container baseline would fail for a reason that has nothing to do with the baseline"
 
   log "rung1: starting the relay on :$RUNG1_RELAY_PORT"
   (
@@ -774,8 +788,14 @@ print(d.get('cpu_child_us',0))
     echo
     echo "PARTIAL RUN - no section 7.2 verdict"
     echo "  rungs run:              $RUNGS"
-    echo "  warm hot path p50:      ${warm_ms}ms   (rung 2, parked)"
-    echo "  replenishment CPU p50:  ${repl_ms}ms   (rung 3, pinned)"
+    # warm_us/repl_us, NOT warm_ms/repl_ms: those two are declared unset at the top of
+    # main and only assigned BELOW this branch, so reading them here was an unbound-variable
+    # error under `set -u` -- this summary would have died instead of printing, on the exact
+    # path the runbook recommends when a host lacks grpcurl/docker/pnpm
+    # (SH_E10_RUNGS='2 3 4'). Converted inline rather than by hoisting the assignments,
+    # which would have to move above the rung-1 readback they depend on.
+    echo "  warm hot path p50:      $(awk -v u="$warm_us" 'BEGIN{printf "%.2f", u/1000.0}')ms   (rung 2, parked)"
+    echo "  replenishment CPU p50:  $(awk -v u="$repl_us" 'BEGIN{printf "%.2f", u/1000.0}')ms   (rung 3, pinned)"
     echo "  container baseline:     NOT MEASURED - rung 1 was not selected"
     echo "  substrate:              $SUBSTRATE"
     echo

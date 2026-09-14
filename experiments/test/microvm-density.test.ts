@@ -77,6 +77,57 @@ describe('E11 ladder analysis', () => {
     ).toThrow(/lease/i);
   });
 
+  it('refuses to score prediction 3 when the cold/warm classifier cannot discriminate', () => {
+    // The real microVM ladder from the validation rig. coldAcquireRate is a LATENCY proxy:
+    // an Exec counts as cold at or above coldLatencyThresholdMs. Here the threshold is the
+    // 50ms default while the arm's own p95 is 236-266ms (resume alone is ~80ms), so every
+    // Exec at every rung is classified cold no matter what the pool did -- the metric is
+    // reporting which arm it is on. Scored naively this reads 'falsified', which would put
+    // a false verdict against a SEALED prediction in the readout.
+    const degenerate = analyzeLadder([
+      rung({
+        c: 1,
+        coldAcquireRate: 1.0,
+        p95Ms: 266,
+        coldLatencyThresholdMs: 50,
+        throughput: 2.07,
+      }),
+      rung({
+        c: 2,
+        coldAcquireRate: 0.5,
+        p95Ms: 236,
+        coldLatencyThresholdMs: 50,
+        throughput: 4.21,
+      }),
+    ]);
+    expect(degenerate.predictions[3]).toBe('inconclusive');
+
+    // Same 50ms threshold, but at the container arm's latencies (p95 40-41ms) the
+    // classifier HAS headroom, so scoring must proceed normally -- shown by a ladder whose
+    // shape is the supported one. (The rig's actual container ladder reads 'inconclusive'
+    // for an unrelated and correct reason: its cold rate never rises at all.)
+    const usable = analyzeLadder([
+      rung({ c: 1, coldAcquireRate: 0, p95Ms: 41, coldLatencyThresholdMs: 50 }),
+      rung({ c: 2, coldAcquireRate: 0, p95Ms: 40, coldLatencyThresholdMs: 50 }),
+      rung({ c: 4, coldAcquireRate: 0.7, p95Ms: 45, coldLatencyThresholdMs: 50, throughput: 8 }),
+    ]);
+    expect(usable.predictions[3]).toBe('supported');
+  });
+
+  it('still falsifies prediction 3 when the classifier HAS headroom', () => {
+    // The converse, and the point of the guard's shape: it must refuse only when the
+    // threshold is the explanation, never swallow a real falsification. Here the warm rung
+    // sits well under the threshold, so a high early cold rate is evidence about the pool
+    // rather than about the classifier -- and prediction 3's shape claim is genuinely
+    // contradicted by a gradual rise.
+    const real = analyzeLadder([
+      rung({ c: 1, coldAcquireRate: 0.4, p95Ms: 20, coldLatencyThresholdMs: 200 }),
+      rung({ c: 4, coldAcquireRate: 0.5, p95Ms: 30, coldLatencyThresholdMs: 200 }),
+      rung({ c: 8, coldAcquireRate: 0.6, p95Ms: 40, coldLatencyThresholdMs: 200, throughput: 8 }),
+    ]);
+    expect(real.predictions[3]).toBe('falsified');
+  });
+
   it('scores prediction 3s shape, not just its direction', () => {
     const r = analyzeLadder([
       rung({ c: 1 }),

@@ -61,7 +61,13 @@ func (p *pool) FillStandbys(ctx context.Context, key string, n int) error {
 		rp, _, err := p.runLocked(key)
 		if err != nil {
 			p.mu.Unlock()
-			return err
+			// countRefusal, exactly as acquire does with this same error (pool.go). Without
+			// it a refused fill was reported as a bare failure with nothing saying why:
+			// E10's teardown-bulk record read "failures: 143, refusals: {}" -- the one
+			// field that would have explained the failures was empty. acquire's production
+			// path was always correct; this diagnostic hook was the only site that dropped
+			// the count.
+			return p.countRefusal(err)
 		}
 		dir, id := rp.dir, p.nextIDLocked()
 		rp.warming++

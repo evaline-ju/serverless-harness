@@ -102,6 +102,37 @@ out=$(env SH_SUBSTRATE=nested-test -u SH_SNAPSHOT_DIR -u SH_WORKSPACE_ROOT bash 
 rc=$?
 check "refuses without SH_SNAPSHOT_DIR/SH_WORKSPACE_ROOT" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
 
+echo "== the missing-snapshot guard actually STOPS the run"
+# It did not. die() was defined 53 lines below its first caller, so with a wrong
+# SH_SNAPSHOT_DIR bash printed "die: command not found" and -- because this script sets
+# -uo pipefail but NOT -e -- carried straight on into preflight. On a host with /dev/kvm
+# that means the whole rung-1 container baseline runs before anything fails, which for a
+# one-shot metal session is the baseline thrown away on a config typo. Asserted on
+# BEHAVIOUR (exit status and message), not on the source text, because the source read
+# perfectly fine while being unreachable.
+out=$(env SH_SUBSTRATE=nested-test SH_SNAPSHOT_DIR=/nonexistent/parent \
+  SH_SNAPSHOT_IMAGE=nope SH_WORKSPACE_ROOT=/tmp bash "$SCRIPT" 2>&1)
+rc=$?
+check "a missing manifest.json exits non-zero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+case "$out" in *"no manifest.json under"*) has_msg=yes ;; *) has_msg=no ;; esac
+check "and says which path it looked in" "$has_msg" "yes"
+case "$out" in *"command not found"*) unreachable=yes ;; *) unreachable=no ;; esac
+check "die is defined before its first caller (no 'command not found')" "$unreachable" "no"
+
+echo "== the PARTIAL RUN summary does not read variables that are still unassigned"
+# warm_ms/repl_ms are declared unset at the top of main and assigned only BELOW the
+# partial-run branch, so printing them there was an unbound-variable error under `set -u`:
+# the summary died instead of printing, on exactly the path the runbook recommends for a
+# host without grpcurl/docker/pnpm (SH_E10_RUNGS='2 3 4'). The branch must reference only
+# values that exist where it runs.
+partial_body="$(sed -n '/PARTIAL RUN - no section 7.2 verdict/,/exit 3/p' "$SCRIPT")"
+check "the partial-run branch does not read \$warm_ms" \
+  "$(printf '%s' "$partial_body" | grep -c '\${warm_ms}')" "0"
+check "the partial-run branch does not read \$repl_ms" \
+  "$(printf '%s' "$partial_body" | grep -c '\${repl_ms}')" "0"
+check "it reports the warm term from a value that IS assigned there" \
+  "$([ "$(printf '%s' "$partial_body" | grep -c 'warm_us')" -ge 1 ] && echo yes || echo no)" "yes"
+
 echo "== check_governor: extracted and sourced in isolation (no real /dev/kvm needed)"
 gov_body="$(extract_fn check_governor || true)"
 check "check_governor helper exists" "$([ -n "$gov_body" ] && echo yes || echo no)" "yes"

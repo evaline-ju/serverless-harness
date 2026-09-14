@@ -1019,6 +1019,20 @@ run_density_rung() {
       idle_snapshot="$(host_signals_snapshot 0)" ||
         die "host signal snapshot failed while polling idle standby residency for rung arm=$arm c=$c (see the refusal above)"
       last_count="$(python3 -c "import json,sys; print(json.load(sys.stdin)['processCount'])" <<<"$idle_snapshot")"
+      # BREAK when the standbys are actually gone. Without this the loop always ran its full
+      # budget, so reclaim_converge_s below was the CONSTANT 138 for every microvm rung no
+      # matter when reclamation finished -- written into the record as reclaimConvergenceS as
+      # though it were observed. Spec 7.4 prediction 5 is precisely a claim about how long
+      # that takes, so a constant made it unmeasurable rather than merely imprecise. It also
+      # burned the whole budget per rung (~9 minutes across the default metal ladder) to
+      # learn nothing.
+      #
+      # processCount is the disclosed proxy for standbys (see the header): at this point every
+      # slot has finished, so a count at or below c means nothing is parked beyond the
+      # in-flight set, which is the convergence this is timing.
+      if [ "$last_count" -le "$c" ]; then
+        break
+      fi
     done
     idle_residency="$last_count"
     reclaim_converge_s="$waited"
@@ -1042,6 +1056,7 @@ rec = {
   'throughput': $throughput,
   'p95Ms': $p95,
   'coldAcquireRate': $cold_rate,
+  'coldLatencyThresholdMs': $COLD_LATENCY_MS,
   'pssBytes': $pss_bytes,
   'memAvailableBytes': $mem_bytes,
   'hostCpuFraction': $cpu_frac,

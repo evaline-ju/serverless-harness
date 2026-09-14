@@ -33,6 +33,14 @@ export interface RungSample {
   p95Ms: number;
   /** Fraction of acquires this rung that had to cold-replenish rather than pop a warm standby. */
   coldAcquireRate: number;
+  /**
+   * The latency threshold (ms) the driver used to CLASSIFY an acquire as cold. Optional
+   * because older records predate the field. It is needed to tell a real result from a
+   * degenerate one: coldAcquireRate is a latency proxy, so a threshold below what a WARM
+   * acquire costs on this arm classifies every Exec as cold and the metric then measures
+   * the threshold rather than the pool. See scoreColdAcquireShape.
+   */
+  coldLatencyThresholdMs?: number;
   /** Sigma PSS (bytes) across VMM + virtiofsd, from /proc/<pid>/smaps_rollup. Never RSS. */
   pssBytes: number;
   /** Host MemAvailable (bytes) sampled at this rung. */
@@ -190,6 +198,25 @@ function scorePrediction1(baseline: RungSample, rest: RungSample[]): Verdict {
  */
 function scoreColdAcquireShape(sortedByC: RungSample[]): Verdict {
   if (sortedByC.length < 2) return 'inconclusive';
+
+  // Refuse to score when the cold/warm CLASSIFIER cannot discriminate on this arm.
+  // coldAcquireRate is a latency proxy (an Exec counts as cold at or above
+  // coldLatencyThresholdMs), so the threshold has to sit between a warm acquire's latency
+  // and a cold one. The lowest-c rung is the warm case by construction -- one active run
+  // against a full standby pool -- so if even ITS p95 is at or above the threshold, then
+  // every Exec at every rung is classified cold no matter what the pool did, and a
+  // "falsified" verdict would be a statement about the threshold.
+  //
+  // Measured on the validation rig: the microVM arm ran p95 236-266ms against a 50ms
+  // default (resume alone is ~80ms), giving coldAcquireRate 1.0 at c=1 and a spurious
+  // 'falsified' on sealed prediction 3; the container arm ran p95 40-41ms under the same
+  // threshold and reported 0.0. The metric was reporting which arm it was on.
+  const lowest = sortedByC[0];
+  const threshold = lowest.coldLatencyThresholdMs;
+  if (threshold !== undefined && lowest.p95Ms >= threshold) {
+    return 'inconclusive';
+  }
+
   const early = sortedByC.slice(0, -1);
   const last = sortedByC[sortedByC.length - 1];
   const earlyAllNearZero = early.every((r) => r.coldAcquireRate <= NEAR_ZERO_COLD_ACQUIRE);
