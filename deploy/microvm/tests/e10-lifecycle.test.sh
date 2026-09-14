@@ -71,6 +71,25 @@ if command -v shellcheck >/dev/null; then
   fi
 fi
 
+# SC2154 (a variable referenced but never assigned) is an OPTIONAL shellcheck check, off by
+# default at every severity -- so `shellcheck -S warning` passes a driver that references a
+# variable nothing defines, and `bash -n` passes it too. Under these drivers' own
+# `set -uo pipefail` that is a HARD RUNTIME FAILURE on the first line that reads it.
+#
+# This assertion exists because exactly that shipped: a fix to the grpcurl invocation
+# introduced $PROTO_IMPORT_PATH and $PROTO_REL_PATH into BOTH drivers but defined them in
+# only ONE, and nothing caught it -- not bash -n, not shellcheck at warning, not this suite,
+# because the affected code path (rung 1 / the container arm) has never executed. It would
+# have died on the metal box with "PROTO_IMPORT_PATH: unbound variable".
+if command -v shellcheck >/dev/null; then
+  if shellcheck -o check-unassigned-uppercase -S warning "$SCRIPT" >/tmp/e10-sc2154.out 2>&1; then
+    check "no uppercase variable is referenced but never assigned (SC2154)" "clean" "clean"
+  else
+    check "no uppercase variable is referenced but never assigned (SC2154)" \
+      "$(grep -c SC2154 /tmp/e10-sc2154.out) finding(s): $(grep SC2154 /tmp/e10-sc2154.out | head -3 | tr '\n' ' ')" "clean"
+  fi
+fi
+
 echo "== it refuses to run without SH_SUBSTRATE"
 out=$(env -u SH_SUBSTRATE SH_SNAPSHOT_DIR=/tmp SH_WORKSPACE_ROOT=/tmp bash "$SCRIPT" 2>&1)
 rc=$?

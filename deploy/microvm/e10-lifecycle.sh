@@ -129,6 +129,20 @@ read -r -a ARMS <<<"${SH_E10_ARMS:-firecracker}"
 VMPOOLCTL="${VMPOOLCTL:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../remote-worker" 2>/dev/null && pwd)/vmpoolctl}"
 REMOTE_WORKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../remote-worker" 2>/dev/null && pwd)"
 PROTO_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)/proto/sandbox/v1/sandbox.proto"
+# grpcurl refuses an absolute -proto path unless also given at least one -import-path, and
+# fails at proto-parse time before dialling. PROTO_FILE stays for the existence check --
+# "is the file there" is a different question from "how is grpcurl invoked" -- and these two
+# are what the invocation actually uses. Verified on the rig: import path at the proto ROOT
+# with the file named relative to it parses and proceeds to dial.
+PROTO_IMPORT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)/proto"
+PROTO_REL_PATH="sandbox/v1/sandbox.proto"
+
+# Client-side deadline for grpcurl, a margin above the request's own timeout_s:30. Rung 1 is
+# closed-loop and serial so it cannot hit E11's req_id collision, but any wedged Exec would
+# otherwise hang the whole ladder with no deadline of its own -- which is what happened to
+# E11 on the validation rig, for 33 minutes. Same guard, same reason. Verified there that
+# -max-time returns non-zero on an established-stream stall, not just on a dial failure.
+RUNG1_EXEC_MAX_TIME_S="${SH_E10_EXEC_MAX_TIME_S:-45}"
 
 # Rung 1 (container baseline) stack knobs — all overridable so a validation pass can
 # reuse an already-running relay/redis instead of starting fresh ones.
@@ -410,7 +424,7 @@ json_escape() {
 grpc_exec_ms() {
   local cmd="$1" req_id="$2" t0 t1 rc=0
   t0="$(date +%s%N)"
-  grpcurl -plaintext -import-path "$PROTO_IMPORT_PATH" -proto "$PROTO_REL_PATH" \
+  grpcurl -plaintext -max-time "$RUNG1_EXEC_MAX_TIME_S" -import-path "$PROTO_IMPORT_PATH" -proto "$PROTO_REL_PATH" \
     -d "{\"sandbox_id\":\"$RUNG1_SANDBOX_ID\",\"exec\":{\"req_id\":$req_id,\"command\":$(json_escape "$cmd"),\"timeout_s\":30}}" \
     "localhost:${RUNG1_RELAY_PORT}" sandbox.v1.SandboxExec/Exec >/dev/null 2>>"$RESULTS/e10-rung1-grpcurl.log" || rc=$?
   t1="$(date +%s%N)"

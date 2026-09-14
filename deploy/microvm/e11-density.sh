@@ -194,6 +194,16 @@ PROTO_FILE="$REPO_ROOT/proto/sandbox/v1/sandbox.proto"
 # The pair below is the form verified against the real grpcurl on the rig: import path at
 # the proto ROOT, file named relative to it. PROTO_FILE is kept for the existence check,
 # which is about the file being there rather than about how grpcurl is invoked.
+# Client-side deadlines for grpcurl, a margin above each request's own timeout_s. Without
+# them a wedged Exec hangs the WHOLE ladder rather than failing one rung: an Exec that
+# collided on req_id (see run_density_rung) left grpcurl waiting 33 MINUTES on the
+# validation rig, and the request's own timeout_s never fired because nothing server-side
+# was late -- the response simply went to the other caller. Verified against that exact
+# wedge on the rig: -max-time returns non-zero at the deadline where the call otherwise
+# hung indefinitely, so it covers an established-stream stall and not merely a dial
+# failure.
+EXEC_MAX_TIME_S="${SH_E11_EXEC_MAX_TIME_S:-45}"      # guards timeout_s:30
+CONVERGE_MAX_TIME_S="${SH_E11_CONVERGE_MAX_TIME_S:-360}" # guards timeout_s:300
 PROTO_IMPORT_PATH="$REPO_ROOT/proto"
 PROTO_REL_PATH="sandbox/v1/sandbox.proto"
 
@@ -578,7 +588,7 @@ grpc_exec_record() {
   local t0 t1 ms err_log cause status
   err_log="$(mktemp "$E11_TMPDIR/errlog.XXXXXX")"
   t0="$(date +%s%N)"
-  if grpcurl -plaintext -import-path "$PROTO_IMPORT_PATH" -proto "$PROTO_REL_PATH" \
+  if grpcurl -plaintext -max-time "$EXEC_MAX_TIME_S" -import-path "$PROTO_IMPORT_PATH" -proto "$PROTO_REL_PATH" \
     -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":$req_id,\"command\":$(json_escape "$cmd"),\"timeout_s\":30,\"workspace_key\":$(json_escape "$workspace_key")}}" \
     "localhost:${relay_port}" sandbox.v1.SandboxExec/Exec >/dev/null 2>"$err_log"; then
     status="ok"
@@ -634,13 +644,16 @@ SCRIPT
 # else, and timing the failure would put a small number in convergeMsP50 -- wrong in the
 # "looks cheap" direction. The slot below turns a non-zero status here into a slot failure,
 # and run_density_rung refuses the rung.
+# req_id is a PARAMETER, not the constant 0 it used to be. Every slot's converge used
+# req_id 0 against one shared sandbox_id, so at c>=2 two concurrent converges collided --
+# see run_density_rung's own comment for what that collision does.
 converge_slot() {
-  local relay_port="$1" sandbox_id="$2" workspace_key="$3" run_id="$4"
+  local relay_port="$1" sandbox_id="$2" workspace_key="$3" run_id="$4" req_id="$5"
   local script t0 t1 rc=0
   script="$(build_converge_script "$CONVERGE_REPO_URL" "$CONVERGE_REF" "$run_id")"
   t0="$(date +%s%N)"
-  grpcurl -plaintext -import-path "$PROTO_IMPORT_PATH" -proto "$PROTO_REL_PATH" \
-    -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":0,\"command\":$(json_escape "$script"),\"timeout_s\":300,\"workspace_key\":$(json_escape "$workspace_key")}}" \
+  grpcurl -plaintext -max-time "$CONVERGE_MAX_TIME_S" -import-path "$PROTO_IMPORT_PATH" -proto "$PROTO_REL_PATH" \
+    -d "{\"sandbox_id\":\"$sandbox_id\",\"exec\":{\"req_id\":$req_id,\"command\":$(json_escape "$script"),\"timeout_s\":300,\"workspace_key\":$(json_escape "$workspace_key")}}" \
     "localhost:${relay_port}" sandbox.v1.SandboxExec/Exec >/dev/null 2>>"$RESULTS/e11-converge.log" || rc=$?
   t1="$(date +%s%N)"
   echo $(((t1 - t0) / 1000000))
@@ -837,15 +850,31 @@ run_density_rung() {
         wskey="$run_id" # microvm arm REFUSES an empty workspace_key (proto doc comment)
       fi               # container arm may omit/empty it (today's single shared workspace)
 
+      # A DISJOINT req_id space per slot. Every slot in this rung talks to ONE shared
+      # sandbox_id, and the relay demultiplexes responses BY req_id (spec 3.1: req_id is
+      # "only probabilistically unique across replicas", so uniqueness is the caller's
+      # job). Two concurrent Execs sharing a req_id therefore collide: on the validation
+      # rig one of the pair got the other's chunks -- with no reqId field on them -- and
+      # the loser's stream was never terminated, hanging for 33 minutes until killed. That
+      # is why the ladder could only ever complete its c=1 rung.
+      #
+      # Isolated with a three-arm probe before this fix was written: one Exec alone
+      # succeeded (30ms); two concurrent with the SAME req_id wedged one of them; two
+      # concurrent with DIFFERENT req_ids both succeeded (27ms, 28ms). So the collision is
+      # the cause, and disjoint spaces are the fix.
+      #
+      # Base 1000000 per slot, converge at the base and the Exec mix above it: disjoint for
+      # any ITERS_PER_SLOT below a million, which it always is.
+      local req_base=$((i * 1000000))
       local cms cms_rc=0
-      cms="$(converge_slot "$relay_port" "$sandbox_id" "$wskey" "$run_id")" || cms_rc=$?
+      cms="$(converge_slot "$relay_port" "$sandbox_id" "$wskey" "$run_id" "$req_base")" || cms_rc=$?
       echo "$cms" >>"$converge_file"
       if [ "$cms_rc" -ne 0 ]; then
         echo "e11: slot $i: converge FAILED after ${cms}ms (see $RESULTS/e11-converge.log) - its workspace was never prepared, so its Exec timings would measure something else" >&2
         exit 1
       fi
 
-      local times_file="$slot_dir/slot-$i.times" req=0
+      local times_file="$slot_dir/slot-$i.times" req="$req_base"
       # Create it empty first. The loop guard below reads it with `wc -l <"$times_file"`,
       # and `2>/dev/null` there binds to wc -- NOT to the shell's own redirection, so a
       # missing file printed "No such file or directory" to stderr on every slot's first
@@ -1076,13 +1105,26 @@ open('$out_path', 'w').write(json.dumps(recs, indent=2))
 # one assembled ladder file and prints the report. Informational only -- this
 # script never writes numbers into deploy/microvm/EXPERIMENTS.md itself (task-21
 # scope: step 6 is structure-only, hardware-corrections F1).
+# The import below says '.ts', NOT '.js'. Inside a compiled TypeScript file '.js' is the
+# correct NodeNext specifier and tsx maps it to the .ts source -- but this is a "tsx -e" EVAL
+# string, whose module lives at a synthetic <dir>/[eval] path, and that mapping does not
+# apply there: resolution falls through to the CJS resolver and dies with "Cannot find
+# module ./src/microvm-density.js". Reproduced on the rig (node 22) and on a dev machine
+# (node 25), so it is not environment-specific.
+#
+# It went unnoticed because analyze_slice is deliberately called with "|| log": every ladder
+# ran, the failure was one logged line, and no knee was ever computed -- and the knee is what
+# sealed prediction 3 is ABOUT. Non-fatal was the right choice; silent was not.
+#
+# Keep prose out of the eval string itself: it is a bash double-quoted argument, so
+# backticks in it are command substitution rather than markup.
 analyze_slice() {
   local ladder_path="$1"
   (
     cd "$EXPERIMENTS_DIR" &&
       pnpm exec tsx -e "
         import { readFileSync } from 'node:fs';
-        import { analyzeLadder } from './src/microvm-density.js';
+        import { analyzeLadder } from './src/microvm-density.ts';
         const samples = JSON.parse(readFileSync(process.argv[1], 'utf8'));
         console.log(JSON.stringify(analyzeLadder(samples), null, 2));
       " "$ladder_path"
