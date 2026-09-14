@@ -73,6 +73,20 @@ LimitMEMLOCK=infinity
 # kernel limits that must be raised deliberately rather than discovered at 500 VMs.
 LimitNOFILE=1048576
 
+# The VMM binaries this tier cannot run without, stated explicitly rather than left to
+# the code defaults (/usr/bin/jailer, /usr/bin/firecracker). Verified on hardware: with
+# these unset the worker starts, sweeps correctly, and then dies in its startup probe with
+# "start jailer: fork/exec /usr/bin/jailer: no such file or directory", crash-looping every
+# 5s. Firecracker's own release tarball and this unit's own ExecStart both live under
+# /usr/local/bin, so /usr/bin was an unstated assumption the unit disagreed with itself
+# about. Override per-host if your packaging installs them elsewhere.
+Environment=SH_JAILER_BIN=/usr/local/bin/jailer
+Environment=SH_FIRECRACKER_BIN=/usr/local/bin/firecracker
+# The golden snapshot is SH_SNAPSHOT_DIR/SH_SNAPSHOT_IMAGE (main.go joins the two), so the
+# deployed snapshot lives at /srv/snapshots/default unless this is changed. Stated rather
+# than relying on the code default, because a missing image directory presents as a
+# device-check failure naming a path nobody configured.
+Environment=SH_SNAPSHOT_IMAGE=default
 Environment=SH_VMM=firecracker
 Environment=SH_SNAPSHOT_DIR=/srv/snapshots
 Environment=SH_WORKSPACE_ROOT=/srv/workspaces
