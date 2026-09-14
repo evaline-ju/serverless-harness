@@ -43,7 +43,8 @@ import (
 // mechanism (--sandbox=chroot|namespace, used below) so the narrower true gap is
 // just the VMM process. Spec §5.3 expects an equivalent for it; Task 17 owns
 // supplying the per-arm confinement/cgroup mechanism split, not this task. This is
-// verified and known, not a guess — see task-16-hardware-corrections.md C5.
+// verified and known, not a guess: it was confirmed against a real cloud-hypervisor
+// v53.0 restore on the rig rather than inferred from documentation.
 //
 // TASK 17'S DISPOSITION OF C5 (D3/D4, hardware-corrections): D3 — the cgroup half —
 // IS closed below: chvSystemdRunScopeArgv wraps the cloud-hypervisor exec in

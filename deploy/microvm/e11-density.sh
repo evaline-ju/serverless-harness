@@ -6,11 +6,11 @@
 # concurrent active runs x D x GuestRAMBytes, so it is a concurrency sweep, not a
 # ladder of isolated terms.
 #
-# SCOPE (task-21-hardware-corrections.md F1): this task builds the INSTRUMENT and
+# SCOPE (pre-run hardware correction F1; a build-time note, not committed): this task builds the INSTRUMENT and
 # runs it, once, on a shared nested rig to validate the mechanism -- not to produce
 # the headline density number. This script is written to be run on that rig by a
 # human operator; it is NOT invoked by any automated test in this repo, and nothing
-# in deploy/microvm/tests/e11-density.test.sh calls main(). See task-21-report.md
+# in deploy/microvm/tests/e11-density.test.sh calls main(). See the scope note in the header
 # for the full disclosure of every proxy/limitation below.
 #
 # Two arms only (hardware-corrections F5): "container" (today's remote-worker, no
@@ -89,7 +89,7 @@
 #   - ReplenishDelay      = 0.2s  (config.go DefaultReplenishDelay, 200ms)
 #   - ReclaimScanInterval = 22.5s (StandbyIdle/4, per spec section 7.3's own framing)
 #
-# Disclosed proxies and limitations (see task-21-report.md for the full writeup;
+# Disclosed proxies and limitations (the full write-up is a build-time note, not committed;
 # summarized here at the point each is produced, not hidden in a report nobody
 # reads before running this):
 #   - leaseSaturations is ALWAYS 0. This driver issues Execs directly against the
@@ -112,7 +112,7 @@
 #     itself at a fixed, declared rate rather than the model stub's calibrated
 #     tool-call rate -- another reason drivingModel is recorded, not assumed.
 #
-# Usage (never run by this task -- see task-21-report.md):
+# Usage (never run by this task -- the instrument is built, not executed):
 #   SH_SUBSTRATE=nested-m8i \
 #   SH_SNAPSHOT_DIR=/srv/snapshots SH_WORKSPACE_ROOT=/srv/workspaces \
 #   SH_MAX_COMMITTED_MB=8192 \

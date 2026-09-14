@@ -47,7 +47,7 @@
 #                                 (main.go's Limits field); this script does not
 #                                 duplicate that, only surfaces it in the summary.
 #
-# Hardware-corrections applied (task-20-hardware-corrections.md), because the brief
+# Hardware-corrections applied (pre-run hardware corrections; a build-time note, not committed), because the brief
 # alone is not the whole spec here:
 #   - E8:  ARMS defaults to firecracker ONLY. ch-remote restore hangs and
 #          cloud-hypervisor dies silently during device restoration on this rig's
@@ -68,7 +68,7 @@
 # vmpoolctl's --stdin flag drives end to end (see main_test.go's
 # TestStdinFlagReachesTheCommand/TestStdinFlagDefaultsToEmpty). This script therefore
 # runs rung 2 once with no --stdin (parked-bash path) and once with --stdin set to a
-# non-empty payload (fresh-child path) — see task-20-report.md for the full writeup.
+# non-empty payload (fresh-child path) — the full write-up is a build-time note, not committed.
 #
 # Usage:
 #   SH_SUBSTRATE=nested-m8i \

@@ -85,7 +85,7 @@ type FirecrackerOptions struct {
 	// does NOT create a new cgroup, so on its own ParentCgroup produces no per-VM
 	// memory.max at all and spec §6's mitigation #3 ("a ballooning command is killed
 	// inside its own cgroup") is unimplemented; this was confirmed directly against
-	// real jailer output (task-17-hardware-corrections.md D1). This value MUST equal
+	// real jailer output, confirmed on the rig rather than inferred. This value MUST equal
 	// vmpool.PerVMBytes(cfg) — the same figure admission control charges per VM — set
 	// by the caller (cmd/microvm-worker/main.go's launcherFor), never a fresh
 	// constant, or the two numbers drift apart (spec §5.3). Only meaningful, and only

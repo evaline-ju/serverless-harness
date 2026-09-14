@@ -5,7 +5,8 @@
 # script needs /dev/kvm, a real relay, real worker binaries and (per task-21
 # hardware-corrections F1/F2) a rig this task is explicitly forbidden from driving
 # a real sweep against -- so what can rot silently here is the CONTRACT: the exact
-# properties task-21-brief.md's Step 4 checklist requires of e11-density.sh,
+# properties the task brief's checklist requires of e11-density.sh (that brief is a
+# build-time note, not committed; the properties themselves are asserted below),
 # verbatim: "asserts: smaps_rollup is used and RSS is not; the ladder includes
 # c=1; converge is timed separately; section 4.5's shape is recorded; the four
 # idle settings are recorded and not swept; the driver is open-loop or declares

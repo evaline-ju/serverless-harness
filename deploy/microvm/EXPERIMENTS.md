@@ -663,7 +663,7 @@ brief for the invocation.
 **Status: instrument built and locally verified; not yet run.** Per the
 project owner's resequencing of this endgame — build everything, then
 validate hypotheses on a virtualized box, then a reviewed PR, then the metal
-run last (task-21-hardware-corrections.md, F1) — this task built the sweep
+run last (pre-run hardware correction F1; a build-time note, not committed) — this task built the sweep
 driver and its cluster-free test but did **not** invoke the driver against
 any hardware, nested or metal. Every number and verdict below is a **named
 blank**, not a placeholder value. No `ssh`, no density sweep, and no
@@ -772,7 +772,7 @@ No blank above is filled. Filling it is the metal run's job, not this task's.
   records which of the three named shapes (`two-mounts`, `shared-clone`,
   `accept-cold-fetch`) a run used (`repoCacheShape` in each rung's JSON
   record); it does not choose one, and no ADR amendment was written. See
-  task-21-hardware-corrections.md F7.
+  pre-run hardware correction F7 (a build-time note, not committed).
 - **Model-stub dependency gap.** The driver can take an external
   `SH_E11_MODEL_STUB_CMD` to drive the relay's `Exec` mix, but absent one it
   drives the mix itself directly — a disclosed stand-in for P6 §5.4's model
@@ -787,5 +787,5 @@ No blank above is filled. Filling it is the metal run's job, not this task's.
   refusal; `analyzeLadder`'s guard against `leaseSaturations > 0` is
   exercised only by the unit tests, never by this driver's own output.
 - **`MV_LIVE=1` was not attempted.** Out of scope for this task
-  (task-21-hardware-corrections.md F8); no placeholder resembling a live run
+  (pre-run hardware correction F8; a build-time note, not committed); no placeholder resembling a live run
   was added.
