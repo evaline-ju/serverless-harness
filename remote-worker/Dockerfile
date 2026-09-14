@@ -26,8 +26,22 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/remote-worker ./cm
 # bumps for the same reason .hadolint.yaml already ignores DL3018 for Alpine.
 # hadolint ignore=DL3007
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+# git and python3 are here because cmd/worker/main.go's `probed` list advertises
+#   bash, rg, base64, file, python3, git
+# as this worker's Hello.capabilities, and its comment says "the pool will eventually match on
+# these, so they must be true". Three of the six were not: on a real VM the leaf reported
+# `caps=[bash base64 file]`, so it advertised a set it could not honour.
+#
+# It also matters for measurement. Spec §2.3's duty bases were derived from workloads whose git
+# operations cost ~470ms; without git in the sandbox, an E8 tool call can only be a ~0ms no-op, so
+# the hands tier is exercised structurally but carries no load and the measured duty cycle describes
+# a cheaper workload than the basis it is compared against.
+#
+# `rg` is deliberately still absent: ripgrep is not in the UBI 9 repositories, so honouring it means
+# either EPEL or vendoring a binary into a demo image. Left as a known gap rather than a silent one —
+# whoever needs capability-matched scheduling should either add it or shorten `probed`.
 # hadolint ignore=DL3041
-RUN microdnf install -y --nodocs bash coreutils-single findutils file \
+RUN microdnf install -y --nodocs bash coreutils-single findutils file git python3 \
     && microdnf clean all
 COPY --from=build /out/remote-worker /usr/local/bin/remote-worker
 # The harness execs every tool call from its sandbox working directory, which defaults to

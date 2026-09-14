@@ -10,8 +10,12 @@
 # bumps for the same reason .hadolint.yaml already ignores DL3018 for Alpine.
 # hadolint ignore=DL3007
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+# git and python3: see the same block in ./Dockerfile. cmd/worker/main.go's `probed` list advertises
+# them as this worker's capabilities and they were not present, and a sandbox without git cannot run
+# a tool call resembling the workloads spec §2.3's duty bases were measured from. `rg` remains absent
+# (not in the UBI 9 repositories) — a known gap, not a silent one.
 # hadolint ignore=DL3041
-RUN microdnf install -y --nodocs bash coreutils-single findutils file \
+RUN microdnf install -y --nodocs bash coreutils-single findutils file git python3 \
     && microdnf clean all
 COPY remote-worker /usr/local/bin/remote-worker
 # See the same block in ./Dockerfile: the harness execs tool calls from /workspace (the default
