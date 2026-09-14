@@ -249,6 +249,50 @@ sudo PATH=… <the same SH_* exports> bash deploy/microvm/e10-lifecycle.sh 2>&1 
 sudo PATH=… <the same SH_* exports> bash deploy/microvm/e11-density.sh  2>&1 | tee /tmp/e11-metal.log
 ```
 
+### Run E10 FIRST, then set E11's cold-latency threshold from its numbers
+
+E11 reports `coldAcquireRate` — the fraction of acquires that had to cold-replenish instead of
+popping a warm standby — and sealed **prediction 3** is a claim about the shape of that curve.
+There is no pool introspection endpoint, so the figure is a **latency proxy**: an Exec counts as
+cold at or above `SH_E11_COLD_LATENCY_MS`, default **50**.
+
+That default cannot serve both arms. On the validation rig the container arm ran p95 40–41ms —
+under the threshold, so nothing was ever classified cold — while the microVM arm ran p95
+236–266ms, so **every** Exec was classified cold regardless of what the pool did
+(`coldAcquireRate` 1.0 at the least-loaded rung). The metric was reporting which arm it was on,
+and prediction 3 came back "falsified" on that basis alone.
+
+The threshold only needs to serve the **microVM** arm: the container arm has no standbys at all
+(`standbysResident: 0`), so "cold acquire" has no referent there. And E10 measures exactly what
+E11 has to assume — so run E10 first and read two numbers out of it:
+
+```bash
+# warm Exec latency on this host — rung 2, parked variant
+python3 -c "import json;d=json.load(open('deploy/microvm/.results/e10-rung2-firecracker-$SH_SUBSTRATE-parked.json'));print(d['p50_total_us']/1000.0)"
+# the restore a cold acquire additionally pays — rung 3, pinned variant
+python3 -c "import json;d=json.load(open('deploy/microvm/.results/e10-rung3-firecracker-$SH_SUBSTRATE-pinned.json'));print(d['p50_acquire_us']/1000.0)"
+```
+
+A cold acquire costs about `warm + restore`, so put the threshold at the midpoint:
+
+```
+SH_E11_COLD_LATENCY_MS ≈ warm_ms + (restore_ms / 2)
+```
+
+Worked example from the nested rig: warm ≈ 236ms, restore ≈ 100ms → cold ≈ 336ms → threshold
+≈ **285**. Recompute on metal; those numbers will be smaller and the midpoint will move.
+
+```bash
+sudo PATH=… <the same SH_* exports> SH_E11_COLD_LATENCY_MS=<computed> \
+  bash deploy/microvm/e11-density.sh 2>&1 | tee /tmp/e11-metal.log
+```
+
+**If you skip this**, the analyzer detects that the classifier has no headroom — the lowest-c
+rung is the warm case by construction, so a threshold at or below its p95 cannot discriminate —
+and reports prediction 3 as `inconclusive` rather than emitting a verdict about the threshold.
+That is the safe outcome, not a good one: it costs the prediction. Nothing else in E11 depends
+on this value.
+
 **Run nothing else on the host.** These are latency and density measurements; a competing
 workload does not degrade them, it makes them wrong in a way that looks fine.
 

@@ -696,6 +696,57 @@ wait_for_relay_port() {
   die "$what never started listening on 127.0.0.1:$port within 30s - its log is above and in $logfile. Every Exec after this point would have measured a client-side dial failure, not a sandbox."
 }
 
+# wait_for_worker_attached blocks until a worker has ATTACHED to the relay, and dies naming
+# its log if it never does. Both drivers previously did `sleep 2` and hoped.
+#
+# The window is not trivial startup. microvm-worker attaches only AFTER PinMemoryFile (an
+# mlock whose cost scales with guest RAM), RaiseMemlockLimit, SweepOrphans and pool.Probe --
+# and Probe is a FULL restore/resume/run/destroy of a real VM, ~300ms on the validation rig by
+# E10's own decomposition. Two seconds usually clears it; the margin is thin and it grows on
+# hardware with more guest RAM.
+#
+# The failure it prevents is one-shot fatal: until the attach lands the relay answers
+# "no live worker" INSTANTLY, so E11's converge fails in milliseconds -- and a converge failure
+# aborts the entire sweep, both arms, with no warmup tolerance.
+#
+# Waits on the log line both binaries print (cmd/worker and cmd/microvm-worker). That couples
+# to a string, so the timeout dumps the log: if the wording ever changes this becomes a loud,
+# diagnosable failure instead of the silent mis-blame `sleep 2` produced.
+wait_for_worker_attached() {
+  local logfile="$1" what="$2" deadline=$((SECONDS + 60))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if grep -q 'attached, serving execs' "$logfile" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "----- last 20 lines of $logfile -----" >&2
+  tail -n 20 "$logfile" >&2 2>/dev/null || echo "(no log at $logfile)" >&2
+  echo "-------------------------------------" >&2
+  die "$what never attached to the relay within 60s - its log is above and in $logfile. Until a worker attaches the relay answers 'no live worker' immediately, so every Exec after this point would have measured that refusal rather than a sandbox."
+}
+
+# assert_relay_alive is a LIVENESS check, distinct from wait_for_relay_port's readiness check
+# -- and the distinction is not academic. On the validation rig a relay bound :8444, a worker
+# attached to it, and then the relay DIED on an unhandled Redis 'error' event
+# (SocketClosedUnexpectedlyError). Nothing noticed: the port check had already passed, so the
+# next Exec burned its full client deadline (360s) before the sweep aborted, and the cause sat
+# unread in the relay's own log.
+#
+# Unlike the supervised deployments, these drivers start the relay themselves and nothing
+# restarts it, so a Redis blip mid-run is a lost run rather than a blip. Checking between rungs
+# turns six silent minutes into an immediate failure that names the log.
+assert_relay_alive() {
+  local port="$1" logfile="$2" what="$3"
+  if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    return 0
+  fi
+  echo "----- last 20 lines of $logfile -----" >&2
+  tail -n 20 "$logfile" >&2 2>/dev/null || echo "(no log at $logfile)" >&2
+  echo "-------------------------------------" >&2
+  die "$what is no longer listening on 127.0.0.1:$port - it started and then DIED mid-run; its log is above and in $logfile. Every Exec from here would time out against a dead relay rather than measure anything."
+}
+
 shuffle_e11_arms() {
   printf 'container\nmicrovm\n' | awk -v seed="$(($$ + $(date +%s)))" 'BEGIN{srand(seed)} {print rand()"\t"$0}' | sort -n | cut -f2-
 }
@@ -748,7 +799,7 @@ start_container_stack() {
     SANDBOX_TOKEN="$E11_RELAY_TOKEN" \
     "$E11_WORKER_BIN" >"$RESULTS/e11-container-worker.log" 2>&1 &
   E11_WORKER_PID="$!"
-  sleep 2
+  wait_for_worker_attached "$RESULTS/e11-container-worker.log" "the container arm's worker"
 }
 
 stop_container_stack() {
@@ -802,7 +853,7 @@ start_microvm_stack() {
     SANDBOX_TOKEN="$E11_RELAY_TOKEN" \
     "$E11_WORKER_BIN" >"$RESULTS/e11-microvm-worker-d${d}-ram${ram_mb}.log" 2>&1 &
   E11_WORKER_PID="$!"
-  sleep 2
+  wait_for_worker_attached "$RESULTS/e11-microvm-worker-d${d}-ram${ram_mb}.log" "the microvm arm's worker (D=$d guest=${ram_mb}MiB)"
 }
 
 stop_microvm_stack() {
@@ -830,6 +881,12 @@ stop_microvm_stack() {
 run_density_rung() {
   local arm="$1" d="$2" ram_mb="$3" c="$4" sandbox_id="$5" relay_port="$6" out_json_path="$7"
   log "rung: arm=$arm D=$d guest=${ram_mb}MiB c=$c"
+
+  # Before issuing a single Exec: is the relay STILL there? See assert_relay_alive for the
+  # run this cost. The log name differs per arm, matching where each arm's relay writes.
+  local relay_log="$RESULTS/e11-container-relay.log"
+  [ "$arm" = "microvm" ] && relay_log="$RESULTS/e11-microvm-relay-d${d}-ram${ram_mb}.log"
+  assert_relay_alive "$relay_port" "$relay_log" "the $arm arm's sandbox-relay"
 
   # Every temp path is under $E11_TMPDIR, named for the rung rather than mktemp-random, so
   # the EXIT trap reclaims all of them however this rung ends (review 4001908613).
