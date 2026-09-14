@@ -240,6 +240,54 @@ func TestGateNoVMReuse(t *testing.T) {
 //
 // Duplicated guest ASLR is NOT what this checks and is not a boundary we rely on: the
 // attacker already executes arbitrary code inside the guest, and our boundary is KVM.
+// credentialPatterns are the byte sequences a golden memfile must not contain. Short
+// prefixes rather than full credential shapes: the point is to catch a token that was
+// alive in the guest when the snapshot was taken, and the prefix is the part that is
+// stable across whatever the token's body happens to be.
+var credentialPatterns = []string{"AKIA", "ghp_", "-----BEGIN"}
+
+// scanForCredentials returns every pattern present in b, including the extra values the
+// caller wants treated as credentials (the live SANDBOX_TOKEN, on a rig that exports it).
+//
+// Split out of the gate below so the DETECTOR can be tested where the gate cannot run:
+// TestTheSnapshotCredentialScannerFiresOnEveryPattern plants each pattern and asserts it
+// is found. gates_privilege_test.go states the rule this earns — "an absence-assertion
+// that has never been shown to be capable of failing is asserting nothing" — and the
+// memfile scan had no equivalent, on a rig or off one.
+func scanForCredentials(b []byte, extra ...string) []string {
+	var found []string
+	for _, pattern := range append(append([]string{}, credentialPatterns...), extra...) {
+		if pattern != "" && bytes.Contains(b, []byte(pattern)) {
+			found = append(found, pattern)
+		}
+	}
+	return found
+}
+
+// TestTheSnapshotCredentialScannerFiresOnEveryPattern is the detector test for the gate
+// below. It needs no KVM and no snapshot: it plants each pattern in a synthetic buffer,
+// so the gate's silence on a real memfile means "looked and found nothing" rather than
+// "cannot look".
+func TestTheSnapshotCredentialScannerFiresOnEveryPattern(t *testing.T) {
+	for _, pattern := range credentialPatterns {
+		// Built from the pattern constant itself rather than spelled out again, so this
+		// test cannot drift from the list it is checking.
+		haystack := []byte("padding\x00" + pattern + "\x00more padding")
+		if found := scanForCredentials(haystack); len(found) != 1 || found[0] != pattern {
+			t.Fatalf("scanForCredentials found %v in a buffer containing %q, want exactly [%q]", found, pattern, pattern)
+		}
+	}
+	// The live-token half, which on a rig is supplied by the environment. Deliberately a
+	// low-entropy placeholder: what is under test is the scan, not the value.
+	const planted = "placeholder-value-for-the-scanner"
+	if found := scanForCredentials([]byte("noise"+planted+"noise"), planted); len(found) != 1 || found[0] != planted {
+		t.Fatalf("scanForCredentials found %v for a planted extra value, want exactly [%q]", found, planted)
+	}
+	if found := scanForCredentials([]byte("nothing to see here"), planted); len(found) != 0 {
+		t.Fatalf("scanForCredentials found %v in a clean buffer, want none", found)
+	}
+}
+
 func TestGateSnapshotHoldsNoSecrets(t *testing.T) {
 	requireKVM(t)
 
@@ -253,13 +301,23 @@ func TestGateSnapshotHoldsNoSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading golden memfile %s: %v", memfile, err)
 	}
-	for _, pattern := range []string{"AKIA", "ghp_", "-----BEGIN"} {
-		if bytes.Contains(b, []byte(pattern)) {
-			t.Errorf("golden memfile contains credential pattern %q", pattern)
-		}
+	// SANDBOX_TOKEN belongs to the systemd unit, not to a `go test` process, so it is
+	// present here only if the rig's gate runner forwards it — which
+	// .github/workflows/microvm-kvm-gates.yml does. When it is absent this half of the
+	// assertion is NOT CHECKED, and saying so out loud is the difference between a gate
+	// that passed and a gate that had nothing to compare against.
+	live := os.Getenv("SANDBOX_TOKEN")
+	if live == "" {
+		t.Log("SANDBOX_TOKEN is unset: the live-token half of this gate is NOT CHECKED " +
+			"(the pattern scan below still ran; the scanner itself is pinned by " +
+			"TestTheSnapshotCredentialScannerFiresOnEveryPattern)")
 	}
-	if live := os.Getenv("SANDBOX_TOKEN"); live != "" && bytes.Contains(b, []byte(live)) {
-		t.Error("golden memfile contains the live SANDBOX_TOKEN value")
+	for _, found := range scanForCredentials(b, live) {
+		if found == live {
+			t.Error("golden memfile contains the live SANDBOX_TOKEN value")
+			continue
+		}
+		t.Errorf("golden memfile contains credential pattern %q", found)
 	}
 
 	lc := launcherForArm(t)

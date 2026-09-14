@@ -1,0 +1,105 @@
+name: microVM KVM gates (manual)
+
+# THE ONLY THING THAT RUNS SPEC §8'S KVM-GATED GATES, and it is manual because of the
+# hardware rather than by preference.
+#
+# Six of those gates -- write durability, cross-run bleed, snapshot secrets, leak-free
+# teardown, the guest clock and output-cap-at-source -- are the isolation argument for the
+# microVM tier, and every one of them needs two things a standard GitHub runner does not
+# have: /dev/kvm, and a golden snapshot built by deploy/microvm/build-snapshot.sh. The
+# snapshot cannot be a cached CI artefact either: spec §2.4 requires restore on IDENTICAL
+# hardware, so it is built on the instance generation that will run it.
+#
+# So they cannot simply be switched on, and the honest arrangement is this file plus two
+# things that DO run everywhere: ci.yml's `microvm-gates` job (the hardware-free gates,
+# with the skipped ones annotated), and
+# remote-worker/internal/vmpool/gates_inventory_test.go, which fails if that split ever
+# drifts from the code. Nothing here should leave a reader thinking these gates gate a
+# merge -- they do not. What this file provides is a reproducible command, an explicit
+# statement of the prerequisites, and a preflight that fails loudly rather than skipping
+# when the runner cannot actually run them.
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label with /dev/kvm and a built golden snapshot (the rig)'
+        required: true
+        default: self-hosted
+      vmm:
+        description: 'Which arm to drive (SH_VMM)'
+        required: true
+        default: firecracker
+        type: choice
+        options:
+          - firecracker
+          - cloud-hypervisor
+      snapshot_dir:
+        description: 'SH_SNAPSHOT_IMAGE_DIR — the golden snapshot from deploy/microvm/build-snapshot.sh'
+        required: true
+        default: /srv/snapshots/swebench-py311
+
+permissions:
+  contents: read
+
+jobs:
+  kvm-gates:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    env:
+      SH_KVM: '1'
+      SH_VMM: ${{ inputs.vmm }}
+      SH_SNAPSHOT_IMAGE_DIR: ${{ inputs.snapshot_dir }}
+      # TestGateSnapshotHoldsNoSecrets' strongest assertion compares the golden memfile
+      # against the LIVE token, which belongs to the systemd unit and not to a `go test`
+      # process -- so without this it silently evaluates to pass. Forwarded here so that
+      # half of the gate is actually checked on the rig; the gate logs "NOT CHECKED" when
+      # it is absent, and the scanner itself is pinned everywhere by
+      # TestTheSnapshotCredentialScannerFiresOnEveryPattern.
+      SANDBOX_TOKEN: ${{ secrets.SANDBOX_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Preflight before setup-go, so a runner that cannot run these gates says so in one
+      # line instead of skipping them and reporting green -- the failure mode this whole
+      # file exists to correct.
+      - name: Preflight the rig
+        run: |
+          set -eu
+          test -e /dev/kvm || {
+            echo "::error title=No /dev/kvm::runner '${{ inputs.runner }}' has no /dev/kvm, so the KVM-gated gates cannot run here"
+            exit 1
+          }
+          test -d "$SH_SNAPSHOT_IMAGE_DIR" || {
+            echo "::error title=No golden snapshot::$SH_SNAPSHOT_IMAGE_DIR is missing; build it with deploy/microvm/build-snapshot.sh"
+            exit 1
+          }
+          ls -l "$SH_SNAPSHOT_IMAGE_DIR"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: remote-worker/go.mod
+
+      - name: Run the KVM-gated spec §8 gates
+        working-directory: remote-worker
+        run: |
+          set -u
+          log="$RUNNER_TEMP/kvm-gates.log"
+          rc=0
+          go test -race -v -run 'TestGate' ./internal/vmpool/ > "$log" 2>&1 || rc=$?
+          passed=$(grep -E '^--- PASS: ' "$log" | awk '{print $3}' | sort -u || true)
+          skipped=$(grep -E '^--- SKIP: ' "$log" | awk '{print $3}' | sort -u || true)
+          {
+            echo "### microVM spec §8 gates on ${{ inputs.runner }} (SH_VMM=$SH_VMM)"
+            echo
+            printf 'Ran:\n```\n%s\n```\n' "${passed:-(none)}"
+            printf 'Skipped:\n```\n%s\n```\n' "${skipped:-(none)}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$skipped" ]; then
+            echo "::warning title=Gates skipped on the rig::$(echo "$skipped" | tr '\n' ' ')-- a skip here is missing evidence, not a pass"
+          fi
+          if [ -z "$passed" ]; then
+            echo "::error title=No gate ran::this job asserted nothing"
+            rc=1
+          fi
+          cat "$log"
+          exit $rc

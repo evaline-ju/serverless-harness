@@ -13,10 +13,18 @@ import (
 // and TestFirecrackerMountsAtAcquireNotAtRestore below are written against the real
 // FirecrackerOptions/VM contract but can only be exercised on a rig with /dev/kvm and a
 // built golden snapshot — see the task-15 report.
+// A skip here is a HOLE IN THE EVIDENCE, not a pass, and the skip message says so
+// because a reader scanning output has nothing else to go on. Which of spec §8's gates
+// this affects, and what does run without a rig, is spelled out in
+// gates_inventory_test.go — a test that fails if that inventory ever drifts away from
+// the code.
 func requireKVM(t *testing.T) {
 	t.Helper()
 	if os.Getenv("SH_KVM") != "1" {
-		t.Skip("needs /dev/kvm and a built golden snapshot; set SH_KVM=1 on the rig")
+		t.Skip("NOT RUN (no signal, not a pass): needs /dev/kvm and a golden snapshot built by " +
+			"deploy/microvm/build-snapshot.sh. Standard GitHub runners have neither, so this gate " +
+			"is enforced only on the rig — see gates_inventory_test.go and " +
+			".github/workflows/microvm-kvm-gates.yml; set SH_KVM=1 there")
 	}
 	if _, err := os.Stat("/dev/kvm"); err != nil {
 		t.Fatalf("SH_KVM=1 but /dev/kvm is unusable: %v", err)
