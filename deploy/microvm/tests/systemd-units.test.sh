@@ -112,6 +112,39 @@ echo "== fail the unit at start, never fall back to the host (spec §6)"
 check "AssertPathExists=/dev/kvm is set" \
   "$([ "$(grep -cF 'AssertPathExists=/dev/kvm' "$SERVICE")" -ge 1 ] && echo yes || echo no)" "yes"
 
+echo "== a permanently-broken host reaches 'failed' instead of crash-looping forever"
+# Restart=on-failure + RestartSec=5s with systemd's default limiter
+# (DefaultStartLimitBurst=5 over DefaultStartLimitIntervalSec=10s) never trips: at one
+# start per 5s, at most 2-3 starts land in any 10s window, so the unit sits in
+# activating/auto-restart indefinitely and `systemctl is-failed` reports success while
+# the host is dead. This branch shipped two crash-loops of exactly that shape.
+#
+# The keys must be in [Unit]: systemd 255 reports "Unknown key name
+# 'StartLimitIntervalSec' in section 'Service'" and ignores them there -- a silent no-op
+# that looks exactly like a fix.
+unit_section="$(sed -n '/^\[Unit\]/,/^\[/p' "$SERVICE")"
+start_limit_interval="$(printf '%s\n' "$unit_section" | grep -oE '^StartLimitIntervalSec=[0-9]+' | head -n1 | cut -d= -f2)"
+start_limit_burst="$(printf '%s\n' "$unit_section" | grep -oE '^StartLimitBurst=[0-9]+' | head -n1 | cut -d= -f2)"
+restart_sec="$(grep -oE '^RestartSec=[0-9]+' "$SERVICE" | head -n1 | cut -d= -f2)"
+check "StartLimitIntervalSec is set in [Unit] (it is ignored in [Service])" \
+  "$([ -n "$start_limit_interval" ] && echo yes || echo no)" "yes"
+check "StartLimitBurst is set in [Unit]" \
+  "$([ -n "$start_limit_burst" ] && echo yes || echo no)" "yes"
+check "RestartSec is set (the limiter is meaningless without a known restart cadence)" \
+  "$([ -n "$restart_sec" ] && echo yes || echo no)" "yes"
+# The arithmetic is the point: burst restarts at RestartSec apart must FIT inside the
+# interval, or the limiter never trips and the unit crash-loops forever. systemd's own
+# defaults (5 over 10s against RestartSec=5s: 25s > 10s) fail this inequality, which is
+# exactly the state this section is here to prevent returning to.
+limiter_trips=no
+if [ -n "$start_limit_interval" ] && [ -n "$start_limit_burst" ] && [ -n "$restart_sec" ]; then
+  if [ "$((restart_sec * start_limit_burst))" -lt "$start_limit_interval" ]; then
+    limiter_trips=yes
+  fi
+fi
+check "RestartSec x StartLimitBurst fits inside StartLimitIntervalSec, so the limiter actually trips" \
+  "$limiter_trips" "yes"
+
 echo "== kernel limits raised deliberately, not discovered at 500 VMs (spec §7.5)"
 check "LimitMEMLOCK=infinity is set" \
   "$([ "$(grep -cF 'LimitMEMLOCK=infinity' "$SERVICE")" -ge 1 ] && echo yes || echo no)" "yes"

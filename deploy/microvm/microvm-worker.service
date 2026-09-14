@@ -49,6 +49,25 @@ Wants=network-online.target
 # the unit before ExecStart even runs, which is a stronger, earlier form of that
 # posture than leaving it to the process's own vmpool.New/Probe checks alone.
 AssertPathExists=/dev/kvm
+# A permanently-broken host must reach `failed`, not restart forever.
+#
+# Restart=on-failure with RestartSec=5s and systemd's DEFAULTS
+# (DefaultStartLimitBurst=5 over DefaultStartLimitIntervalSec=10s) never trips the rate
+# limiter: at one start per 5s at most 2-3 starts land in any 10s window, so the unit
+# sits in activating/auto-restart indefinitely while `systemctl is-failed` reports
+# success and monitoring sees a healthy host. This branch has already produced two
+# crash-loops of exactly that shape (an unstated jailer path, a missing snapshot), and
+# every remaining startup-failure path still reaches it: no /srv/snapshots/default, a
+# manifest hash mismatch, the SH_MAX_COMMITTED_MB refusal, a VMM socket already in use.
+#
+# 5 starts per 5 minutes: a transient failure (a slow /dev/kvm, a race with a mount)
+# still gets its retries, and a host that is simply broken lands in `failed` inside half
+# a minute and pages someone. Both keys belong in [Unit], not [Service] -- systemd 255
+# reports "Unknown key name 'StartLimitIntervalSec' in section 'Service'" and ignores
+# them there, which is the silent no-op this comment exists to prevent someone
+# reintroducing.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
