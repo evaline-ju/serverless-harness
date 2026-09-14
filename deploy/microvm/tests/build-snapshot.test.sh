@@ -562,10 +562,13 @@ check "link_snapshot_file's warning names memfile/guest-RAM as the risk, not jus
   "$([ "$(grep -cF 'ENTIRE guest RAM image' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 check "link_snapshot_file's fallback copy is cp -p (preserves mode/mtime), after the warning" \
   "$([ "$(grep -cF 'cp -p "$src" "$dst"' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
-check "no bare 'ln \"\$OUT/...' call site remains anywhere in the script" \
-  "$(grep -cE 'ln "\$OUT/' "$SCRIPT")" "0"
-check "both verify functions route \$OUT's vmstate/memfile/rootfs/ch-config.json through link_snapshot_file" \
-  "$([ "$(grep -cF 'link_snapshot_file "$OUT/' "$SCRIPT")" -eq 7 ] && echo yes || echo no)" "yes"
+check "no bare 'ln \"\$PENDING/...' call site remains anywhere in the script" \
+  "$(grep -cE 'ln "\$(PENDING|OUT)/' "$SCRIPT")" "0"
+# $PENDING, not $OUT: fix-round-14 moved verification ahead of publication, so the
+# files being linked into the verify jail are the sealed-but-unpublished ones. Same
+# seven call sites, same device (both are siblings) -- see the fix-round-14 section.
+check "both verify functions route the sealed snapshot's vmstate/memfile/rootfs/ch-config.json through link_snapshot_file" \
+  "$([ "$(grep -cF 'link_snapshot_file "$PENDING/' "$SCRIPT")" -eq 7 ] && echo yes || echo no)" "yes"
 check "both verify jails are rooted under new_verify_dir, not \$STAGE" \
   "$([ "$(grep -cF 'jail="$verify_root/verify-jail"' "$SCRIPT")" -eq 2 ] && echo yes || echo no)" "yes"
 check "no verify jail is still rooted at \$STAGE/verify-jail" \
@@ -1357,6 +1360,175 @@ check "...and records that the two arms now use different guest memory backing -
   "$([ "$(grep -ciF 'Different guest memory backing' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
 check "...and ties that third item explicitly to spec section 7.3's memory arithmetic / standby-density basis" \
   "$([ "$(grep -cF 'section 7.3' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
+echo "== fix-round-14: the snapshot is VERIFIED before it is published, and a failed verify leaves the previous one intact"
+# The defect this section pins: main() used to be write_manifest -> lock_down ->
+# verify_restore, so the artifact was sealed into $OUT before anything proved it could
+# restore, and nothing rolled it back. A failed verification therefore left $OUT holding
+# a complete, root-owned, 0444/0555 snapshot whose manifest hash matches its own bytes --
+# so every worker's startup verification PASSES and the tier boots on an artifact known
+# not to restore. Compounding: a rebuild overwrote $OUT in place, so a failed rebuild
+# destroyed a previously-good snapshot and replaced it with a broken one.
+#
+# Three checks, in increasing strength: the order in main(), that only publish_snapshot
+# names $OUT at all, and then the behaviour itself -- main() actually run, with the real
+# publish_snapshot and the real cleanup_on_exit, against real directories.
+main_start=$(grep -n "^main() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+main_body=""
+if [ -n "$main_start" ]; then
+  main_end=$(awk -v s="$main_start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  if [ -n "$main_end" ]; then
+    main_body="$(sed -n "${main_start},${main_end}p" "$SCRIPT")"
+  fi
+fi
+check "main() was found" "$([ -n "$main_body" ] && echo yes || echo no)" "yes"
+lock_line=$(printf '%s\n' "$main_body" | grep -nE '^  lock_down$' | head -n1 | cut -d: -f1)
+verify_line=$(printf '%s\n' "$main_body" | grep -nE '^  verify_restore$' | head -n1 | cut -d: -f1)
+publish_line=$(printf '%s\n' "$main_body" | grep -nE '^  publish_snapshot$' | head -n1 | cut -d: -f1)
+check "main() calls publish_snapshot at all" "$([ -n "$publish_line" ] && echo yes || echo no)" "yes"
+check "main() seals (lock_down) before it verifies" \
+  "$([ -n "$lock_line" ] && [ -n "$verify_line" ] && [ "$lock_line" -lt "$verify_line" ] && echo yes || echo no)" "yes"
+check "main() verifies BEFORE it publishes (the whole point: an unverified snapshot never reaches \$OUT)" \
+  "$([ -n "$verify_line" ] && [ -n "$publish_line" ] && [ "$verify_line" -lt "$publish_line" ] && echo yes || echo no)" "yes"
+
+# Only publish_snapshot may name $OUT as a destination. Scoped to each function's own
+# body rather than grepped whole-script, because $OUT appears in a dozen comments.
+fn_body() {
+  local start end
+  start=$(grep -n "^$1() {" "$SCRIPT" | head -n1 | cut -d: -f1)
+  [ -n "$start" ] || return 0
+  end=$(awk -v s="$start" 'NR>s && /^}$/{print NR; exit}' "$SCRIPT")
+  [ -n "$end" ] || return 0
+  sed -n "${start},${end}p" "$SCRIPT" | grep -v '^\s*#'
+}
+check "lock_down installs into \$PENDING" \
+  "$([ "$(fn_body lock_down | grep -cF 'install -m 0644 "$STAGE/$f" "$PENDING/$f"')" -ge 1 ] && echo yes || echo no)" "yes"
+check "lock_down writes nothing under \$OUT" \
+  "$(fn_body lock_down | grep -cF '"$OUT/')" "0"
+check "lock_down registers the unpublished snapshot for cleanup" \
+  "$([ "$(fn_body lock_down | grep -cF 'CLEANUP_PENDING_DIR="$PENDING"')" -ge 1 ] && echo yes || echo no)" "yes"
+check "verify_restore_firecracker links out of \$PENDING, not \$OUT" \
+  "$([ "$(fn_body verify_restore_firecracker | grep -cF 'link_snapshot_file "$PENDING/')" -ge 3 ] && [ "$(fn_body verify_restore_firecracker | grep -cF 'link_snapshot_file "$OUT/')" -eq 0 ] && echo yes || echo no)" "yes"
+check "verify_restore_cloud_hypervisor links out of \$PENDING, not \$OUT" \
+  "$([ "$(fn_body verify_restore_cloud_hypervisor | grep -cF 'link_snapshot_file "$PENDING/')" -ge 4 ] && [ "$(fn_body verify_restore_cloud_hypervisor | grep -cF 'link_snapshot_file "$OUT/')" -eq 0 ] && echo yes || echo no)" "yes"
+check "cleanup_on_exit removes the unpublished snapshot on any exit path" \
+  "$([ "$(fn_body cleanup_on_exit | grep -cF 'CLEANUP_PENDING_DIR')" -ge 1 ] && echo yes || echo no)" "yes"
+
+# Behavioural: run the REAL main(), publish_snapshot and cleanup_on_exit against real
+# directories, with the phases that need KVM and root stubbed out.
+#
+# The extracted snippet is written INSIDE this tests/ directory, not under /tmp: every
+# path this suite reasons about is computed from $DIR, and a snippet living somewhere
+# else has produced confidently wrong answers on this branch before.
+#
+# lock_down is the REAL function, extracted and run, with only `install` and `chown`
+# shadowed by shell functions (a non-root CI runner cannot chown root:root, and
+# install(1)'s -m/-o flags are not the property under test). That matters: it is
+# lock_down's choice of DESTINATION that the pre-fix code got wrong, so a stubbed
+# lock_down would have hidden the defect behind the harness. publish_snapshot,
+# cleanup_on_exit and main are real too.
+pub_tmproot="$(mktemp -d "$DIR/tests/.publish-scenario.XXXXXX")"
+trap 'chmod -R u+rwX "$pub_tmproot" 2>/dev/null; rm -rf "$pub_tmproot"' EXIT
+pub_snippet="$pub_tmproot/publish_snippet.sh"
+{
+  fn_body cleanup_on_exit
+  fn_body lock_down
+  fn_body publish_snapshot
+  printf '%s\n' "$main_body"
+} >"$pub_snippet"
+
+# $1 = verify outcome (0 or 1), $2 = "pre" to seed a previously-good $OUT.
+# Echoes "<exit code>|<manifest contents or MISSING>|<leftover pending/retired dirs>".
+run_publish_scenario() {
+  local verify_rc="$1" seed="$2"
+  local root out rc manifest leftovers
+  root="$(mktemp -d "$pub_tmproot/scenario.XXXXXX")"
+  out="$root/snapshots/default"
+  if [ "$seed" = "pre" ]; then
+    mkdir -p "$out"
+    printf 'PREVIOUS-GOOD\n' >"$out/manifest.json"
+  fi
+  rc=0
+  (
+    # set -e is what the real script runs under, and it is what makes a failing
+    # verify_restore abort main() instead of falling through to publish_snapshot.
+    set -euo pipefail
+    OUT="$out"
+    STAGE="$root/stage"
+    mkdir -p "$STAGE"
+    # What boot_quiesce_snapshot/write_manifest would have left in $STAGE for the real
+    # lock_down to seal. manifest.json's contents are the marker the assertions read.
+    for f in vmstate memfile kernel rootfs agent; do printf 'stub-%s\n' "$f" >"$STAGE/$f"; done
+    printf 'FRESHLY-BUILT\n' >"$STAGE/manifest.json"
+    VMM="firecracker"
+    PENDING=""
+    CLEANUP_PID=""
+    CLEANUP_JAIL=""
+    CLEANUP_EXTRA_DIR=""
+    CLEANUP_FS_PID=""
+    CLEANUP_PENDING_DIR=""
+    log() { :; }
+    # rm_rf_jail's mount-table guard reads /proc/mounts, which does not exist on a
+    # macOS dev machine; the property under test is what gets removed and when, not
+    # that guard (which build-snapshot.test.sh covers elsewhere).
+    rm_rf_jail() {
+      # The real script runs as root, which ignores the 0555 lock_down applies. This
+      # harness does not, so make the tree writable before removing it -- otherwise
+      # the scenario's own cleanup, not the code under test, is what fails.
+      chmod -R u+rwX "$@" 2>/dev/null || true
+      rm -rf "$@"
+    }
+    jail_unmount_dev() { :; }
+    require_root() { :; }
+    preflight() { :; }
+    build_agent() { :; }
+    assemble_rootfs() { :; }
+    boot_quiesce_snapshot() { :; }
+    write_manifest() { :; }
+    # Shadow only what a non-root runner cannot do. The real lock_down (sourced from
+    # the snippet below) is what decides WHERE the snapshot is sealed, which is the
+    # whole question here.
+    install() { cp "${@:$#-1:1}" "${@:$#:1}"; }
+    chown() { :; }
+    verify_restore() { return "$verify_rc"; }
+    : "$OUT" "$STAGE" "$PENDING" "$VMM" "$CLEANUP_PID" "$CLEANUP_JAIL" \
+      "$CLEANUP_EXTRA_DIR" "$CLEANUP_FS_PID" "$CLEANUP_PENDING_DIR"
+    # shellcheck disable=SC1090
+    . "$pub_snippet"
+    trap cleanup_on_exit EXIT
+    main
+  ) >/dev/null 2>&1
+  rc=$?
+  # Deliberately NOT `( ... ) || rc=$?`: errexit is suppressed inside a compound command
+  # that is the left operand of `||`, so the subshell's own `set -e` would not abort
+  # main() on a failing verify_restore and both failure scenarios would report success --
+  # observed while writing this test.
+  if [ -f "$out/manifest.json" ]; then
+    manifest="$(cat "$out/manifest.json")"
+  else
+    manifest="MISSING"
+  fi
+  leftovers="$(find "$root/snapshots" -maxdepth 1 -name '.build-snapshot-*' 2>/dev/null | wc -l | tr -d ' ')"
+  printf '%s|%s|%s\n' "$rc" "$manifest" "$leftovers"
+}
+
+got="$(run_publish_scenario 0 pre)"
+check "verify passes, previous snapshot present: main succeeds, \$OUT holds the NEW snapshot, nothing left behind" \
+  "$got" "0|FRESHLY-BUILT|0"
+got="$(run_publish_scenario 0 nopre)"
+check "verify passes, no previous snapshot: main succeeds, \$OUT is created, nothing left behind" \
+  "$got" "0|FRESHLY-BUILT|0"
+# The two that would have gone green on the pre-fix order, with $OUT holding a sealed,
+# self-consistent snapshot that does not restore:
+got="$(run_publish_scenario 1 pre)"
+check "verify FAILS: main fails, the PREVIOUS good snapshot is untouched, and the unverified one is removed" \
+  "$got" "1|PREVIOUS-GOOD|0"
+got="$(run_publish_scenario 1 nopre)"
+check "verify FAILS with no previous snapshot: main fails and \$OUT is never created" \
+  "$got" "1|MISSING|0"
+chmod -R u+rwX "$pub_tmproot" 2>/dev/null
+rm -rf "$pub_tmproot"
+trap - EXIT
 
 if [ "$fails" -eq 0 ]; then echo "PASS"; else echo "FAIL ($fails)"; fi
 exit "$fails"

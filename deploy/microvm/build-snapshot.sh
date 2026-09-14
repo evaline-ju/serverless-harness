@@ -87,11 +87,25 @@
 #                      investigation.
 #   6. lock_down    -- root-owned, read-only. Only a 64-bit CRC guards vmstate and the
 #                      VMM trusts these files (spec §2.4); the filesystem permissions
-#                      are the next line of defence after that.
-#   7. verify_restore -- restore ONE VM from the artifact just produced and run a
-#                      trivial command in it. A snapshot can hash correctly and still
-#                      not restore on this host, and that must be caught here, not on
-#                      a worker's first user request (spec §6).
+#                      are the next line of defence after that. Seals into $PENDING, a
+#                      sibling of $OUT on the same device -- NOT into $OUT itself, see
+#                      step 8.
+#   7. verify_restore -- restore ONE VM from the artifact just produced (from $PENDING)
+#                      and run a trivial command in it. A snapshot can hash correctly
+#                      and still not restore on this host, and that must be caught
+#                      here, not on a worker's first user request (spec §6).
+#   8. publish_snapshot -- the ONLY step that touches $OUT, and it runs last, after
+#                      verify_restore has passed. This order is load-bearing, not
+#                      tidiness: lock_down used to seal straight into $OUT before
+#                      verify_restore ran, so a snapshot that failed verification was
+#                      left published, sealed and self-consistent -- its manifest hash
+#                      matches its own bytes, so every worker's startup verification
+#                      passes and the tier boots on an artifact known not to restore.
+#                      Nothing rolled it back either ($OUT was never a cleanup target),
+#                      and because a rebuild overwrote $OUT in place, a failed rebuild
+#                      left the host WORSE off than before it ran. Publishing by rename
+#                      after verification means a failed build leaves the previous
+#                      good snapshot exactly where it was.
 #
 # Needs a KVM host with the chosen VMM installed; it cannot run in CI. What CAN run
 # everywhere is deploy/microvm/tests/build-snapshot.test.sh, which pins this script's
@@ -190,6 +204,11 @@ esac
 
 OUT="${OUT:-$REPO_ROOT/.build/microvm-snapshots/$IMAGE}"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/build-snapshot.XXXXXX")"
+# PENDING is where lock_down seals the finished snapshot and where verify_restore
+# restores it FROM. It is created by lock_down (as a sibling of $OUT, so that
+# publish_snapshot's mv is a same-device rename rather than a copy of the whole guest
+# RAM image) and is renamed onto $OUT only after verification passes.
+PENDING=""
 
 # Fix-round-7 item 2: every phase below runs a VMM in the background and/or holds
 # a device-mounted jail open, and each used to arm ITS OWN `trap '...' EXIT`
@@ -227,6 +246,12 @@ CLEANUP_EXTRA_DIR=""  # extra directory (beyond $STAGE) to remove, if any
 # ORDER (VMM before virtiofsd, never the reverse -- see teardown_virtiofsd's own
 # comment), which a single shared pid variable cannot express.
 CLEANUP_FS_PID=""
+# The sealed-but-not-yet-published snapshot directory ($PENDING), if one exists. Set by
+# lock_down and cleared by publish_snapshot once the rename has happened, so any exit
+# between those two points -- a failed verify_restore above all -- removes the unverified
+# artifact instead of leaving a root-owned, read-only, self-consistent snapshot lying
+# next to $OUT for someone to find and deploy.
+CLEANUP_PENDING_DIR=""
 
 cleanup_on_exit() {
   # Runs once, however deep whatever phase was mid-flight when the script exited
@@ -251,6 +276,12 @@ cleanup_on_exit() {
   local rm_targets=("$STAGE")
   if [ -n "${CLEANUP_EXTRA_DIR:-}" ]; then
     rm_targets+=("$CLEANUP_EXTRA_DIR")
+  fi
+  # An unpublished snapshot is removed on every exit path. $OUT deliberately is NOT a
+  # cleanup target and never was: by the time it exists, it has been verified, and the
+  # previous good snapshot lives there until that moment.
+  if [ -n "${CLEANUP_PENDING_DIR:-}" ]; then
+    rm_targets+=("$CLEANUP_PENDING_DIR")
   fi
   rm_rf_jail "${rm_targets[@]}"
 }
@@ -1184,10 +1215,12 @@ rm_rf_jail() {
 }
 
 # new_verify_dir creates a fresh directory ON THE SAME DEVICE AS $OUT -- a
-# SIBLING of $OUT, not a subdirectory of it ($OUT is locked read-only by
-# lock_down before verify_restore ever runs, so nothing should write inside it)
-# -- so that link_snapshot_file below can hard-link $OUT's own files into the
-# verify jail instead of copying them.
+# SIBLING of $OUT, not a subdirectory of it -- so that link_snapshot_file below
+# can hard-link the sealed snapshot's own files into the verify jail instead of
+# copying them. $PENDING, which is what verify_restore actually links out of,
+# is a sibling of $OUT too and therefore on that same device; it is locked
+# read-only by lock_down before verify_restore ever runs, so nothing writes
+# inside it either.
 #
 # Fix-round-7 item 1: the verify jail used to nest under $STAGE, which lives
 # under ${TMPDIR:-/tmp} -- tmpfs on the rig -- while $OUT is normally on
@@ -1205,8 +1238,9 @@ new_verify_dir() {
   mktemp -d "$base/.build-snapshot-verify.XXXXXX"
 }
 
-# link_snapshot_file hard-links $1 (a file inside $OUT, i.e. a component of the
-# golden snapshot just produced by lock_down) into $2. Deliberately NOT the same
+# link_snapshot_file hard-links $1 (a file inside $PENDING, i.e. a component of
+# the golden snapshot just sealed by lock_down and not yet published to $OUT)
+# into $2. Deliberately NOT the same
 # shape as hardlink_or_copy_bin: that helper's quiet cp fallback is fine for the
 # firecracker/cloud-hypervisor binaries it places (small, and a cross-device
 # fallback there is the normal, expected case on most hosts), but is NOT fine
@@ -1565,9 +1599,23 @@ MANIFEST
 # ---------------------------------------------------------------------------
 # 6. lock_down
 # ---------------------------------------------------------------------------
+# Seals the finished snapshot into $PENDING, NOT into $OUT. $PENDING is a sibling of
+# $OUT, which buys two things at once:
+#
+#   - publish_snapshot's `mv` is a same-device rename, not a copy. memfile is the
+#     guest's ENTIRE RAM image (--guest-ram-mb), so publishing across devices would
+#     duplicate it -- the same reasoning link_snapshot_file spells out for its `ln`.
+#   - verify_restore's own jail (new_verify_dir) is a sibling of both, so its hard
+#     links out of $PENDING stay same-device too.
+#
+# Everything else about this function is unchanged: the artifact is root-owned and
+# 0444/0555 BEFORE it is verified, so what gets published is byte-for-byte and
+# permission-for-permission the thing that was proven to restore.
 lock_down() {
-  log "locking down $OUT (root-owned, read-only)"
-  mkdir -p "$OUT"
+  mkdir -p "$(dirname "$OUT")"
+  PENDING="$(mktemp -d "$(dirname "$OUT")/.build-snapshot-pending.XXXXXX")"
+  CLEANUP_PENDING_DIR="$PENDING"
+  log "sealing the snapshot in $PENDING (root-owned, read-only) before verifying it"
   files=(vmstate memfile kernel rootfs agent manifest.json)
   # cloud-hypervisor's snapshot is a directory (config.json, state.json,
   # memory-ranges), not just the vmstate/memfile pair -- config.json has to ship
@@ -1576,20 +1624,20 @@ lock_down() {
     files+=(ch-config.json)
   fi
   for f in "${files[@]}"; do
-    install -m 0644 "$STAGE/$f" "$OUT/$f"
+    install -m 0644 "$STAGE/$f" "$PENDING/$f"
   done
-  chown -R root:root "$OUT"
+  chown -R root:root "$PENDING"
   for f in "${files[@]}"; do
-    chmod 0444 "$OUT/$f"
+    chmod 0444 "$PENDING/$f"
   done
-  chmod 0555 "$OUT"
+  chmod 0555 "$PENDING"
 }
 
 # ---------------------------------------------------------------------------
 # 7. verify_restore
 # ---------------------------------------------------------------------------
 verify_restore() {
-  log "verifying: restoring one VM from $OUT and running \`true\` in it"
+  log "verifying: restoring one VM from $PENDING and running \`true\` in it"
   case "$VMM" in
     firecracker) verify_restore_firecracker ;;
     cloud-hypervisor) verify_restore_cloud_hypervisor ;;
@@ -1598,22 +1646,26 @@ verify_restore() {
 }
 
 verify_restore_firecracker() {
-  # Items 1/2/9's whole point: prove the snapshot in $OUT is portable by
-  # restoring it into a FRESH jail at a DIFFERENT absolute path than the one it
-  # was built under -- if $OUT still baked in an absolute, build-time path, this
-  # jail would never see it and LoadSnapshot would fail exactly like the
-  # original bug this round fixes.
+  # Items 1/2/9's whole point: prove the sealed snapshot is portable by restoring
+  # it into a FRESH jail at a DIFFERENT absolute path than the one it was built
+  # under -- if it still baked in an absolute, build-time path, this jail would
+  # never see it and LoadSnapshot would fail exactly like the original bug this
+  # round fixes. The bytes come from $PENDING rather than $OUT: they are the same
+  # bytes with the same permissions (publish_snapshot only renames the
+  # directory), and verifying BEFORE publishing is what stops a snapshot that
+  # cannot restore from ever appearing at $OUT at all.
   # Fix-round-7 item 1: the verify jail can no longer live under $STAGE (tmpfs)
-  # if it is going to hard-link vmstate/memfile/rootfs out of $OUT (ext4, or
-  # whatever device --out points at) -- ln across tmpfs<->ext4 is EXDEV, always,
-  # unconditionally, no matter permissions. new_verify_dir allocates a sibling
-  # directory of $OUT itself, sharing $OUT's device, so link_snapshot_file's
+  # if it is going to hard-link vmstate/memfile/rootfs out of the sealed
+  # snapshot (ext4, or whatever device --out points at) -- ln across
+  # tmpfs<->ext4 is EXDEV, always, unconditionally, no matter permissions.
+  # new_verify_dir allocates a sibling directory of $OUT itself, which is also a
+  # sibling of $PENDING and therefore on the same device, so link_snapshot_file's
   # `ln` below is a same-device link and actually succeeds; see new_verify_dir's
-  # own comment for why "sibling of $OUT" (not "inside $OUT" -- lock_down has
-  # already chmod'd $OUT to 0555 by the time verify_restore runs) and why this
-  # doesn't weaken the cross-path portability check the surrounding comment
-  # describes. CLEANUP_EXTRA_DIR ensures this directory is removed on any exit
-  # path, same as $STAGE.
+  # own comment for why a sibling (not "inside" -- lock_down has already chmod'd
+  # $PENDING to 0555 by the time verify_restore runs) and why this doesn't weaken
+  # the cross-path portability check the surrounding comment describes.
+  # CLEANUP_EXTRA_DIR ensures this directory is removed on any exit path, same as
+  # $STAGE.
   local verify_root
   verify_root="$(new_verify_dir)"
   CLEANUP_EXTRA_DIR="$verify_root"
@@ -1632,9 +1684,9 @@ verify_restore_firecracker() {
   # Fix-round-7 item 1: hard-link, not bare `ln` -- see link_snapshot_file's own
   # comment for why a silent copy fallback (hardlink_or_copy_bin's pattern) is
   # wrong specifically for these three files, memfile above all.
-  link_snapshot_file "$OUT/vmstate" "$jail/vmstate"
-  link_snapshot_file "$OUT/memfile" "$jail/memfile"
-  link_snapshot_file "$OUT/rootfs" "$jail/rootfs"
+  link_snapshot_file "$PENDING/vmstate" "$jail/vmstate"
+  link_snapshot_file "$PENDING/memfile" "$jail/memfile"
+  link_snapshot_file "$PENDING/rootfs" "$jail/rootfs"
   ensure_workspace_image "$jail/workspace.img"
 
   chroot "$jail" /firecracker --api-sock /run/verify-api.sock \
@@ -1711,7 +1763,9 @@ verify_restore_firecracker() {
 
 verify_restore_cloud_hypervisor() {
   # Same portability check as the firecracker arm, restoring into a fresh jail
-  # at a different absolute path than the one used to build $OUT.
+  # at a different absolute path than the one used to build the snapshot, and out
+  # of $PENDING rather than $OUT for the same reason -- see that function's first
+  # comment block.
   #
   # Self-discovered 11th finding: the previous form of this function passed
   # `--restore source_url=file://$OUT` as a CLI flag. cloud-hypervisor has no
@@ -1747,14 +1801,14 @@ verify_restore_cloud_hypervisor() {
   # Fix-round-7 item 1: hard-link via link_snapshot_file, not bare `ln` -- see
   # that function's comment for why a silent copy fallback is wrong here,
   # memfile (shipped here as memory-ranges) above all.
-  link_snapshot_file "$OUT/rootfs" "$jail/rootfs"
+  link_snapshot_file "$PENDING/rootfs" "$jail/rootfs"
   # vm.restore replays the whole snapshot directory, not just memory state, so
   # config.json (shipped as ch-config.json, see lock_down/item 9's corollary)
   # has to be put back next to the state files under their original names
   # before the restore call.
-  link_snapshot_file "$OUT/ch-config.json" "$jail/ch-snapshot/config.json"
-  link_snapshot_file "$OUT/vmstate" "$jail/ch-snapshot/state.json"
-  link_snapshot_file "$OUT/memfile" "$jail/ch-snapshot/memory-ranges"
+  link_snapshot_file "$PENDING/ch-config.json" "$jail/ch-snapshot/config.json"
+  link_snapshot_file "$PENDING/vmstate" "$jail/ch-snapshot/state.json"
+  link_snapshot_file "$PENDING/memfile" "$jail/ch-snapshot/memory-ranges"
 
   # Fix-round-12: same ordering requirement as the build side -- virtiofsd up
   # and its socket confirmed live BEFORE cloud-hypervisor starts, since the
@@ -1803,6 +1857,39 @@ verify_restore_cloud_hypervisor() {
 }
 
 # ---------------------------------------------------------------------------
+# 8. publish_snapshot
+# ---------------------------------------------------------------------------
+# The only step that writes $OUT, and it runs only after verify_restore has passed.
+#
+# Publishing is a rename, not a copy: $PENDING is a sibling of $OUT (see lock_down), so
+# `mv` is a single same-device rename of the directory -- no second copy of memfile, and
+# no window in which $OUT holds half a snapshot. A previously-good $OUT is renamed ASIDE
+# first rather than deleted in place, so the only moment $OUT does not exist is between
+# two renames, and it is removed only once the new snapshot is in place.
+#
+# rename(2) needs write permission on the PARENT of each path, not on the directories
+# being moved, so $PENDING's own 0555 and root ownership (set by lock_down, verified by
+# verify_restore) survive publication untouched -- which is the point: what lands in
+# $OUT is the exact artifact that was proven to restore.
+publish_snapshot() {
+  log "publishing the verified snapshot to $OUT"
+  local retired=""
+  if [ -e "$OUT" ]; then
+    retired="$(dirname "$OUT")/.build-snapshot-retired.$$"
+    rm_rf_jail "$retired"
+    mv "$OUT" "$retired"
+  fi
+  mv "$PENDING" "$OUT"
+  # $PENDING no longer exists under that name; clearing this keeps cleanup_on_exit from
+  # trying to remove a path that is now $OUT.
+  CLEANUP_PENDING_DIR=""
+  PENDING=""
+  if [ -n "$retired" ]; then
+    rm_rf_jail "$retired"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 main() {
   require_root
   preflight
@@ -1810,8 +1897,14 @@ main() {
   assemble_rootfs
   boot_quiesce_snapshot
   write_manifest
+  # lock_down seals into $PENDING, verify_restore restores from $PENDING, and
+  # publish_snapshot renames it onto $OUT last. Sealing straight into $OUT and verifying
+  # afterwards (the previous order) left a failed verification published, sealed and
+  # self-consistent, so every worker's startup hash check passed on an artifact known
+  # not to restore -- see publish_snapshot and the header's step 8.
   lock_down
   verify_restore
+  publish_snapshot
   log "done: $OUT"
 }
 
