@@ -81,6 +81,7 @@ func realMain(args []string, stdout io.Writer) error {
 		wsRoot      = fs.String("workspace-root", "", "directory holding per-run workspaces")
 		key         = fs.String("key", "", "workspace_key to run under")
 		depth       = fs.Int("standby-depth", vmpool.DefaultStandbyDepth, "D")
+		bulkKeys    = fs.Int("bulk-keys", 0, "teardown-bulk only: run pools per batch; 0 derives a batch of MaxReclaimsPerScan VMs")
 		guestMB     = fs.Int64("guest-ram-mb", vmpool.DefaultGuestRAMBytes>>20, "guest RAM per VM, MiB")
 		maxRuns     = fs.Int("max-runs", 64, "MaxRuns backstop")
 		committedMB = fs.Int64("max-committed-mb", 32<<10, "MaxCommittedBytes, MiB")
@@ -219,7 +220,7 @@ func realMain(args []string, stdout io.Writer) error {
 	case "teardown-inflight", "teardown-standby":
 		samples, firstErr = runTeardownPerVMMode(hooks, *mode, *key, *wsRoot, *iterations, warmupN, &res)
 	case "teardown-bulk":
-		samples, firstErr = runTeardownBulkMode(hooks, *key, *iterations, *depth, &res)
+		samples, firstErr = runTeardownBulkMode(hooks, *key, *iterations, warmupN, bulkKeysFor(*bulkKeys, *depth), *depth, &res)
 	default:
 		// Guards DIVERGENCE between two lists that must agree: the flag validator's
 		// accepted set (see the switch near the top of realMain) and this dispatcher's
@@ -442,44 +443,103 @@ func runTeardownPerVMMode(hooks vmpool.BenchmarkHooks, mode, key, wsRoot string,
 	return samples, firstErr
 }
 
-// runTeardownBulkMode is E10 rung 4's third variant: a bulk reclaim of D x R
-// standbys in one DestroyAllStandbys call, because "the per-VM number does not
-// predict" the sweep's bulk reclaim (spec §7.2) and this rung exists to price that
-// sweep directly rather than as R separate single-VM destroys. D is --standby-depth,
-// the same knob production Config uses; R is --iterations, reused rather than given
-// a dedicated flag so this mode's invocation looks like every other mode's. R
-// synthetic keys are derived from --key (FillStandbys is per-key) so the batch
-// spans multiple run pools exactly as a real sweep's bulk reclaim would, rather
-// than D standbys under one key alone.
-//
-// This is a one-shot batch primitive, not a per-iteration one: DestroyAllStandbys
-// reclaims everything pool-wide in a single call, so there is no warmup concept to
-// discard and no meaningful way to repeat it within one invocation (a second call
-// would find nothing left to destroy). res.WarmupDiscarded is left at 0 by the
-// caller for this mode; that is a deliberate, documented choice, not an oversight.
-func runTeardownBulkMode(hooks vmpool.BenchmarkHooks, key string, r, depth int, res *runResult) ([]sample, error) {
-	var firstErr error
-	for i := 0; i < r; i++ {
-		subKey := fmt.Sprintf("%s-bulk%d", key, i)
-		if err := hooks.FillStandbys(context.Background(), subKey, depth); err != nil {
-			res.Failures++
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
+// bulkKeysFor sizes teardown-bulk's batch: how many run pools one batch spans, chosen so
+// the batch holds MaxReclaimsPerScan VMs — the most a real sweep ever reclaims in one
+// scan (sweep.go's own budget). That is the quantity this rung exists to price, so it is
+// the quantity it builds, rather than whatever number happens to be in --iterations.
+// Always at least 1: a batch of zero pools would measure nothing and report it as a
+// destroy figure.
+func bulkKeysFor(explicit, depth int) int {
+	if explicit > 0 {
+		return explicit
 	}
+	if depth < 1 {
+		depth = 1
+	}
+	if k := vmpool.DefaultMaxReclaimsPerScan / depth; k > 0 {
+		return k
+	}
+	return 1
+}
 
-	start := time.Now()
-	_, err := hooks.DestroyAllStandbys(context.Background())
-	d := time.Since(start)
-	res.WallMs = d.Milliseconds()
-	if err != nil {
+// runTeardownBulkMode is E10 rung 4's third variant: a bulk reclaim of K x D standbys in
+// one DestroyAllStandbys call, because "the per-VM number does not predict" the sweep's
+// bulk reclaim (spec §7.2) and this rung exists to price that sweep directly rather than
+// as K x D separate single-VM destroys. D is --standby-depth, the same knob production
+// Config uses; K is --bulk-keys, and K synthetic keys are derived from --key
+// (FillStandbys is per-key) so the batch spans multiple run pools exactly as a real
+// sweep's bulk reclaim would, rather than D standbys under one key alone.
+//
+// K used to BE --iterations, and that was the defect that would have aborted the metal
+// ladder. For every other mode --iterations is a repeat count: more iterations, more
+// samples, same resource footprint. Here it silently meant more SIMULTANEOUS VMs, so
+// E10's metal defaults (ITERS=200, D=2) asked for 400 concurrent microVMs — a batch ~50x
+// larger than any the sweep can perform, which the admission budget then refused after
+// ~57 keys, exiting non-zero with 143 counted failures. e10-lifecycle.sh's vmpoolctl_run
+// dies on a non-zero exit, so rung 4 took the whole ladder with it; and the runbook's
+// ITERS=5 smoke pass builds 10 VMs, so it could never have caught it. Fan-out now has
+// its own knob and --iterations means iterations here too.
+//
+// Each iteration is a full fill-then-destroy cycle, with only the destroy timed — so R
+// iterations yield R samples and a percentile that is a percentile, instead of the single
+// measurement this rung used to report as both p50 and p95. Warmup iterations are
+// discarded exactly as the per-VM variants discard theirs, which also makes the record's
+// warmup_discarded field honest: it previously reported the flag's value for a mode that
+// performed no warmup at all.
+//
+// The K subkeys are REUSED across iterations rather than freshly minted per iteration.
+// Fresh keys would grow the pool's run map by K every iteration (R x K entries, 800 at
+// metal defaults) and hit MaxRuns instead of the memory budget — the same class of
+// failure one flag along. Reusing them keeps the live run count at K, which is the
+// footprint the rung is supposed to have.
+func runTeardownBulkMode(hooks vmpool.BenchmarkHooks, key string, iterations, warmupN, keys, depth int, res *runResult) ([]sample, error) {
+	var firstErr error
+	fail := func(err error) {
 		res.Failures++
 		if firstErr == nil {
 			firstErr = err
 		}
 	}
-	return []sample{{destroy: d, total: d}}, firstErr
+
+	// One batch: fill K pools to D, then destroy everything pool-wide and return how
+	// long that took. The fill is deliberately outside the returned duration.
+	batch := func() (time.Duration, bool) {
+		ok := true
+		for k := 0; k < keys; k++ {
+			subKey := fmt.Sprintf("%s-bulk%d", key, k)
+			if err := hooks.FillStandbys(context.Background(), subKey, depth); err != nil {
+				fail(err)
+				ok = false
+			}
+		}
+		start := time.Now()
+		_, err := hooks.DestroyAllStandbys(context.Background())
+		d := time.Since(start)
+		if err != nil {
+			fail(err)
+			ok = false
+		}
+		return d, ok
+	}
+
+	for i := 0; i < warmupN; i++ {
+		batch()
+	}
+
+	measured := iterations - warmupN
+	// Appended on success only, never pre-sized and left zero-filled on failure: a
+	// zero-valued sample is indistinguishable from a destroy too fast for the clock, and
+	// it would drag the p50 of the very term this rung prices toward zero — making a run
+	// with failures look FASTER than a clean one.
+	samples := make([]sample, 0, measured)
+	start := time.Now()
+	for i := 0; i < measured; i++ {
+		if d, ok := batch(); ok {
+			samples = append(samples, sample{destroy: d, total: d})
+		}
+	}
+	res.WallMs = time.Since(start).Milliseconds()
+	return samples, firstErr
 }
 
 // launcher maps --vmm to a Launcher. "fake" is handled here and ONLY here — it must

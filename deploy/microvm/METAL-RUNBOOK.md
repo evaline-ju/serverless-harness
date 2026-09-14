@@ -6,11 +6,18 @@ what it means.
 
 > ## Read this before anything else
 >
-> **These two drivers have never been executed.** They are unit-tested (271 assertions
-> across both suites), shellcheck-clean, and every failure path was exercised against
-> fabricated inputs — but no rung has ever run against a real VM. So do the smoke pass in
-> §4 before the real run in §5. If the instrument is broken, you want to find out in two
-> minutes on a small `ITERS`, not ninety minutes into a ladder.
+> **What has and has not been executed.** E10's rungs 2, 3 and 4 have now run against real
+> VMs on a 4-vCPU **nested** rig, rung 4 at the full `ITERS=200`; every figure from that is
+> a validation result and none of it is quotable. **E10 rung 1 and the whole of E11 have
+> still never run** — rung 1 needs docker/grpcurl, absent on that rig. Both drivers are
+> unit-tested (271 assertions), shellcheck-clean, with every failure path exercised against
+> fabricated inputs. So still do the smoke pass in §4 before the real run in §5: for E11 it
+> is the first execution of anything, and for E10 it is the first on this hardware. If the
+> instrument is broken, you want to find out in two minutes, not ninety minutes into a
+> ladder.
+>
+> The first-ever execution of E10 rung 4 found three defects, and the first run at
+> `ITERS=200` found a fourth that `ITERS=5` could not (see §4). Expect the same of E11.
 >
 > **The golden snapshot cannot be copied to this machine.** Spec §2.4: a Firecracker
 > snapshot only restores on identical hardware. A snapshot built on any other instance
@@ -91,10 +98,49 @@ If `jailer` and `firecracker` are not in `/usr/local/bin`, set `SH_JAILER_BIN` a
 absolute `--parent-cgroup` — so it must be slice-relative, e.g.
 `microvm.slice/microvm-vms.slice`.
 
+## 3a. Clear orphaned VMMs before every run
+
+`vmpoolctl` runs **no startup orphan sweep** — only `microvm-worker` does, and the E10/E11
+drivers do not go through it. A live VMM left behind by an aborted run still holds its VM
+id's API socket, and the next run that mints the same id refuses rather than restoring:
+
+```
+firecracker: restore vm-6: a live VMM already holds this VM id's API socket at
+/srv/jail/firecracker/vm-6/root/run/firecracker.socket — refusing to load a snapshot
+into another microVM
+```
+
+That refusal is deliberate. Before this guard existed, the restore instead loaded a
+snapshot into the orphan's already-loaded microVM, and the operator saw Firecracker's
+`PUT /snapshot/load: not supported after starting the microVM (400)` — a message naming
+neither the collision nor the id.
+
+Check and clear before each run, **by cgroup membership, never by process name**
+(`pkill -f firecracker` has matched an operator's own ssh shell on a test rig):
+
+```bash
+sudo find /sys/fs/cgroup -maxdepth 5 -type d -name 'vm-*'
+for d in $(sudo find /sys/fs/cgroup/microvm.slice -maxdepth 2 -type d -name 'vm-*'); do
+  for pid in $(sudo cat "$d/cgroup.procs"); do sudo kill -9 "$pid"; done
+done
+sudo rm -rf "$SH_WORKSPACE_ROOT"/* /srv/jail/firecracker
+```
+
+A jail directory left behind with **no** live process is a different, milder case: the
+restore fails loudly after a 5s socket timeout, removes the stale jail, and an immediate
+retry succeeds. Clearing first avoids paying that per orphaned id.
+
 ## 4. Smoke pass first — two minutes, not ninety
 
 The point is to prove the instrument runs end to end, not to get a number. Use the same
 `SH_SUBSTRATE` you will use for real, so the record shape is identical.
+
+> **A smoke pass at `ITERS=5` cannot catch a failure that only exists at scale.** It has
+> already missed one: `teardown-bulk` used to take its batch size from `--iterations`, so
+> `ITERS=5` built 10 VMs and passed while `ITERS=200` asked for 400, exhausted the
+> admission budget, exited non-zero, and aborted the ladder at rung 4. Fan-out now has its
+> own knob (`--bulk-keys`, §5), so the shapes agree — but treat a green smoke pass as
+> evidence the instrument runs, not as evidence the real run will finish.
 
 ```bash
 sudo PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin \
@@ -139,6 +185,24 @@ sudo PATH=… <the same SH_* exports> bash deploy/microvm/e11-density.sh  2>&1 |
 
 **Run nothing else on the host.** These are latency and density measurements; a competing
 workload does not degrade them, it makes them wrong in a way that looks fine.
+
+### What rung 4's bulk variant costs, and the one knob it has
+
+`teardown-bulk` prices the sweep's bulk reclaim. Its batch is `--bulk-keys` run pools at
+`--standby-depth` standbys each; `--bulk-keys` defaults to whatever makes the batch
+`MaxReclaimsPerScan` VMs — 8 at the shipped defaults, which is the most a real sweep ever
+reclaims in one scan (`sweep.go`'s own budget). `--iterations` is a repeat count here, as
+it is for every other mode, so each iteration is one full fill-then-destroy cycle with
+only the destroy timed.
+
+The driver passes no `--bulk-keys`, so the derived default applies and nothing needs
+setting. Raising it is how you would price a larger batch than the sweep performs — but
+`--bulk-keys × --standby-depth × (guest RAM + 32 MiB overhead)` must stay inside
+`--max-committed-mb` (default 32 GiB), or admission refuses mid-batch and the rung fails.
+
+Budget the time: at `ITERS=200` this rung took **293s** on a 4-vCPU nested rig, against 62s
+and 49s for the two per-VM variants. Expect metal to be faster, not slower, but plan for
+rung 4 being the long pole of E10 outside rung 1.
 
 ## 6. What to capture and hand back
 
