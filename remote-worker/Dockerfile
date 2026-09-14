@@ -19,8 +19,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/remote-worker ./cm
 # ripgrep is vendored because it is the IMPLEMENTATION of two registered tools, not a scheduling
 # label. The Find/Glob tool runs `rg --files --hidden` (k8s-sandbox operations.ts:170) and the Grep
 # tool runs `rg` directly (grep-tool.ts), and both land in THIS container whenever a leased gRPC
-# presence record supplies a relay transport: extension.ts:47-49 overrides the fast AND the stream
-# transport, so every pod operation runs over the relay. Without `rg` on PATH the model's Glob
+# presence record supplies a relay transport: extension.ts's `opts?.transport ??` overrides the fast
+# AND the stream transport, so every pod operation runs over the relay. Without `rg` on PATH the model's Glob
 # returns "glob failed in pod (rg exited 127)" and its Grep "rg failed in pod (exit 127)" -- the
 # same attached-and-healthy-yet-every-tool-fails signature as the /workspace bug below. Both other
 # sandbox images in the repo install it (sandbox.Dockerfile, k8s-sandbox/deploy/sandbox.yaml).
