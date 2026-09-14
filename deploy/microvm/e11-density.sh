@@ -846,6 +846,12 @@ run_density_rung() {
       fi
 
       local times_file="$slot_dir/slot-$i.times" req=0
+      # Create it empty first. The loop guard below reads it with `wc -l <"$times_file"`,
+      # and `2>/dev/null` there binds to wc -- NOT to the shell's own redirection, so a
+      # missing file printed "No such file or directory" to stderr on every slot's first
+      # iteration. The fallback made it harmless, but an operator reading the log saw what
+      # looked like a failure in the middle of a working rung.
+      : >"$times_file"
       local want=$((ITERS_PER_SLOT + WARMUP_PER_SLOT))
       while [ "$(wc -l <"$times_file" 2>/dev/null || echo 0)" -lt "$want" ]; do
         while IFS= read -r cmd; do
@@ -877,7 +883,13 @@ run_density_rung() {
   all_times="$E11_TMPDIR/all-times-$rung_tag"
   : >"$all_times"
   rm -f "${all_times}.ok"
-  declare -A cause_counts
+  # `=()` is load-bearing, not style. Under `set -u`, `declare -A x` alone leaves x
+  # DECLARED BUT UNSET, and `${#x[@]}` on it is an unbound-variable error -- verified on
+  # this rig's bash 5.2.15. The only thing that ever assigned an element was the failure
+  # branch below, so this rung's recorder crashed if and only if EVERY Exec succeeded:
+  # the clean path was the broken one, and any run with a failure sailed past it. Found on
+  # E11's first execution that got far enough to have a clean rung.
+  declare -A cause_counts=()
   local f
   for f in "$slot_dir"/slot-*.times; do
     [ -e "$f" ] || continue

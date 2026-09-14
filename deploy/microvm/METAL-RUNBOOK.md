@@ -75,6 +75,16 @@ cd pi-fork && npm ci && npm run build && cd ..
 pnpm install
 ```
 
+**pi-fork requires Node >= 22.19.0** (its own `engines` field) and its build refuses an older
+one. Most distributions' default `nodejs` package is older: Amazon Linux 2023 ships 18,
+Ubuntu 22.04 and 24.04 ship 18. So check `node --version` BEFORE building rather than after,
+and install a 22.x from a versioned distro package, NodeSource or nvm if it is short.
+
+Where a distribution manages `node` through an alternatives system, installing a 22.x package
+is **not by itself enough** to change what `node` on `PATH` resolves to — the alternatives
+link keeps pointing at the old one. Verify with `node --version`, never with the package
+list. This cost a build on the validation rig.
+
 This is the same setup CLAUDE.md prescribes for the repo generally; it is repeated here
 because a missing pi-fork build presents only as the relay dying at startup, taking every
 downstream Exec with it. The drivers now fail at that point, naming the relay's log and
