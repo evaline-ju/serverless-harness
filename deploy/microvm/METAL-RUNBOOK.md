@@ -112,8 +112,8 @@ line. `sudo -E` is not sufficient and `PATH` must include `/sbin` and `/usr/sbin
 sudo PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin \
   bash deploy/microvm/build-snapshot.sh \
     --kernel  /path/to/vmlinux \
-    --rootfs  /path/to/rootfs.ext4 \
-    --agent   /path/to/guest-agent \
+    --rootfs  /path/to/extracted-rootfs-TREE \
+    --agent   /path/to/remote-worker \
     --image   swebench-py311 \
     --vmm     firecracker \
     --guest-ram-mb 256 \
@@ -121,6 +121,15 @@ sudo PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin \
 ```
 
 Notes that cost time if missed:
+
+- **`--rootfs` is a DIRECTORY TREE, not a filesystem image.** The script does
+  `cp -a "$ROOTFS/." …` to layer the agent and its init on top, so an `.ext4` file fails with
+  `cp: cannot stat '…/rootfs.ext4/.': Not a directory`. Extract the image (or its squashfs)
+  first and pass the resulting tree.
+- **`--agent` is the remote-worker MODULE ROOT, not a prebuilt binary.** The script builds
+  the agent itself, statically, from `<that dir>/cmd/guest-agent`; passing a compiled binary
+  fails with `has no cmd/guest-agent; pass the remote-worker module root`. Building it
+  in-script is deliberate — the agent in the snapshot is then provably from this tree.
 
 - **`--out /srv/snapshots/default`.** The worker reads `SH_SNAPSHOT_DIR/SH_SNAPSHOT_IMAGE`
   and `SH_SNAPSHOT_IMAGE` defaults to `default`. Pointing `SH_SNAPSHOT_DIR` at the leaf

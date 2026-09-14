@@ -148,6 +148,32 @@ func realMain(args []string, stdout io.Writer) error {
 	// sets it either), so both binaries compute the identical figure from the
 	// identical inputs.
 	perVMBytes := vmpool.PerVMBytes(vmpool.Config{GuestRAMBytes: *guestMB << 20})
+
+	// Verify the snapshot against its own manifest before measuring anything with it, the
+	// same check cmd/microvm-worker/main.go makes at startup. The asymmetry was itself a
+	// defect: microvm-worker refused to start against a drifted snapshot while this binary
+	// happily produced a full set of latency numbers from one, and a rung measured against
+	// a corrupted image is not a degraded measurement -- it is a wrong one that looks fine.
+	//
+	// It matters here more than the phrase "diagnostic CLI" suggests, because E10's rungs
+	// 2-4 are driven entirely through this binary: every microVM figure the ladder reports
+	// comes from a run that until now never checked whether the image it restored was the
+	// image the manifest describes. On the validation rig it was not -- a writable root
+	// device had been mutating it (see build-snapshot.sh's is_read_only comment).
+	//
+	// Skipped for --vmm=fake, which has no snapshot to verify.
+	if *vmm != "fake" {
+		// Returned bare: main() already prefixes "vmpoolctl: " when it prints, and
+		// wrapping here produced "vmpoolctl: vmpoolctl: snapshot ... drifted" on the rig.
+		man, mErr := vmpool.LoadManifest(*snapshotDir)
+		if mErr != nil {
+			return mErr
+		}
+		if vErr := man.Verify(*snapshotDir); vErr != nil {
+			return vErr
+		}
+	}
+
 	lc, err := launcher(*vmm, *snapshotDir, perVMBytes)
 	if err != nil {
 		return err

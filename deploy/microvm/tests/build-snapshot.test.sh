@@ -32,6 +32,27 @@ if command -v shellcheck >/dev/null; then
   shellcheck "$SCRIPT" && check "shellcheck" "$?" "0"
 fi
 
+echo "== the golden rootfs is attached READ-ONLY, and the kernel is told to mount it ro"
+# Defect 11: the launcher HARDLINKS this snapshot's rootfs into every VM's jail (one shared
+# inode), so a writable root device means the guest mutates the golden snapshot itself.
+# Measured on the rig: an Exec whose command was literally `true` changed the rootfs hash,
+# because mounting ext4 rw rewrites the superblock's mount count and last-mount time. The
+# snapshot then failed its own Manifest.Verify and microvm-worker refused to start.
+#
+# Both halves are asserted, because either alone is insufficient: is_read_only without `ro`
+# makes the kernel attempt a rw mount of a read-only device (an early boot failure), and
+# `ro` without is_read_only leaves the device writable to anything that remounts.
+check "the rootfs drive is is_read_only:true" \
+  "$(grep -c '\\"drive_id\\":\\"rootfs\\".*\\"is_read_only\\":true' "$SCRIPT")" "1"
+check "the rootfs drive is NOT is_read_only:false anywhere" \
+  "$(grep -c '\\"drive_id\\":\\"rootfs\\".*\\"is_read_only\\":false' "$SCRIPT")" "0"
+check "boot_args tell the kernel to mount root ro" \
+  "$([ "$(grep -c 'boot_args.*[^a-z]ro[^a-z]' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+# The workspace drive must stay WRITABLE -- it is the one place a run is supposed to write,
+# and making it read-only too would be a plausible over-correction of the above.
+check "the workspace drive stays writable" \
+  "$(grep -c '\\"drive_id\\":\\"workspace\\".*\\"is_read_only\\":false' "$SCRIPT")" "1"
+
 echo "== it refuses to run without the inputs it cannot invent"
 for missing in --kernel --rootfs --agent --image; do
   out=$(bash "$SCRIPT" 2>&1)

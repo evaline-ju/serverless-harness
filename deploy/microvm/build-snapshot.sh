@@ -1336,10 +1336,27 @@ boot_quiesce_snapshot_firecracker() {
   # /snapshot/load call, and re-declaring them before or after that call is
   # rejected by the real binary (fix-round-8's rig failure: a stray PUT /vsock
   # copied from here into the verify function, forbidden before a restore).
+  # `ro` is required alongside the read-only rootfs drive below. Without it the kernel
+  # mounts its root rw by default, and a rw mount of a read-only block device fails --
+  # which surfaces as an early boot failure, not as a clear message. With it the kernel
+  # mounts ro and init's tmpfs mounts supply every writable path the guest needs.
   api_put "$api_sock" /boot-source \
-    "{\"kernel_image_path\":\"/kernel\",\"boot_args\":\"console=ttyS0 reboot=k panic=1 pci=off\"}"
+    "{\"kernel_image_path\":\"/kernel\",\"boot_args\":\"console=ttyS0 ro reboot=k panic=1 pci=off\"}"
+  # is_read_only TRUE. A writable root device silently CORRUPTS THIS SNAPSHOT: the
+  # launcher hardlinks the golden rootfs into every jail (os.Link, one shared inode), so
+  # anything the guest writes to /dev/vda lands on the golden file itself. Measured on the
+  # rig -- an Exec whose command was literally `true` changed the rootfs hash, because
+  # merely MOUNTING ext4 rw rewrites the superblock's mount count and last-mount time.
+  # After that, microvm-worker's own Manifest.Verify refuses to start ("rootfs drifted"),
+  # which is how this was found, and vmpoolctl (which had no such check until this change)
+  # went on measuring against a mutating image.
+  #
+  # Nothing legitimate is lost. sbin/init mounts tmpfs on /tmp and /var (see assemble_
+  # rootfs) so everything a run writes there is ephemeral by design, and /workspace is a
+  # SEPARATE rw drive. The Cloud Hypervisor path in this same script already passed
+  # `readonly=on` for its rootfs -- this makes the Firecracker arm agree with it.
   api_put "$api_sock" /drives/rootfs \
-    "{\"drive_id\":\"rootfs\",\"path_on_host\":\"/rootfs\",\"is_root_device\":true,\"is_read_only\":false}"
+    "{\"drive_id\":\"rootfs\",\"path_on_host\":\"/rootfs\",\"is_root_device\":true,\"is_read_only\":true}"
   api_put "$api_sock" /drives/workspace \
     "{\"drive_id\":\"workspace\",\"path_on_host\":\"/workspace.img\",\"is_root_device\":false,\"is_read_only\":false}"
   api_put "$api_sock" /vsock \
