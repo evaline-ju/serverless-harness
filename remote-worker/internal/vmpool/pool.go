@@ -117,6 +117,12 @@ type pool struct {
 	reclaimQ    chan reclaimBatch
 	reclaimDone sync.WaitGroup
 
+	// inFlightWarms counts background replenishment warms that have been admitted but
+	// not yet settled, so Close can wait for them. Not guarded by mu: it is a
+	// WaitGroup, and the Add/Wait ordering that makes it safe is the mu hold in
+	// replenishOne, not the counter itself. See Close.
+	inFlightWarms sync.WaitGroup
+
 	// clampLogged keeps the timeout clamp's log line to one per process. The
 	// per-Exec visibility is Stats().TimeoutsClamped — a caller that omits
 	// timeout_s on EVERY request would otherwise log once per Exec, at up to the
@@ -621,6 +627,29 @@ func (p *pool) Close() error {
 		rp.pending = nil
 	}
 	p.mu.Unlock()
+
+	// Wait for background replenishment warms already in flight. p.closed is now set,
+	// so each one takes replenishOne's post-warm `case p.closed` branch and destroys
+	// the VM it just built rather than parking it as a standby — but that branch only
+	// runs if its goroutine gets to run at all. Close's caller is usually a process
+	// that exits the moment Close returns (every vmpoolctl invocation, so every E10
+	// rung), and a warm cut short mid-Restore leaves the jailer it already spawned
+	// alive: it is in its own process group with no Pdeathsig, so it outlives its
+	// parent, holding that VM id's API socket. The next process to mint the same id
+	// dials that socket, finds a listener, and PUTs /snapshot/load into a microVM that
+	// is already loaded — Firecracker's "not supported after starting the microVM"
+	// (400), which is how E10 rung 4's teardown-bulk failed on its first execution.
+	// See TestCloseWaitsForAnInFlightReplenishmentWarm.
+	//
+	// Outside the lock, necessarily: replenishOne takes p.mu to settle. Before the
+	// victim destroys rather than after, so that by the time this returns every VM
+	// this pool created has been accounted for exactly once.
+	//
+	// Still NOT waited on, deliberately and as before: a cold warm in flight inside
+	// acquire (see acquire). That VM goes straight to its Exec caller, whose deferred
+	// destroy owns it — waiting here would make Close block on an unrelated Exec's
+	// whole restore, and it is not a leak.
+	p.inFlightWarms.Wait()
 
 	var firstErr error
 	for _, vm := range victims {

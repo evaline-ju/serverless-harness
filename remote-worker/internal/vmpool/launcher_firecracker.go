@@ -216,6 +216,35 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	// task-15 report); this matches Firecracker's jailer documentation, but Task 16
 	// or the first rig run should confirm it before trusting it further.
 	jailRoot := filepath.Join(l.opts.ChrootBase, filepath.Base(l.opts.FirecrackerBin), req.ID, "root")
+	apiSockHost := filepath.Join(jailRoot, apiSockRelPath)
+
+	// Refuse a jail some OTHER live VMM is still holding, before creating, spawning or
+	// removing anything. Without this, an id collision is silently destructive in both
+	// directions: waitForUnixSocket below DIALS (correctly — Firecracker creates the
+	// socket file before it accept()s on it), so a leaked VMM's live listener reads as
+	// this restore's own socket coming up, and LoadSnapshot lands on a microVM that is
+	// already loaded. Firecracker answers "not supported after starting the microVM"
+	// (400) — a message that names neither the collision nor the id, and points the
+	// reader at the snapshot instead of at the leak. Then cleanup() runs
+	// os.RemoveAll(jailRoot) against the LIVE foreign VM's jail while killing only the
+	// process group of the jailer THIS call started, so the collided-with VM loses its
+	// files and keeps running. That is exactly how E10 rung 4's teardown-bulk failed on
+	// its first execution and still left a live firecracker behind afterwards.
+	//
+	// Fixing Close's in-flight-warm leak (see pool.Close) removes the cause this
+	// branch actually hit, but not the class: SIGKILL, an OOM kill or a crash can
+	// orphan a VMM no Close-side tidiness can reach, and vmpoolctl runs no startup
+	// orphan sweep. A stale socket FILE with no listener is not a collision and must
+	// not be treated as one — verified on the rig, where leftover jail directories
+	// with no live process restored cleanly — so this asks the socket, not the
+	// filesystem. See TestFirecrackerRefusesAJailALiveVMMStillHolds and its
+	// free-jail converse.
+	if fcJailOccupied(apiSockHost) {
+		return nil, fmt.Errorf("firecracker: restore %s: a live VMM already holds this VM id's API socket at %s "+
+			"— refusing to load a snapshot into another microVM (an earlier run leaked a VMM at this id; "+
+			"kill it by cgroup membership under %s, never by process-name pattern)",
+			req.ID, apiSockHost, l.opts.ParentCgroup)
+	}
 
 	var cmd *exec.Cmd
 	// cleanup mirrors Destroy's error handling below: a failure here (permission,
@@ -338,7 +367,6 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: start jailer: %w", req.ID, err), cleanup())
 	}
 
-	apiSockHost := filepath.Join(jailRoot, apiSockRelPath)
 	if err := waitForUnixSocket(ctx, apiSockHost, 5*time.Second); err != nil {
 		return nil, errors.Join(fmt.Errorf("firecracker: restore %s: API socket never appeared: %w", req.ID, err), cleanup())
 	}
@@ -496,6 +524,25 @@ func buildWorkspaceImage(ctx context.Context, path string, sizeBytes int64) (str
 		return fail(err)
 	}
 	return tmp, nil
+}
+
+// fcJailOccupied reports whether some live VMM is already accept()ing on path — the
+// one-shot inverse of waitForUnixSocket's poll, and deliberately the same question
+// asked the same way, since a disagreement between the two is what let a collision
+// through in the first place.
+//
+// A socket FILE that no process is listening on answers false: dial fails with
+// ECONNREFUSED, the jail is genuinely free, and the restore proceeds. That is not a
+// tolerated edge case but the common one — a VM's Destroy removes its jail root, and a
+// crashed VMM leaves the file behind with nothing behind it. Treating file existence as
+// occupancy would refuse restores after any unclean exit.
+func fcJailOccupied(path string) bool {
+	conn, err := net.DialTimeout("unix", path, 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // waitForUnixSocket polls until a listener answers at path, or ctx ends, or timeout

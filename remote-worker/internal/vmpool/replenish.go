@@ -97,6 +97,15 @@ func (p *pool) replenishOne(key string) {
 	}
 	rp.warming++
 	dir, id := rp.dir, p.nextIDLocked()
+	// Registered under the SAME p.mu hold that verified !p.closed above, so no Add can
+	// land after Close's Wait: Close sets closed under p.mu and only then unlocks and
+	// waits, and any replenishOne reaching this lock afterwards returns at the check
+	// above without adding. The matching Done is deferred rather than placed at each
+	// return so it also covers the post-warm `case p.closed` branch below — which is
+	// the one that actually destroys this VM, and the one whose completion Close is
+	// waiting for. See Close for why waiting matters at all.
+	p.inFlightWarms.Add(1)
+	defer p.inFlightWarms.Done()
 	p.mu.Unlock()
 
 	vm, err := p.warm(context.Background(), key, dir, id)
