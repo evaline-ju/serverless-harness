@@ -45,6 +45,27 @@ substrate is not a degraded measurement — it is a wrong one that looks fine.
 | CPU governor       | `cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor` → `performance` | `sudo cpupower frequency-set -g performance`. If the path does not exist at all, that is fine — the script records `governor: not exposed` and proceeds |
 | root               | —                                                                           | both drivers need it (jailer chroot, cgroups, `mkfs.ext4`, `drop_caches`)                                                                               |
 
+### Tools, and which rungs die without them
+
+Check this **before** §4, not during it. E10 rung 1 does not silently skip when a tool is
+missing — it **dies**, taking the whole ladder with it, because a rung-1 timing measured
+against an absent `grpcurl` is a timing of `grpcurl` failing to launch.
+
+| Tool          | Needed by                                           | If absent                                                             |
+| ------------- | --------------------------------------------------- | --------------------------------------------------------------------- |
+| `jailer`      | E10 rungs 2–4, E11                                  | set `SH_JAILER_BIN`; nothing runs without it                          |
+| `firecracker` | E10 rungs 2–4, E11                                  | set `SH_FIRECRACKER_BIN`                                              |
+| `mkfs.ext4`   | every microVM rung (workspace images)               | install e2fsprogs; `PATH` must include `/sbin` and `/usr/sbin`        |
+| `go`          | E10 rungs 2–4 (builds `vmpoolctl`), E11 (2 workers) | install it; both drivers build their own binaries                     |
+| `grpcurl`     | **E10 rung 1**, **all of E11**                      | E10: `SH_E10_RUNGS='2 3 4'` to skip rung 1. E11 cannot run at all     |
+| `docker`      | **E10 rung 1**, **all of E11** (Redis)              | as above, or `SH_E10_START_STACK=0` to reuse an already-running stack |
+| `pnpm`        | **E10 rung 1** (starts the real sandbox-relay)      | `SH_E10_RUNGS='2 3 4'`, or `SH_E10_START_STACK=0`                     |
+
+If you skip rung 1 you lose the container baseline, and with it **sealed prediction 2**
+(warm hot path within 2x of the container baseline) — that prediction is a ratio against
+rung 1 and cannot be computed without it. Decide deliberately rather than by discovering a
+missing tool at run time.
+
 `sudo` resets the environment, so pass every `SH_*` variable explicitly on the command
 line. `sudo -E` is not sufficient and `PATH` must include `/sbin` and `/usr/sbin` for
 `mkfs.ext4`.
