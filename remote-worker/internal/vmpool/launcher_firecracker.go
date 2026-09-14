@@ -2,6 +2,7 @@ package vmpool
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -366,35 +367,135 @@ func (l *firecrackerLauncher) Restore(ctx context.Context, req RestoreRequest) (
 	}, nil
 }
 
-// ensureWorkspaceImage creates path as a sparse ext4 filesystem of sizeBytes if it
-// does not already exist. Called at most once per run (WorkspaceDir is one run's
-// directory, shared by every VM Restore creates for it), so the mkfs cost is paid
-// once per run rather than once per VM.
-func ensureWorkspaceImage(ctx context.Context, path string, sizeBytes int64) error {
-	if _, err := os.Stat(path); err == nil {
-		return nil
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return err
-	}
-	if err := f.Truncate(sizeBytes); err != nil {
-		_ = f.Close()
-		_ = os.Remove(path)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(path)
-		return err
-	}
+// The ext2/3/4 superblock lives at a fixed byte offset 1024 into the device, and its
+// 16-bit magic at offset 0x38 within it — so 0x438 into the image, for every block size
+// mkfs.ext4 can choose. That fixed position is what makes "is this file a formatted
+// filesystem?" a question with an answer, rather than one inferred from the file
+// existing.
+const (
+	ext4MagicOffset = 0x438
+	ext4Magic       = 0xEF53
+)
+
+// mkfsExt4 formats path in place. A package var rather than a direct call so tests can
+// substitute a formatter: mkfs.ext4 exists on the rig and on Linux CI, but not on a
+// macOS developer machine, and the ordering property this file's tests pin (a half-built
+// image is never at the final path) must be checkable everywhere — it is the property
+// whose absence left durable 2 GiB zero-filled "images" behind.
+var mkfsExt4 = func(ctx context.Context, path string) error {
 	out, err := exec.CommandContext(ctx, "mkfs.ext4", "-F", path).CombinedOutput()
 	if err != nil {
-		_ = os.Remove(path)
 		return fmt.Errorf("mkfs.ext4 %s: %w: %s", path, err, out)
 	}
 	return nil
+}
+
+// workspaceImageFormatted reports whether path is a formatted ext4 image. Absent, short
+// and zero-filled all answer false; only an unreadable file is an error.
+func workspaceImageFormatted(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	var b [2]byte
+	if _, err := f.ReadAt(b[:], ext4MagicOffset); err != nil {
+		// A file too short to hold a superblock is exactly the "created and Truncate'd
+		// but never formatted" case in a different disguise, not an IO fault.
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return false, err
+	}
+	return binary.LittleEndian.Uint16(b[:]) == ext4Magic, nil
+}
+
+// ensureWorkspaceImage makes path a formatted, sparse ext4 filesystem of sizeBytes.
+// Called at most once per run (WorkspaceDir is one run's directory, shared by every VM
+// Restore creates for it), so the mkfs cost is paid once per run rather than once per VM.
+//
+// IT USED TO TREAT "THE FILE EXISTS" AS "THE FILE IS FORMATTED", while creating and
+// Truncate'ing that very file well before mkfs ran on it. Two reachable outcomes, and
+// this function is shaped to answer both:
+//
+//   - DURABLE. The worker is killed (or the ctx is cancelled and the cleanup Remove also
+//     fails) between the Truncate and mkfs finishing. A 2 GiB zero-filled file then
+//     persists, every later Restore for that run hardlinks it, and every `mount /dev/vdb`
+//     in Resume fails for the whole WorkspaceIdle window with no self-healing. The magic
+//     check above is what makes that file recognisable, so the next Restore rebuilds it
+//     instead of inheriting it forever.
+//   - CONCURRENT. A replenish timer firing while a cold warm is mid-mkfs for the same key
+//     (both can hold warming — replenishOne only checks len(ready)+warming against
+//     StandbyDepth) saw the file present, returned nil, and hardlinked an unformatted
+//     image. The build now happens under a TEMP name in the same directory and is
+//     link(2)'d into place, so nothing is ever visible at path until it is a finished
+//     filesystem, and link — which refuses to clobber — means two concurrent builders
+//     cannot leave two inodes fighting over one path.
+//
+// A build that dies part-way therefore leaves at most a temp file no Restore will ever
+// hardlink, rather than something later treated as a valid image.
+func ensureWorkspaceImage(ctx context.Context, path string, sizeBytes int64) error {
+	if ok, err := workspaceImageFormatted(path); err != nil {
+		return err
+	} else if ok {
+		return nil
+	}
+	tmp, err := buildWorkspaceImage(ctx, path, sizeBytes)
+	if err != nil {
+		return err
+	}
+	// After a successful Link the image is reachable by its real name, so dropping the
+	// temp name leaves one link, not two; after a Rename this is a harmless ENOENT.
+	defer func() { _ = os.Remove(tmp) }()
+
+	switch err := os.Link(tmp, path); {
+	case err == nil:
+		return nil
+	case !os.IsExist(err):
+		return err
+	}
+	// Something appeared at path while we were building. If it is a real filesystem, a
+	// concurrent builder won the race and its image is as good as ours.
+	if ok, err := workspaceImageFormatted(path); err != nil {
+		return err
+	} else if ok {
+		return nil
+	}
+	// It is not a filesystem: an unformatted leftover from the pre-fix code path (or from
+	// a build killed between its own create and format). Replacing it IS the repair, and
+	// rename is the one operation that does it atomically.
+	return os.Rename(tmp, path)
+}
+
+// buildWorkspaceImage creates a sparse, formatted image under a temp name beside path and
+// returns that name. The caller owns the temp file on every path, including error.
+func buildWorkspaceImage(ctx context.Context, path string, sizeBytes int64) (string, error) {
+	// CreateTemp opens 0o600 — the same mode the image was created with before this
+	// function grew a temp name, and the mode Restore's chown to the jail UID/GID then
+	// relies on.
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".mkfs-*")
+	if err != nil {
+		return "", err
+	}
+	tmp := f.Name()
+	fail := func(err error) (string, error) {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	if err := f.Truncate(sizeBytes); err != nil {
+		_ = f.Close()
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		return fail(err)
+	}
+	if err := mkfsExt4(ctx, tmp); err != nil {
+		return fail(err)
+	}
+	return tmp, nil
 }
 
 // waitForUnixSocket polls until a listener answers at path, or ctx ends, or timeout
