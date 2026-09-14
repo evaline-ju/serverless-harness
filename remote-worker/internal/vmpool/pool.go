@@ -11,12 +11,59 @@ import (
 )
 
 // Exec is one command as the pool sees it: pb.Exec minus the wire types.
+//
+// TimeoutS is NOT taken at face value: it arrives from the relay as a plain proto3
+// field, so "absent" and "0" are indistinguishable on the wire, and 0 armed no timer
+// at all on either side. clampTimeoutS bounds it at this boundary — see its comment
+// for why this tier cannot honour "0 means unbounded" the way the container tier can.
 type Exec struct {
 	ReqID     uint64
 	Command   string
 	Stdin     []byte
 	TimeoutS  uint32
 	Streaming bool
+}
+
+// Bounds on Exec.TimeoutS. Every Exec is bounded; there is no unbounded form.
+//
+// DefaultExecTimeoutS is deliberately the SAME 30 minutes as
+// packages/k8s-sandbox/src/transport.ts's DEFAULT_EXEC_TIMEOUT_S, which every
+// transport already applies when a caller names no timeout (#182). So a request that
+// reaches this tier without a timeout now gets the budget the harness itself would
+// have chosen, not a different one invented here.
+//
+// MaxExecTimeoutS is the ceiling. It is four times the default rather than close to
+// it because a clamp that truncates a legitimate long command is worse than the
+// unbounded case it replaces: this number only has to be far below "forever" and
+// comfortably above anything the harness or the E10/E11 drivers ask for (the relay's
+// own deadline is the 30-minute default; vmpoolctl's -timeout-s default is 30s).
+const (
+	DefaultExecTimeoutS uint32 = 30 * 60
+	MaxExecTimeoutS     uint32 = 4 * DefaultExecTimeoutS
+)
+
+// clampTimeoutS bounds one Exec's timeout, returning the value to use and whether it
+// differs from what the caller asked for.
+//
+// WHY A ZERO CANNOT MEAN UNBOUNDED HERE. On the container tier an exec with
+// timeout_s == 0 is documented as unbounded (transport.ts), and what it pins is a pod
+// slot. On this tier the same request pins a live microVM, its admission-control
+// reservation against MaxCommittedBytes, AND — on the Firecracker arm, which
+// serializes per run — every subsequent Exec for that workspace_key, until the relay
+// stream dies. There is no code path that can free any of that while the guest never
+// answers, so "unbounded" is not a mode this tier can offer.
+//
+// The clamped value is what the host timer arms AND what is sent to the guest as its
+// own timeout_s (see ExecPhased), so the two sides cannot hold different budgets: the
+// guest is told exactly the bound the host is enforcing.
+func clampTimeoutS(timeoutS uint32) (uint32, bool) {
+	switch {
+	case timeoutS == 0:
+		return DefaultExecTimeoutS, true
+	case timeoutS > MaxExecTimeoutS:
+		return MaxExecTimeoutS, true
+	}
+	return timeoutS, false
 }
 
 // Pool is the package's whole contract (spec §4.1).
@@ -69,6 +116,13 @@ type pool struct {
 	ticker      Timer
 	reclaimQ    chan reclaimBatch
 	reclaimDone sync.WaitGroup
+
+	// clampLogged keeps the timeout clamp's log line to one per process. The
+	// per-Exec visibility is Stats().TimeoutsClamped — a caller that omits
+	// timeout_s on EVERY request would otherwise log once per Exec, at up to the
+	// tier's full Exec rate, which is how a real diagnostic becomes noise nobody
+	// reads.
+	clampLogged sync.Once
 }
 
 // New validates cfg and returns a Pool. It starts the reclaim goroutine and arms
@@ -172,16 +226,27 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 	// container worker times its exec around the entire process spawn for the same
 	// reason: the harness cannot tell the two tiers apart, and spec §6 requires a
 	// cold-acquire storm to stay "counted, never queued unboundedly."
+	//
+	// The bound is UNCONDITIONAL. It used to be armed only for TimeoutS > 0, and
+	// timeout_s is a plain proto3 field, so an Exec that simply omitted it was
+	// bounded by nothing on either side — see clampTimeoutS.
+	timeoutS, clamped := clampTimeoutS(e.TimeoutS)
+	if clamped {
+		p.counters.timeoutClamped()
+		p.clampLogged.Do(func() {
+			log.Printf("vmpool: Exec timeout_s=%d clamped to %d (default %d, ceiling %d); "+
+				"further clamps are counted in Stats().TimeoutsClamped, not logged",
+				e.TimeoutS, timeoutS, DefaultExecTimeoutS, MaxExecTimeoutS)
+		})
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var timedOut atomic.Bool
-	if e.TimeoutS > 0 {
-		tm := p.clk.AfterFunc(time.Duration(e.TimeoutS)*time.Second, func() {
-			timedOut.Store(true)
-			cancel()
-		})
-		defer tm.Stop()
-	}
+	tm := p.clk.AfterFunc(time.Duration(timeoutS)*time.Second, func() {
+		timedOut.Store(true)
+		cancel()
+	})
+	defer tm.Stop()
 
 	t0 := p.clk.Now()
 	vm, rp, cause, err := p.acquire(runCtx, key)
@@ -190,7 +255,7 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 		ph.Cold = cause
 	}
 	if err != nil {
-		if cErr := p.classify(ctx, &timedOut, e.TimeoutS); cErr != nil {
+		if cErr := p.classify(ctx, &timedOut, timeoutS); cErr != nil {
 			return Result{}, cErr
 		}
 		return Result{}, err
@@ -225,7 +290,7 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 		ph.Resume = p.clk.Now().Sub(t0)
 	}
 	if resumeErr != nil {
-		if cErr := p.classify(ctx, &timedOut, e.TimeoutS); cErr != nil {
+		if cErr := p.classify(ctx, &timedOut, timeoutS); cErr != nil {
 			return Result{}, cErr
 		}
 		return Result{}, p.refuse(RefuseSpawn, "resume %q: %v", key, resumeErr)
@@ -233,9 +298,12 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 
 	t0 = p.clk.Now()
 	res, runErr := vm.Run(runCtx, Command{
-		Command:   e.Command,
-		Stdin:     e.Stdin,
-		TimeoutS:  e.TimeoutS,
+		Command: e.Command,
+		Stdin:   e.Stdin,
+		// The CLAMPED value, not e.TimeoutS: the guest arms its own timer from this
+		// field, and the one thing worse than an unbounded Exec is a host and a guest
+		// enforcing different budgets for the same command.
+		TimeoutS:  timeoutS,
 		Streaming: e.Streaming,
 		CapBytes:  OutputCapBytes,
 	}, out)
@@ -243,7 +311,7 @@ func (p *pool) ExecPhased(ctx context.Context, key string, e Exec, out Sink, ph 
 		ph.Run = p.clk.Now().Sub(t0)
 	}
 
-	if cErr := p.classify(ctx, &timedOut, e.TimeoutS); cErr != nil {
+	if cErr := p.classify(ctx, &timedOut, timeoutS); cErr != nil {
 		return res, cErr
 	}
 	return res, runErr

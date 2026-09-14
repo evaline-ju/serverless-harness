@@ -21,6 +21,11 @@ type Stats struct {
 	Replenishments    uint64
 	ReplenishFailures uint64
 	DestroyFailures   uint64
+	// TimeoutsClamped counts Execs whose timeout_s this package had to bound
+	// (clampTimeoutS): absent/zero, or above MaxExecTimeoutS. A nonzero and growing
+	// figure is a caller-side fact, not a pool fault — most likely a relay that omits
+	// the field — and it is the only visibility on it after the first log line.
+	TimeoutsClamped uint64
 }
 
 // counters is the mutable half. A mutex over two small maps rather than atomics
@@ -33,6 +38,7 @@ type counters struct {
 	replenishments    uint64
 	replenishFailures uint64
 	destroyFailures   uint64
+	timeoutsClamped   uint64
 }
 
 func newCounters() *counters {
@@ -51,6 +57,8 @@ func (c *counters) replenishFailed() { c.mu.Lock(); c.replenishFailures++; c.mu.
 
 func (c *counters) destroyFailed() { c.mu.Lock(); c.destroyFailures++; c.mu.Unlock() }
 
+func (c *counters) timeoutClamped() { c.mu.Lock(); c.timeoutsClamped++; c.mu.Unlock() }
+
 func (c *counters) snapshot(into *Stats) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -58,6 +66,7 @@ func (c *counters) snapshot(into *Stats) {
 	into.Replenishments = c.replenishments
 	into.ReplenishFailures = c.replenishFailures
 	into.DestroyFailures = c.destroyFailures
+	into.TimeoutsClamped = c.timeoutsClamped
 	into.ColdAcquires = make(map[ColdCause]uint64, len(c.cold))
 	for k, v := range c.cold {
 		into.ColdAcquires[k] = v

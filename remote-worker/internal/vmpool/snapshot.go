@@ -141,6 +141,17 @@ func fileSHA256(path string) (string, error) {
 // checkKey requires the first character to be alphanumeric.
 const probeKey = "_probe"
 
+// probeCommandTimeoutS is the guest-side bound on the probe's `true`, and probeTimeout
+// is the HOST-side bound on the whole probe. Two numbers because they bound two
+// different things: the first is a field in a frame the guest reads, the second is the
+// only thing that holds if the guest never reads anything. probeTimeout must therefore
+// exceed probeCommandTimeoutS with room for a cold restore and a resume, or a wedged
+// guest would be reported as a host-side deadline rather than as the timeout it is.
+const (
+	probeCommandTimeoutS uint32 = 30
+	probeTimeout                = 90 * time.Second
+)
+
 // Probe restores one VM, runs a trivial command in it and destroys it.
 //
 // Spec §6's last row: the pinned hash is not sufficient, because a snapshot can be
@@ -149,6 +160,21 @@ const probeKey = "_probe"
 // user's first request. It bypasses checkKey deliberately, using a reserved key that
 // no wire value can spell.
 func (p *pool) Probe(ctx context.Context) error {
+	// A DEADLINE OF ITS OWN. Probe's whole reason for existing is to fail the unit at
+	// START rather than on a user's first request, and its caller
+	// (cmd/microvm-worker/main.go) passes context.Background(). The Command below
+	// carries a timeout_s, but that field only arms the GUEST's timer — a guest that
+	// accepts the vsock connection and then never answers, or a VMM that never
+	// finishes restoring, would hang worker startup forever, which is the exact
+	// opposite of what this function is for.
+	//
+	// Armed off p.clk, not context.WithTimeout, for the same reason everything else
+	// in this package takes a Clock: a test must be able to drive this expiry.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	tm := p.clk.AfterFunc(probeTimeout, cancel)
+	defer tm.Stop()
+
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
@@ -171,7 +197,7 @@ func (p *pool) Probe(ctx context.Context) error {
 	if err := vm.Resume(ctx); err != nil {
 		return fmt.Errorf("startup probe: could not resume: %w", err)
 	}
-	res, err := vm.Run(ctx, Command{Command: "true", TimeoutS: 30, CapBytes: OutputCapBytes}, discardingSink{})
+	res, err := vm.Run(ctx, Command{Command: "true", TimeoutS: probeCommandTimeoutS, CapBytes: OutputCapBytes}, discardingSink{})
 	if err != nil {
 		return fmt.Errorf("startup probe: guest did not answer: %w", err)
 	}
