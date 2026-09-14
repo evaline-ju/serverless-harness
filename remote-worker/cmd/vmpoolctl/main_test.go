@@ -71,8 +71,20 @@ func TestRunsOneExecInAVMAndReportsItAsJSON(t *testing.T) {
 	if rec.WarmAcquires+sumUint(rec.ColdAcquires) != 3 {
 		t.Errorf("acquires = %d warm + %v cold, want 3 total", rec.WarmAcquires, rec.ColdAcquires)
 	}
-	if rec.P50AcquireUs == 0 || rec.P50RunUs == 0 || rec.P50DestroyUs == 0 {
-		t.Errorf("record = %+v, want the hot path decomposed into acquire/run/destroy", rec)
+	// Only the RUN term is asserted nonzero, and only because the fake launcher really
+	// shells out to `bash -c`, so it costs milliseconds on any machine. Acquire and
+	// destroy do not: FakeLauncher.Restore is a map insert and the fake VM's Destroy is
+	// bookkeeping, both well under a microsecond, so a p50 of 0 is the CORRECT reading on
+	// a fast machine rather than a defect. This is the same reasoning the resume field
+	// below already used, applied consistently -- asserting a duration is nonzero asserts
+	// that the clock had resolution, not that the code works.
+	if rec.P50RunUs == 0 {
+		t.Errorf("record = %+v, want a measurable run term (the fake really runs bash)", rec)
+	}
+	for _, field := range []string{`"p50_acquire_us"`, `"p95_acquire_us"`, `"p50_destroy_us"`, `"p95_destroy_us"`} {
+		if !strings.Contains(out, field) {
+			t.Errorf("record missing %s — the hot path must be decomposed into acquire/run/destroy, out=%s", field, out)
+		}
 	}
 	// Resume is a term too — on the Firecracker arm it performs the workspace
 	// mount, exactly a cost this benchmark exists to expose. The fake's Resume is
@@ -197,8 +209,14 @@ func TestModeReplenishMeasuresRestoreOnly(t *testing.T) {
 	}
 	// Rung 3 measures spawn -> restore -> pause -> ready, WALL AND CPU. Spec §7.2: "The
 	// CPU number is what §7.3 divides into host capacity. Wall time alone misleads."
-	if rec.Mode != "replenish" || rec.P50AcquireUs == 0 {
-		t.Fatalf("rec = %+v", rec)
+	// The acquire term is reported as a FIELD, not asserted nonzero: replenishment on the
+	// fake launcher is a map insert, so its p50 legitimately rounds to 0us. What must hold
+	// is that a replenishment rung is labelled as one and carries the phase it measures.
+	if rec.Mode != "replenish" {
+		t.Fatalf("Mode = %q, want replenish (rec = %+v)", rec.Mode, rec)
+	}
+	if !strings.Contains(out, `"p50_acquire_us"`) {
+		t.Fatalf("replenish record missing p50_acquire_us, out=%s", out)
 	}
 	if rec.CPUChildUs < 0 {
 		t.Fatalf("CPUChildUs = %d", rec.CPUChildUs)
