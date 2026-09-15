@@ -825,6 +825,49 @@ d = json.load(open('$RESULTS/e10-rung2-${arm}-${SUBSTRATE}-parked.json'))
 print(d.get('p50_run_us',0)+d.get('p50_acquire_us',0)+d.get('p50_resume_us',0)+d.get('p50_destroy_us',0))
 ")" || die "could not read the rung 2 record at $RESULTS/e10-rung2-${arm}-${SUBSTRATE}-parked.json (the traceback is above) - refusing to print a section 7.2 verdict about a warm hot path that was never measured"
   warm_us="$(require_positive warm_hot_path_p50_us "$warm_us")" || exit 1
+
+  # WAS THE WARM RUNG ACTUALLY WARM? Nothing used to ask, and that is how the metal smoke pass
+  # produced a STOP verdict against the design from a rung that had measured the COLD path.
+  # Its own record said so:
+  #     warm_acquires: 1   cold_acquires: {exhausted: 3, first-exec: 1}   p50_acquire_us: 23747
+  # One warm acquire out of five; a genuine warm acquire is ~1us, not 23ms. At a small ITERS the
+  # standby pool cannot refill between back-to-back Execs (ReplenishDelay is 200ms), so rung 2
+  # measures replenishment rather than the parked-standby pop it is named for -- and verdict()
+  # read p50_total_us and called it the warm hot path regardless.
+  #
+  # This is the highest-stakes instance of the class these drivers already guard elsewhere ("a
+  # p95 of 0 at a rung where every Exec failed is not a fast rung"), because the STOP row only
+  # fires on metal and is the single most consequential output of the experiment: it recommends
+  # abandoning the design.
+  #
+  # A strict majority of WARM acquires is the floor, and that number is not arbitrary: the figure
+  # under test is a p50, a MEDIAN, so it falls inside the warm population exactly when warm >
+  # 50%. Below that the median is a cold sample and the verdict would be about the wrong
+  # quantity; above it, the mix still belongs in the record so a narrow pass can be weighed
+  # rather than trusted.
+  #
+  # Measured on metal, which is also the proof this is not a blanket refusal -- it fires on a
+  # smoke pass and passes at the size the real run uses:
+  #     ITERS=5    warm 1  cold 4   ( 20% warm)  -> refused
+  #     ITERS=20   warm 11 cold 9   ( 55% warm)  -> passes
+  #     ITERS=60   warm 42 cold 18  ( 70% warm)  -> passes
+  #     ITERS=200  warm 148 cold 52 ( 74% warm)  -> passes, the authoritative shape
+  # Fixing a refused mix is a matter of raising ITERS, not of overriding a check, so there is
+  # deliberately no override.
+  local acq_mix warm_acq cold_acq
+  acq_mix="$(python3 -c "
+import json
+d = json.load(open('$RESULTS/e10-rung2-${arm}-${SUBSTRATE}-parked.json'))
+warm = int(d.get('warm_acquires', 0))
+cold = sum(int(v) for v in (d.get('cold_acquires') or {}).values())
+print(f'{warm} {cold}')
+")" || die "could not read the acquire mix out of the rung 2 record - refusing to print a section 7.2 verdict without knowing whether the warm rung was warm"
+  warm_acq="${acq_mix% *}"
+  cold_acq="${acq_mix#* }"
+  log "rung2 acquire mix: warm=$warm_acq cold=$cold_acq (the warm hot path is only the warm ones)"
+  if [ "$((warm_acq * 2))" -le "$((warm_acq + cold_acq))" ]; then
+    die "rung 2's acquires were $warm_acq warm and $cold_acq cold, so its p50 is not a warm-hot-path measurement - it is dominated by cold replenishment, and a section 7.2 verdict computed from it would be about the wrong thing (the STOP row recommends abandoning the design). Raise ITERS so replenishment can keep up with the Exec rate: at ITERS=5 the pool cannot refill between back-to-back Execs, because ReplenishDelay is 200ms."
+  fi
   repl_us="$(python3 -c "
 import json
 d = json.load(open('$RESULTS/e10-rung3-${arm}-${SUBSTRATE}-pinned.json'))
@@ -872,6 +915,10 @@ summary = {
   'warmup': $WARMUP,
   'container_p50_ms': $container_ms,
   'warm_p50_ms': $warm_ms,
+  # The mix behind that p50. A warm-hot-path number is only as good as the fraction of its
+  # acquires that were actually warm, and the metal smoke pass produced one that was 1-in-5.
+  'rung2_warm_acquires': $warm_acq,
+  'rung2_cold_acquires': $cold_acq,
   'replenishment_cpu_p50_ms': $repl_ms,
 }
 print(json.dumps(summary, indent=2))

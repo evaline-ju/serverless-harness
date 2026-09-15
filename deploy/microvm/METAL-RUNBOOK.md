@@ -238,6 +238,13 @@ false "leaked relay" reading during validation.
 The point is to prove the instrument runs end to end, not to get a number. Use the same
 `SH_SUBSTRATE` you will use for real, so the record shape is identical.
 
+> **The smoke pass produces NO usable verdict, and now says so.** At `ITERS=5` rung 2's standby
+> pool cannot refill between Execs, so its acquires are mostly cold and its "warm hot path" p50
+> is a cold-path number. On metal that combination printed
+> `STOP: warm hot path 69.87ms >= 15ms` — a recommendation to abandon the design, computed from
+> four Execs of which one was warm. E10 now refuses the verdict when the warm rung was not warm.
+> Treat §4 as proof the instrument runs, and nothing else.
+>
 > **A smoke pass at `ITERS=5` cannot catch a failure that only exists at scale.** It has
 > already missed one: `teardown-bulk` used to take its batch size from `--iterations`, so
 > `ITERS=5` built 10 VMs and passed while `ITERS=200` asked for 400, exhausted the
@@ -301,7 +308,16 @@ and prediction 3 came back "falsified" on that basis alone.
 
 The threshold only needs to serve the **microVM** arm: the container arm has no standbys at all
 (`standbysResident: 0`), so "cold acquire" has no referent there. And E10 measures exactly what
-E11 has to assume — so run E10 first and read two numbers out of it:
+E11 has to assume — so run E10 first and read two numbers out of it.
+
+> **Read them from the REAL run, never from the §4 smoke pass.** At a small `ITERS` the standby
+> pool cannot refill between back-to-back Execs (`ReplenishDelay` is 200ms), so rung 2's acquires
+> come out mostly **cold** and its p50 is a replenishment number, not a warm one. Measured on
+> metal at `ITERS=5`: one warm acquire out of five, `p50_acquire_us` 23747 where a genuine warm
+> acquire is ~1µs. A threshold derived from that is calibrated against the wrong quantity. E10
+> now refuses to print a §7.2 verdict when that happens and prints the mix either way — check
+> `rung2_warm_acquires` / `rung2_cold_acquires` in `e10-summary.json` before trusting either
+> number.
 
 ```bash
 # warm Exec latency on this host — rung 2, parked variant

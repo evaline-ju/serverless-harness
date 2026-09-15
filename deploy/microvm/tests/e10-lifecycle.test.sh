@@ -102,6 +102,28 @@ out=$(env SH_SUBSTRATE=nested-test -u SH_SNAPSHOT_DIR -u SH_WORKSPACE_ROOT bash 
 rc=$?
 check "refuses without SH_SNAPSHOT_DIR/SH_WORKSPACE_ROOT" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
 
+echo "== no section 7.2 verdict is printed when the warm rung was not actually warm"
+# Defect 18, found by the metal smoke pass: verdict() read rung 2's p50_total_us and called it
+# the warm hot path without ever asking whether those acquires were warm. At ITERS=5 they were
+# not -- one warm out of five, the rest cold because the pool cannot refill between Execs -- and
+# the driver printed "STOP: warm hot path 69.87ms >= 15ms on metal", a recommendation to abandon
+# the design, from a cold-path number. This is the highest-stakes instance of a class these
+# drivers already guard ("a p95 of 0 at a rung where every Exec failed is not a fast rung").
+check "the verdict path reads the acquire mix at all" \
+  "$([ "$(grep -c 'warm_acquires' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "it refuses on a cold-dominated warm rung" \
+  "$([ "$(grep -c 'is not a warm-hot-path measurement' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+check "the refusal names the fix (raise ITERS), not an override" \
+  "$([ "$(grep -c 'Raise ITERS so replenishment' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+# The mix must reach the RECORD too, not just stderr: a reader judging a run that passed
+# narrowly needs the numbers, and a verdict is only as good as the fraction behind it.
+check "the summary records the mix" \
+  "$(grep -c "rung2_warm_acquires" "$SCRIPT")" "1"
+# And the guard must be a MAJORITY test, not "any cold at all": the very first Exec of a run is
+# structurally a cold acquire (first-exec), so refusing on any cold would refuse every run.
+check "the guard is a majority test, so a structural first-exec cold does not fail it" \
+  "$([ "$(grep -c 'warm_acq \* 2' "$SCRIPT")" -ge 1 ] && echo yes || echo no)" "yes"
+
 echo "== the missing-snapshot guard actually STOPS the run"
 # It did not. die() was defined 53 lines below its first caller, so with a wrong
 # SH_SNAPSHOT_DIR bash printed "die: command not found" and -- because this script sets
@@ -600,6 +622,12 @@ if [ -n "$summary_body" ]; then
       GOVERNOR_STATE="not exposed"
       ITERS=5 WARMUP=1
       container_ms="$1" warm_ms="$2" repl_ms="$3"
+      # The acquire mix the writer also records. Every variable the extracted writer
+      # interpolates has to exist in this fixture, or the isolation test fails on the
+      # fixture rather than on the writer -- which is how adding these two fields first
+      # showed up. The values are the metal smoke pass's real mix (1 warm of 5), which is
+      # exactly the shape the verdict guard refuses.
+      warm_acq=1 cold_acq=4
       eval "$summary_body"
     )
   }
