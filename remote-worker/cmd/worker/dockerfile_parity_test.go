@@ -26,6 +26,11 @@ import (
 // the surrounding comment prose -- "the worker runs `bash -c`", "git and python3 are here because...",
 // and `file` inside the word "Dockerfile". Deleting `git python3` from both install lines passed. A
 // guard that a comment can satisfy is worse than no guard, because it reads as covered.
+//
+// When changing this file, mutate the Dockerfiles by ADDING text as well as by deleting it. Both
+// holes found in review were opened by an addition -- explanatory comment blocks the first time, a
+// trailing comment on the install line the second -- and a mutation set that only subtracts cannot
+// find either: every deletion case still failed correctly while both holes were wide open.
 
 // source says what puts a probed tool on PATH and, critically, WHERE that has to appear. A package has
 // to be a field of the microdnf install list; a vendored binary has to appear in a RUN instruction.
@@ -59,7 +64,13 @@ var (
 	// group and mode rather than on whether the words appear somewhere.
 	workspaceInstall = regexp.MustCompile(`(?m)^RUN install -d ((?:-[ogm] \S+ +)+)/workspace\s*$`)
 	workdirLine      = regexp.MustCompile(`(?m)^WORKDIR /workspace\s*$`)
-	commentLine      = regexp.MustCompile(`(?m)^\s*#.*$`)
+	commentLine      = regexp.MustCompile(`(?m)^[ \t]*#[^\n]*$`)
+	// A TRAILING comment is the case a line-oriented stripper misses, and the install list is the
+	// one place it matters: installLine captures to end-of-line, so `... file # dropped git python3`
+	// puts the comment's words into the captured text and strings.Fields turns them into packages.
+	// In shell `#` opens a comment only at a word boundary, which is what the leading [ \t]+ encodes
+	// (`a#b` is not a comment); neither Dockerfile has a mid-line `#` in any other position.
+	inlineComment = regexp.MustCompile(`[ \t]+#[^\n]*`)
 )
 
 func dockerfiles(t *testing.T) map[string]string {
@@ -77,10 +88,13 @@ func dockerfiles(t *testing.T) map[string]string {
 	return out
 }
 
-// code returns the Dockerfile with every comment line removed, so no assertion below can be satisfied
-// by prose. This is the whole reason the earlier revision of this test was hollow.
+// code returns the Dockerfile with comments removed -- whole-line AND trailing -- so no assertion
+// below can be satisfied by prose. This is the whole reason the earlier revisions of this test were
+// hollow, twice: first because it matched the raw body, then because stripping only whole-line
+// comments still let a trailing `# dropped git python3` be parsed as two installed packages.
 func code(body string) string {
-	return commentLine.ReplaceAllString(body, "")
+	body = commentLine.ReplaceAllString(body, "")
+	return inlineComment.ReplaceAllString(body, "")
 }
 
 // runtimePackages returns the package list from the runtime stage's microdnf install. The last match
@@ -154,6 +168,28 @@ func TestBothDockerfilesInstallTheSamePackages(t *testing.T) {
 	}
 }
 
+// canonicalInstallFlags turns a captured "-o 1001 -g 0 -m 775" into an order-independent
+// "-g=0 -m=775 -o=1001". `install` itself does not care about flag order -- both spellings produce a
+// byte-identical directory (checked with stat) -- so comparing source order would report drift
+// between two files that agree. Sorting the raw fields would scramble flag/value pairs, so they are
+// paired first. This is the same defect as the one fixed in the package-set comparison.
+func canonicalInstallFlags(t *testing.T, name, captured string) string {
+	t.Helper()
+	f := strings.Fields(captured)
+	if len(f)%2 != 0 {
+		t.Errorf("%s: cannot pair up `install -d` flags %q -- an odd field count means this test's "+
+			"regex captured something it does not understand, so the comparison below would be "+
+			"meaningless rather than wrong", name, captured)
+		return ""
+	}
+	pairs := make([]string, 0, len(f)/2)
+	for i := 0; i < len(f); i += 2 {
+		pairs = append(pairs, f[i]+"="+f[i+1])
+	}
+	slices.Sort(pairs)
+	return strings.Join(pairs, " ")
+}
+
 // /workspace was this PR's primary find and the more confusing of the two failures: the exec dies on
 // `cd /workspace` before running anything the caller asked for, so a sandbox that is attached, healthy
 // and reachable returns a tool error. It was also the one thing this file did not cover -- both the
@@ -170,7 +206,7 @@ func TestBothDockerfilesCreateWorkspaceIdentically(t *testing.T) {
 				"tool call fails inside a sandbox that looks healthy.", name)
 			continue
 		}
-		flags[name] = strings.Join(strings.Fields(m[1]), " ")
+		flags[name] = canonicalInstallFlags(t, name, m[1])
 
 		// runner.go's "every command is self-contained as `cd 'cwd' && ...`" is the only thing making
 		// the process cwd irrelevant today. WORKDIR is what keeps a bare command, or an operator's
@@ -181,9 +217,11 @@ func TestBothDockerfilesCreateWorkspaceIdentically(t *testing.T) {
 		}
 	}
 	if a, b := flags["Dockerfile"], flags["Dockerfile.runtime"]; a != "" && b != "" && a != b {
+		// Printed in canonical form, so a reader sees the actual disagreement rather than two
+		// spellings that look equivalent.
 		t.Errorf("the two leaf Dockerfiles create /workspace with different owner/group/mode, so an "+
 			"agent's ability to write in its own workspace depends on which build path an operator "+
-			"used:\n  Dockerfile:         install -d %s /workspace\n  Dockerfile.runtime: install -d %s /workspace", a, b)
+			"used (flags shown normalised as flag=value, sorted):\n  Dockerfile:         %s\n  Dockerfile.runtime: %s", a, b)
 	}
 }
 
