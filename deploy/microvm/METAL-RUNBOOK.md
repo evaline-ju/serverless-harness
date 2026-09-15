@@ -196,6 +196,43 @@ A jail directory left behind with **no** live process is a different, milder cas
 restore fails loudly after a 5s socket timeout, removes the stale jail, and an immediate
 retry succeeds. Clearing first avoids paying that per orphaned id.
 
+### Also clear a leaked relay, and do it between the smoke pass and the real run
+
+A leaked **relay** is a quieter hazard than a leaked VMM, and it matters here specifically
+because **this runbook runs the drivers twice** — the §4 smoke pass and then the §5 real run.
+The drivers background the relay with `( … & echo $! > pidfile )`, which captures the
+backgrounding subshell rather than the relay itself, so teardown can SIGTERM the wrong process
+and leave the relay holding its port after the run.
+
+If that happens, the next run does not fail cleanly. Its own relay cannot bind, so it dies with
+`EADDRINUSE` into its own log; the driver's liveness check then sees _something_ listening on
+the port and proceeds, because it cannot tell the right relay from a stale one; and the run
+measures against a relay whose worker registration belongs to the previous invocation. That is
+silently wrong data, which is worse than a crash.
+
+The ports are `8443` (E10 rung 1) and `8444` (E11) for the relays, `6380` and `6381` for their
+scratch redises. Clear by **port and container name**, which cannot self-match the way
+`pgrep -f` can:
+
+```bash
+# what is holding the driver ports, if anything
+sudo ss -ltnp | grep -E ':8443|:8444|:6380|:6381'
+
+# kill whatever is listening on them, by port rather than by name
+for port in 8443 8444; do
+  pid=$(sudo ss -ltnp "sport = :$port" | grep -oP 'pid=\K[0-9]+' | head -1)
+  [ -n "$pid" ] && sudo kill "$pid"
+done
+
+# and the drivers' own scratch redis containers (named sh-e10-redis-* / sh-e11-redis-*)
+sudo docker ps -aq --filter 'name=sh-e10-redis' --filter 'name=sh-e11-redis' |
+  xargs -r sudo docker rm -f
+```
+
+Verify with `ss`, not with `pgrep -f sandbox-relay`: that pattern matches the command line of
+the very shell you run it from, so it reports a relay that does not exist. It cost a
+false "leaked relay" reading during validation.
+
 ## 4. Smoke pass first — two minutes, not ninety
 
 The point is to prove the instrument runs end to end, not to get a number. Use the same
