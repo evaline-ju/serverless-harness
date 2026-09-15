@@ -310,7 +310,15 @@ The threshold only needs to serve the **microVM** arm: the container arm has no 
 (`standbysResident: 0`), so "cold acquire" has no referent there. And E10 measures exactly what
 E11 has to assume — so run E10 first and read two numbers out of it.
 
-> **Read them from the REAL run, never from the §4 smoke pass.** At a small `ITERS` the standby
+> **Derive it from E11's OWN latencies, not E10's.** E10 rung 2 drives `vmpool` DIRECTLY, with
+> no relay in the path; E11 measures the RELAYED path. On metal those differ by more than 2x --
+> E10's warm p50 was 55ms while E11's microVM c=1 p95 was 133ms -- so a threshold taken from E10
+> sits _below_ E11's warm floor, classifies every Exec as cold, and the analyzer then (correctly)
+> refuses to score prediction 3. Take the c=1 p95 from a prior E11 run on this host and add half
+> the restore cost E10 rung 3 measured: 133 + 23/2 gave 145 here. The first authoritative run
+> used 67, derived the wrong way, and P3 came back inconclusive for exactly that reason.
+>
+> **And read E10's numbers from the REAL run, never from the §4 smoke pass.** At a small `ITERS` the standby
 > pool cannot refill between back-to-back Execs (`ReplenishDelay` is 200ms), so rung 2's acquires
 > come out mostly **cold** and its p50 is a replenishment number, not a warm one. Measured on
 > metal at `ITERS=5`: one warm acquire out of five, `p50_acquire_us` 23747 where a genuine warm
