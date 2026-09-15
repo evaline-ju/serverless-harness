@@ -789,7 +789,7 @@ print_verdict() {
   echo "=== E10 decision-rule verdict (substrate=$substrate) ==="
   echo "warm hot path p50 = ${warm_ms}ms ($substrate)   container baseline p50 = ${container_ms}ms"
   echo "ratio = ${ratio}   ->  ${warm_verdict}"
-  echo "replenishment CPU p50 = ${repl_ms}ms      ->  ${repl_verdict}"
+  echo "replenishment CPU per restore (mean) = ${repl_ms}ms      ->  ${repl_verdict}"
   if [ "$substrate" != "metal" ]; then
     echo "(substrate is not metal: this is a schedule-a-metal-run recommendation, never a stop or mandatory verdict - hardware-corrections E9)"
   fi
@@ -868,12 +868,25 @@ print(f'{warm} {cold}')
   if [ "$((warm_acq * 2))" -le "$((warm_acq + cold_acq))" ]; then
     die "rung 2's acquires were $warm_acq warm and $cold_acq cold, so its p50 is not a warm-hot-path measurement - it is dominated by cold replenishment, and a section 7.2 verdict computed from it would be about the wrong thing (the STOP row recommends abandoning the design). Raise ITERS so replenishment can keep up with the Exec rate: at ITERS=5 the pool cannot refill between back-to-back Execs, because ReplenishDelay is 200ms."
   fi
+  # PER RESTORE, not the run total. cpu_child_us is RUSAGE_CHILDREN's delta across the whole
+  # measured window -- a sum over every restore in the rung -- while section 7.2's thresholds
+  # (< 25ms metal, the [25,50]ms band, > 50ms MANDATORY) are the CPU cost of ONE replenishment.
+  # Comparing the sum against them made the verdict a function of ITERS: the authoritative metal
+  # run reported 1927.43ms and fired MANDATORY, where the real figure is 1927435us / 180 restores
+  # = 10.71ms, comfortably inside row 1. The nested rig passed that row only because ITERS=5 made
+  # the sum small (~27ms), which is the same artefact wearing the opposite sign.
+  #
+  # It is a MEAN, not a p50 -- a single RUSAGE total cannot yield a median -- so the label says
+  # so. The old output called it "p50", which promised per-iteration while carrying a total.
   repl_us="$(python3 -c "
 import json
 d = json.load(open('$RESULTS/e10-rung3-${arm}-${SUBSTRATE}-pinned.json'))
-print(d.get('cpu_child_us',0))
+measured = int(d.get('iterations',0)) - int(d.get('warmup_discarded',0))
+if measured <= 0:
+    raise SystemExit('rung 3 recorded %d measured iterations, so a per-restore CPU cost cannot be derived' % measured)
+print(int(round(d.get('cpu_child_us',0) / measured)))
 ")" || die "could not read the rung 3 record at $RESULTS/e10-rung3-${arm}-${SUBSTRATE}-pinned.json (the traceback is above) - refusing to print a section 7.2 verdict about a replenishment CPU cost that was never measured"
-  repl_us="$(require_positive replenishment_cpu_p50_us "$repl_us")" || exit 1
+  repl_us="$(require_positive replenishment_cpu_mean_us_per_restore "$repl_us")" || exit 1
   if ! wants_rung 1; then
     # The rung 2/3/4 records are already on disk; what cannot be produced is the RATIO row,
     # because section 7.2's middle band is defined against the container baseline. Say that,
@@ -919,7 +932,9 @@ summary = {
   # acquires that were actually warm, and the metal smoke pass produced one that was 1-in-5.
   'rung2_warm_acquires': $warm_acq,
   'rung2_cold_acquires': $cold_acq,
-  'replenishment_cpu_p50_ms': $repl_ms,
+  # Renamed from replenishment_cpu_p50_ms: it was never a p50, and while it held a run TOTAL
+  # the name made that impossible to notice.
+  'replenishment_cpu_mean_ms_per_restore': $repl_ms,
 }
 print(json.dumps(summary, indent=2))
 " >"$RESULTS/e10-summary.json"

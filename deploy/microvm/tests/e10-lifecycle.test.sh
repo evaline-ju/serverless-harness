@@ -651,7 +651,7 @@ if [ -n "$summary_body" ]; then
   check "a representative summary writes successfully" "$sm_rc" "0"
   check "  ...with no error output" "$sm_err" ""
   check "  ...and json.load parses it" \
-    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["container_p50_ms"], d["warm_p50_ms"], d["replenishment_cpu_p50_ms"], d["governor"])' "$sm_tmpdir/e10-summary.json" 2>&1)" \
+    "$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["container_p50_ms"], d["warm_p50_ms"], d["replenishment_cpu_mean_ms_per_restore"], d["governor"])' "$sm_tmpdir/e10-summary.json" 2>&1)" \
     "2.5 3.75 12.0 not exposed"
   rm -rf "$sm_tmpdir"
 fi
