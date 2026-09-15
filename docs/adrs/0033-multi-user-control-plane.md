@@ -1,6 +1,6 @@
 # ADR-0033: An always-on control plane owns multi-user identity and credentials
 
-- **Status:** Proposed <!-- Proposed → Accepted → Superseded by ADR-NNNN / Deprecated -->
+- **Status:** Accepted <!-- Proposed → Accepted → Superseded by ADR-NNNN / Deprecated -->
 - **Date:** 2026-09-08
 - **Deciders:** Serverless Harness team
 - **Spec:** [`../specs/2026-09-08-multi-user-control-plane-design.md`](../specs/2026-09-08-multi-user-control-plane-design.md)
@@ -79,8 +79,10 @@ The containments are the reason the cost is bounded:
   resolvable credential, so a credential-less session fails closed instead of borrowing its
   neighbour's. Pinned by a test that sets `ANTHROPIC_AUTH_TOKEN` in the environment and asserts the
   session is still refused.
-- Positive: the harness cannot forge identity. Ed25519 with a public-key-only verifier makes that
-  structural rather than procedural.
+- Positive: the harness cannot forge identity **from the sandbox tier**, where model code runs. Ed25519
+  with a public-key-only verifier makes that structural rather than procedural — but namespace
+  collocation (below) means code execution in the harness pod itself can still reach the signing key,
+  so the guarantee is bounded to the tier, not absolute. Spec §8.1/§8.2.
 - Positive: the control plane stays off the data path — one small exchange per turn, and it never sees a
   prompt or a model response.
 - Negative / accepted cost: the identity minter and the credential store are one component, against
@@ -96,7 +98,7 @@ The containments are the reason the cost is bounded:
   policy** (two checks) rather than **by construction** (nothing reachable). The spec §3.5 refuses to
   blur the two, and §9.3 test 1 asserts the policy form now and tightens later.
 - Negative / accepted cost: the operator-key fallback does not disappear, it relocates — behind
-  `ALLOW_OPERATOR_FALLBACK` (default `false`), resolved by the trusted tier where it is attributable and
+  `SH_ALLOW_OPERATOR_FALLBACK` (default `false`), resolved by the trusted tier where it is attributable and
   logged rather than ambient in the harness.
 - Negative / accepted cost: revoking a user at the identity provider does not stop their scheduled runs,
   because the stored credential — not an OIDC grant — is what authorizes background egress.
@@ -113,6 +115,13 @@ The containments are the reason the cost is bounded:
   pod; isolation holds at the API, session store, and inference credential only, and the demo says so.
   The tenant-labelled partition is blocked on the ADR-0028 deferral at `server.ts:308-320`, where a
   workload's pool selector is deliberately ignored for `kind: 'prompt'` leaves.
+- Follow-up owed: the control plane's Deployment and Secrets currently sit in the same namespace as
+  the harness, and the same unscoped `pods/exec` grant the harness needs for sandbox pods also reaches
+  the control-plane pod, so code execution in the harness pod can read the signing key, KEK, and
+  exchange token from its environment. Bounded to that tier, not to the sandbox where model code
+  runs. The fix is moving the Deployment and its Secrets into the `sh-credentials` namespace already
+  shipped for the credential store, which also splits the pod-phase RBAC behind `/resources`. Not done
+  in slice 1. Spec §8.2.
 - Follow-up owed: deliver `sandbox-egress` credentials via Z5 rather than storing them unconsumed, and
   retire this divergence as MU3. The environment fallbacks, the startup sentinel, and the leaf/CLI
   paths are all **P5's**, so this decision deliberately touches no line of `run-turn.ts` — the linked

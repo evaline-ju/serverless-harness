@@ -59,6 +59,31 @@ spec:
                   name: llm-credentials
                   key: auth-token
                   optional: true
+            # MU1: caller authentication on /turn. Default FALSE -- 14 scripts in deploy/knative call
+            # /turn or /runs with no auth today, and making the token mandatory in one step would
+            # break every smoke path and both demos (spec §4.3.1). Flipping this default, and
+            # updating those callers, is MU2. A present-but-BAD token is 401 in either mode.
+            - name: SH_REQUIRE_AUTH
+              value: 'false'
+            # `<kid>:<base64 DER SPKI>[,…]`. A public key is not a secret, so this is plain
+            # configuration rather than a Secret mount. Accepting a LIST is what makes rotation
+            # possible without a flag day: publish the new key alongside the old, roll the Service,
+            # switch the control plane to signing with the new kid, then drop the old entry
+            # (spec §5.2). Empty here -- see deploy/knative/control-plane.yaml for how to derive it.
+            - name: SH_SESSION_TOKEN_PUBLIC_KEYS
+              value: ''
+            - name: SH_CONTROL_PLANE_URL
+              value: 'http://sh-control-plane.default.svc:8080'
+            # The shared bearer for the exchange hop, from the SAME Secret the control plane reads
+            # (spec §5.3.1). optional:true so this base manifest still applies on a cluster that has
+            # not created it; the exchange is fail-closed in code, so an absent value rejects every
+            # call rather than opening one.
+            - name: SH_EXCHANGE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sh-exchange-token
+                  key: SH_EXCHANGE_TOKEN
+                  optional: true
           readinessProbe:
             httpGet:
               path: /health

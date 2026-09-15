@@ -11,8 +11,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@sh/control-plane": "workspace:*",
     "@sh/harness": "workspace:*",
-    "@sh/work-queue": "workspace:*"
+    "@sh/work-queue": "workspace:*",
+    "redis": "^6.2.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

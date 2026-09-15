@@ -1,0 +1,484 @@
+# The MU1 /v1 contract, delivered as a product surface rather than as prose
+# (spec §4). Pinned by packages/control-plane/test/openapi-contract.test.ts, which
+# asserts this document and src/routes.ts describe the same route table -- without
+# it, "API as a product" degrades into documentation that lies (spec §9.3 test 3).
+#
+# Two conventions this document follows (spec §4.1):
+#   * THE PRINCIPAL IS NEVER IN A PATH. /v1/sessions means MY sessions, derived
+#     from the token. Admin listing is ?owner=<subject>, gated on a role claim.
+#   * NO CREDENTIAL VALUE IS EVER RETURNED. PUT is write-only and there is no
+#     read-back path at all.
+openapi: 3.1.0
+info:
+  title: Serverless Harness control plane
+  version: 1.0.0
+  description: |
+    Multi-user control plane: authenticated API, owned sessions, per-user credentials (MU1).
+    This document covers the CONTROL PLANE's routes only. The data plane also serves `/v1` paths
+    -- `/v1/turn` and `/v1/runs`, on the harness Knative Service -- and they are deliberately not
+    described here; "the `/v1` API contract" in spec §1/§4 is therefore wider than this file.
+    `/internal/credentials` is the data-plane-only credential exchange and is not part of the
+    public surface; it is documented here because it is part of the contract between the tiers.
+servers:
+  - url: http://sh-control-plane.default.svc:8080
+    description: in-cluster
+components:
+  securitySchemes:
+    sessionToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Ed25519 (`alg: EdDSA`) JWT minted by the control plane. Two shapes: an API token
+        (`scope: ["api"]`, 1 hour) for `/v1` routes, and a session token (`scope: ["turn:write"]`
+        plus `sid`, 5 minutes) for the data plane's `/turn`. No credential travels in the token.
+    exchangeToken:
+      type: http
+      scheme: bearer
+      description: The shared `SH_EXCHANGE_TOKEN`, mounted into both tiers from one Secret.
+  parameters:
+    sessionId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    credentialName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$'
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          # A real enum, NOT a prose list: this is the half a client generator and a schema validator
+          # consume, and the half openapi-contract.test.ts compares against CP_ERROR_CODES. Keep it
+          # sorted the same way as the source array for a readable diff when a code is added.
+          enum:
+            - invalid_json
+            - invalid_request
+            - token_required
+            - token_invalid
+            - token_expired
+            - subject_conflict
+            - unauthorized
+            - forbidden
+            - session_not_found
+            - session_mismatch
+            - credential_required
+            - credential_ambiguous
+            - credential_not_found
+            - credential_unavailable
+            - endpoint_unresolved
+            - authorization_pending
+            - redis_unavailable
+            - internal_error
+          description: snake_case error code.
+        message:
+          type: string
+          description: |
+            Human-readable detail. ABSENT on `internal_error` by design -- an arbitrary error's text
+            can carry a Redis connection string or a presented token, and this body reaches an
+            arbitrary caller (errors.ts).
+        sessionId: { type: string }
+    Session:
+      type: object
+      required: [sessionId, owner, tenant, createdAt, state, turns]
+      properties:
+        sessionId: { type: string }
+        owner: { type: string, description: 'github:<numeric id>' }
+        tenant: { type: string }
+        createdAt: { type: integer, description: epoch ms }
+        state: { type: string, enum: [active, deleting] }
+        lastTurnAt: { type: [integer, 'null'] }
+        turns: { type: integer }
+    CredentialDescriptor:
+      type: object
+      required: [name, kind, consumer, destination, binding]
+      properties:
+        name: { type: string }
+        kind:
+          {
+            type: string,
+            description: 'registry entry: bearer | basic | api-key | oauth2-token | …',
+          }
+        consumer: { type: string, enum: [inference, sandbox-egress, control-plane] }
+        destination:
+          type: object
+          required: [hosts]
+          properties:
+            hosts:
+              type: array
+              items: { type: string }
+              description: host allow-list, not a base URL
+        binding:
+          type: object
+          required: [header, format]
+          properties:
+            header: { type: string }
+            format: { type: string }
+        endpoint:
+          type: [string, 'null']
+          description: full gateway origin; meaningful only for consumer `inference`
+  responses:
+    Unauthorized:
+      description: no token, a bad token, or a failed exchange authentication
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: |
+        Unknown session, or a session owned by someone else -- deliberately indistinguishable.
+        404 rather than 403, because a 403 is an existence oracle (spec §8.1).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: a typed validation or policy refusal
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+paths:
+  /healthz:
+    get:
+      operationId: healthz
+      summary: Liveness
+      security: []
+      responses:
+        '200': { description: ok }
+  /readyz:
+    get:
+      operationId: readyz
+      summary: Readiness — whether Redis is answering
+      description: |
+        Credentials live in Kubernetes Secrets, so they stay available while Redis is down
+        (spec §7.1, §9.2). This probe therefore reports only the session index.
+      security: []
+      responses:
+        '200': { description: ready }
+        '503':
+          description: redis_unavailable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/auth/device:
+    post:
+      operationId: startDeviceAuth
+      summary: Start a GitHub OAuth device-flow login
+      description: |
+        GitHub's user-login flow is plain OAuth 2.0, not OIDC (spec §5.1). The device flow is what a
+        shell script can complete, and it needs no client secret. The GitHub OAuth app must have
+        device flow ENABLED -- it is off by default (spec §5.1.1).
+      security: []
+      responses:
+        '200':
+          description: the code the operator types at verificationUri
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deviceCode, userCode, verificationUri, interval, expiresIn]
+                properties:
+                  deviceCode: { type: string }
+                  userCode: { type: string }
+                  verificationUri: { type: string }
+                  interval: { type: integer }
+                  expiresIn: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/auth/device/token:
+    post:
+      operationId: completeDeviceAuth
+      summary: Exchange an approved device code for an API token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [deviceCode]
+              properties:
+                deviceCode: { type: string }
+      responses:
+        '200':
+          description: an api-scoped token
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, subject, expiresAt]
+                properties:
+                  token: { type: string }
+                  subject: { type: string }
+                  displayName: { type: string }
+                  roles: { type: array, items: { type: string } }
+                  expiresAt: { type: integer, description: epoch seconds }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '428':
+          description: authorization_pending — the user has not approved yet; poll again
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/me:
+    get:
+      operationId: getMe
+      summary: The calling principal
+      security: [{ sessionToken: [] }]
+      responses:
+        '200':
+          description: subject, tenant, roles
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [subject, tenant, roles]
+                properties:
+                  subject: { type: string }
+                  tenant: { type: string }
+                  roles: { type: array, items: { type: string } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/sessions:
+    post:
+      operationId: createSession
+      summary: Create an owned session and mint its first session token
+      description: |
+        Resolves the inference credential AT CREATION and records the choice: a missing key must fail
+        here, not three turns in (spec §6.4). Returns `credential_required` when the subject has none
+        and `credential_ambiguous` when it has several and named none -- never a silent pick.
+      security: [{ sessionToken: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                credentials:
+                  type: object
+                  properties:
+                    inference: { type: string }
+      responses:
+        '201':
+          description: created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessionId, token, expiresAt]
+                properties:
+                  sessionId: { type: string }
+                  token: { type: string }
+                  expiresAt: { type: integer, description: epoch seconds }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    get:
+      operationId: listSessions
+      summary: My sessions, newest first
+      description: |
+        Paged from the owner zset -- the only user-facing list path. `?owner=` requires the admin role
+        and returns 403 otherwise.
+      security: [{ sessionToken: [] }]
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - {
+            name: cursor,
+            in: query,
+            schema: { type: integer },
+            description: exclusive createdAt of the last item seen,
+          }
+        - { name: owner, in: query, schema: { type: string }, description: admin only }
+      responses:
+        '200':
+          description: a page of sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions, nextCursor]
+                properties:
+                  sessions: { type: array, items: { $ref: '#/components/schemas/Session' } }
+                  nextCursor: { type: [integer, 'null'] }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: forbidden — ?owner= without the admin role
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/sessions/{id}:
+    get:
+      operationId: getSession
+      summary: One of my sessions
+      security: [{ sessionToken: [] }]
+      parameters: [{ $ref: '#/components/parameters/sessionId' }]
+      responses:
+        '200':
+          description: the session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteSession
+      summary: Cascade-delete one of my sessions
+      description: |
+        Tombstone, then data, then index -- never the reverse, since dropping the index first leaves
+        data present but invisible (spec §7.3).
+      security: [{ sessionToken: [] }]
+      parameters: [{ $ref: '#/components/parameters/sessionId' }]
+      responses:
+        '202': { description: accepted — a turn was in flight; the tombstone is set }
+        '204': { description: deleted }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/sessions/{id}/resources:
+    get:
+      operationId: getSessionResources
+      summary: Where this session is running
+      description: |
+        Partly self-reported by the harness, which is the untrusted brain tier, so this projection is
+        DISPLAY ONLY and is never consulted for authorization (spec §7.4). A Kubernetes outage yields
+        `sandbox.phase: "unknown"` rather than an error.
+      security: [{ sessionToken: [] }]
+      parameters: [{ $ref: '#/components/parameters/sessionId' }]
+      responses:
+        '200':
+          description: the projection
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [session, harness, sandbox]
+                properties:
+                  session: { type: object }
+                  harness: { type: object }
+                  sandbox: { type: object }
+                  lease: { type: [object, 'null'] }
+                  queue: { type: [object, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/sessions/{id}/token:
+    post:
+      operationId: mintSessionToken
+      summary: Re-mint a session token
+      description: A session outlives a 5-minute token.
+      security: [{ sessionToken: [] }]
+      parameters: [{ $ref: '#/components/parameters/sessionId' }]
+      responses:
+        '200':
+          description: a fresh session token
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, expiresAt]
+                properties:
+                  token: { type: string }
+                  expiresAt: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/credentials:
+    get:
+      operationId: listCredentials
+      summary: My credentials — metadata only
+      description: No value is ever returned, and there is no read-back path anywhere in /v1.
+      security: [{ sessionToken: [] }]
+      responses:
+        '200':
+          description: descriptors
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [credentials]
+                properties:
+                  credentials:
+                    type: array
+                    items: { $ref: '#/components/schemas/CredentialDescriptor' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/credentials/{name}:
+    put:
+      operationId: putCredential
+      summary: Store or rotate a credential — write-only
+      security: [{ sessionToken: [] }]
+      parameters: [{ $ref: '#/components/parameters/credentialName' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CredentialDescriptor'
+                - type: object
+                  required: [kind, consumer, destination]
+                  properties:
+                    secret:
+                      type: object
+                      additionalProperties: { type: string }
+                      description: |
+                        Exactly the fields the `kind` declares (bearer -> token, basic ->
+                        username+password, api-key -> key, oauth2-token -> accessToken). Encrypted at
+                        rest and never returned.
+      responses:
+        '204': { description: stored }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      operationId: deleteCredential
+      summary: Delete a credential
+      description: 204 whether or not it existed — a 404 would be an existence oracle over names.
+      security: [{ sessionToken: [] }]
+      parameters: [{ $ref: '#/components/parameters/credentialName' }]
+      responses:
+        '204': { description: deleted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /internal/credentials:
+    post:
+      operationId: exchangeCredential
+      summary: Data-plane only — exchange a session token for that subject's credential
+      description: |
+        Not part of the public surface. Authenticated by the shared `SH_EXCHANGE_TOKEN`, fail-closed
+        with none configured (spec §5.3.1). Puts the control plane on the CONTROL path once per turn,
+        never on the data path: it sees no prompt and no model output.
+      security: [{ exchangeToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, description: the session token presented by the caller }
+      responses:
+        '200':
+          description: the resolved credential
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [mode, anthropicAuthToken, anthropicBaseUrl, sessionId, subject]
+                properties:
+                  mode:
+                    type: string
+                    enum: [placeholder, direct]
+                    description: |
+                      `placeholder` when the deployment has an injector to rewrite it; `direct` (MU1's
+                      interim mode) when none is configured. Tagged, because a mislabelled credential
+                      fails silently in both directions (spec §3.6).
+                  anthropicAuthToken: { type: string }
+                  anthropicBaseUrl:
+                    { type: string, description: never absent — see endpoint_unresolved }
+                  sessionId: { type: string }
+                  subject: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }

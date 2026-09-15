@@ -25,9 +25,10 @@ M3 closes all three, **harness-side only** (`pi-fork` untouched, as in M2):
 2. **Env injection** — Pi's per-command `env` (passed only to the bash tool) is applied
    inside the pod.
 3. **find ignore-list** — find honours the `ignore` patterns (negated globs) AND `.gitignore`
-   for ignored **directories** (verified on the pod's ripgrep 14.1.0). Minor divergence from
-   Pi's `fd`: an individually-gitignored _file_ matching the positive `-g <pattern>` is
-   re-included by the glob whitelist — see D5 caveat below.
+   for ignored **directories** (verified on the pod's ripgrep 14.1.0; re-verified on 15.2.0,
+   which the leaf sandbox images vendor). Minor divergence from Pi's `fd`: an
+   individually-gitignored _file_ matching the positive `-g <pattern>` is re-included by the
+   glob whitelist — see D5 caveat below.
 
 M3 is **done** when: a burst of fast ops in one agent turn is served by a single reused
 kubectl process (proven on a real kind cluster); an env var set on a bash tool call is
@@ -252,13 +253,13 @@ glob: async (pattern, cwd, { ignore, limit }) => {
 ```
 
 `rg --files` lists files under cwd honouring `.gitignore`; `--hidden` keeps dotfiles in
-view; each `ignore` pattern becomes a negated glob. **Verified nuance (rg 14.1.0):**
-gitignored _directories_ (e.g. `node_modules/`, `dist/`) are pruned and stay excluded even
-when `-g` matches files inside; but an individually-gitignored _file_ matching the positive
-`-g <pattern>` is re-included (the glob whitelist-overrides a file-level ignore) — a minor
-divergence from Pi's `fd --glob`. The `ignore`-list negated globs (`-g '!<ig>'`) always
-exclude their entries. Output shape (relative paths, `./` stripped, `limit`-capped) matches
-M2. `exists` is unchanged.
+view; each `ignore` pattern becomes a negated glob. **Verified nuance (rg 14.1.0, re-verified
+on 15.2.0):** gitignored _directories_ (e.g. `node_modules/`, `dist/`) are pruned and stay
+excluded even when `-g` matches files inside; but an individually-gitignored _file_ matching
+the positive `-g <pattern>` is re-included (the glob whitelist-overrides a file-level ignore)
+— a minor divergence from Pi's `fd --glob`. The `ignore`-list negated globs (`-g '!<ig>'`)
+always exclude their entries. Output shape (relative paths, `./` stripped, `limit`-capped)
+matches M2. `exists` is unchanged.
 
 ---
 

@@ -329,9 +329,22 @@ harness process** in server mode. Direct mode puts one there every turn.
 divergence from **P5 §5** as well as from Z1 §2 / Z3 — so that P5's implementation does not assert an
 invariant MU1 knowingly breaks.
 
-Concretely, P5's lock-down assertion wants scoping to the **environment** (which MU1 never writes)
-rather than to the whole process, or gating on direct mode being disabled. MU3 removes the divergence
-by removing direct mode.
+Concretely, the environment is not out of reach either — it is written, by **P5's own construct, not
+MU1's**. The write-once-if-absent seed at `run-turn.ts:336-338` — guarded by
+`if (authToken && !process.env.ANTHROPIC_API_KEY)` — is unchanged by this spec, and MU1 was
+deliberately forbidden from touching it (§3.5's ownership split). Since MU1, the resolved token is
+`config?.upstreamCredential?.value` first (`:329-332`), so in direct mode the first authenticated turn
+in a fresh harness pod with no `ANTHROPIC_API_KEY` set writes **that subject's real provider key**
+into the process environment for the pod's lifetime, spanning every other user's subsequent turns.
+`harness/test/model-gateway.test.ts` now pins exactly this, asserting `process.env.ANTHROPIC_API_KEY`
+becomes the direct-mode credential value, so the claim is anchored to something executable rather than
+to prose.
+
+Reachability stays narrow: `service.yaml:45-49` makes `ANTHROPIC_API_KEY` a **required**
+`secretKeyRef`, so a normally-deployed pod always has it set and the guard never fires — this is not a
+routine leak. The net effect is that the divergence declared above is slightly wider than this section
+first said, not that MU1 introduces a second one: the seed is P5's, and removing it without P5's
+sentinel remains P5's to do, not MU1's. MU3 removes the divergence by removing direct mode.
 
 #### 3. Inbound `X-SH-Subject` becomes conditional
 
@@ -482,6 +495,14 @@ Accepting a _list_ is what makes rotation possible without a flag day: publish t
 the old, roll the Service, switch the control plane to signing with the new `kid`, then drop the old
 entry. Tokens minted before the switch keep verifying for their five-minute lifetime.
 
+A malformed or mislabelled entry — including the rotation footgun of publishing the new key under the
+old `kid` — is refused at **parse** time, and both tiers parse before serving: the control plane in
+`configFromEnv`, the data plane in `startServer`. Neither `/healthz` nor `/readyz` touches the keyset,
+so without that boot check an operator typo would be a Ready pod that refuses every turn. The data plane
+_also_ re-reads per request so a Knative env change needs no restart; that path converts the same
+failure into a typed `credential_unavailable` (503) rather than returning the parse error's text to a
+caller.
+
 Deliberately **not** a JWKS endpoint on the control plane. Fetching keys at verify time would put a
 control-plane round trip on the critical path of every turn and undo §9.2's property that an
 identity-provider or control-plane outage does not break running work — verification stays local
@@ -631,7 +652,7 @@ creation — a missing key should fail at session creation, not three turns in.
 
 **The operator fallback relocates rather than disappearing.** For deployments that want "user has no
 key yet → use the deployment's", the control plane resolves the operator key **at exchange time**,
-behind `ALLOW_OPERATOR_FALLBACK` (default `false`) — never as an environment fallback in the harness.
+behind `SH_ALLOW_OPERATOR_FALLBACK` (default `false`) — never as an environment fallback in the harness.
 
 Same convenience, a different property: the decision is made by the trusted tier, is attributable to a
 subject, and is logged. The harness still cannot run bare, so a control-plane bug fails closed instead
@@ -659,6 +680,38 @@ secret read yields ciphertext and the KEK is a distinct RBAC subject.
 
 **AAD = `subject|name`.** Free, and it buys a real property: an attacker who can _write_ Secrets still
 cannot relabel Alice's ciphertext into Bob's row and spend her key — decryption fails.
+
+**The KEK is a ring, for the same reason the token keyset is a list.** `SH_CREDENTIAL_KEK` is
+comma-separated and newest-first: `seal` uses the first key, `open` tries each. Without that dual-read
+window there is no rotation — only a cutover that makes every previously sealed credential
+undecryptable at once. And because there is deliberately no read-back path anywhere in `/v1` (§6.2),
+nothing can export and re-seal, so a single-key cutover's only recovery would be every user re-entering
+every credential by hand — the outcome the design otherwise avoids, arriving at the worst moment.
+Rotation is: prepend the new key and roll the Service; writes re-seal forward on the next
+`PUT /v1/credentials/{name}`; drop the retired key once nothing is left under it.
+
+**And that last step is observable, or it would not be a step.** Dropping the retired key is the only
+part of the procedure an operator has to _decide_, and the first draft of this design gave them nothing
+to decide it with: `open` computed the ring index and discarded it, nothing counted a non-primary open,
+`list()` never touches the KEK (§6.2), there is no read-back path to sweep the store with, and the audit
+record carries the decision but not the key. The only signal was the outage that followed deciding
+wrong. So `open` returns its ring index and `K8sSecretStore.get` logs every `keyIndex > 0`, keyed by the
+subject hash — a **positive** terminating condition ("no non-primary open for a full credential-lifetime
+window"), and while a rotation is in flight those lines are the remaining backlog. Deliberately not
+deduplicated: a once-per-process log would let a long-lived pod satisfy the condition while credentials
+were still stale. The same hash is added to the decrypt-failure message, because a credential name is
+user-chosen and collides freely across subjects — without it an operator who dropped a key too early
+knows some users are broken and cannot enumerate which. Neither reaches a caller: `writeError` reduces a
+non-`CpError` to a bare `internal_error` with no message.
+
+The ring lives in configuration rather than in the sealed value. A key id on the wire would let `open`
+select a key instead of trying each, but it is a format change — and a format change becomes a migration
+needing the old KEK, which the no-read-back rule forbids, from the moment the first credential is
+sealed. Trying each key costs a failed GCM verification or two on a ring of that size and buys the
+rotation without one. A ring must not become an oracle either: `open` reports the same single opaque
+`failed to decrypt credential '<name>'` after the whole ring fails, so "sealed under a key I do not
+have" is indistinguishable from "tampered ciphertext", and the AAD is re-bound per attempt so a
+relabelled ciphertext is refused by every key rather than only the primary.
 
 **No `list` verb on the serving path.** The Secret name is derived deterministically from the subject,
 so every access is a `get` by exact name. The runtime Role grants
@@ -759,21 +812,31 @@ what a multi-user deployment sets. Under the permissive default the control-plan
 with no token has no `sid` to bind against. A deployment that wants the guarantees below sets the flag;
 one that has not enabled multi-user keeps today's behaviour and makes no claim.
 
-| Layer                  | Property                                                          | Mechanism                                                                                              |
-| ---------------------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| API                    | a user sees and deletes only their own sessions                   | `assertOwner`, owner zset, 404 on mismatch                                                             |
-| Session drive          | a valid token cannot drive another session                        | `token.sid === body.sessionId`                                                                         |
-| Token forgery          | the harness cannot mint a token                                   | Ed25519, harness holds the public key only                                                             |
-| Inference credential   | a turn runs on its own subject's key or not at all                | per-subject inflow; **enforced by policy** pre-P5, **by construction** once P5's sentinel lands (§3.5) |
-| Credential at rest     | a namespace secret read yields ciphertext; a relabel attack fails | envelope encryption, AAD = `subject\|name`                                                             |
-| Credential enumeration | the serving path cannot list users                                | no `list` verb, separate namespace                                                                     |
+| Layer                  | Property                                                                  | Mechanism                                                                                              |
+| ---------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| API                    | a user sees and deletes only their own sessions                           | `assertOwner`, owner zset, 404 on mismatch                                                             |
+| Session drive          | a valid token cannot drive another session                                | `token.sid === body.sessionId`                                                                         |
+| Token forgery          | the **sandbox tier** cannot mint a token; the **harness tier** can — §8.2 | Ed25519, harness holds the public key only — bounded to the sandbox tier (§8.2)                        |
+| Inference credential   | a turn runs on its own subject's key or not at all                        | per-subject inflow; **enforced by policy** pre-P5, **by construction** once P5's sentinel lands (§3.5) |
+| Credential at rest     | a namespace secret read yields ciphertext; a relabel attack fails         | envelope encryption, AAD = `subject\|name`                                                             |
+| Credential enumeration | the serving path cannot list users                                        | no `list` verb, separate namespace                                                                     |
 
 **404, not 403, for another user's session.** A 403 is an existence oracle. Session ids are unguessable
 UUIDs so the leak is small, but 404 is the standard answer and the one we would otherwise have to
 change later. `403` is reserved for _authenticated but insufficiently privileged on a resource you may
 know exists_ — e.g. a non-admin passing `?owner=`.
 
-### 8.2 What slice 1 does not guarantee — the shared pool
+**Token forgery holds at the sandbox tier, not the harness tier.** Ed25519 with a public-key-only
+verifier is what makes forgery cryptographically impossible for the **sandbox tier** rather than merely
+discouraged — no private key is mounted anywhere a sandbox pod can reach. Namespace collocation defeats
+that custody for the **harness tier** specifically: code execution in the harness pod can reach the
+control-plane pod holding the private key (§8.2 item 2). The sandbox tier, where model code actually
+runs, is unaffected — it holds neither the harness's ServiceAccount nor a network path to the control
+plane.
+
+### 8.2 What slice 1 does not guarantee
+
+#### 1. The shared pool
 
 Two users' leaves can be placed on the same pooled sandbox pod. Nothing in slice 1 changes that, and
 the demo narration says so out loud.
@@ -813,6 +876,36 @@ decision.
 Rejected alternatives: **exclusive lease + scrub on release** (isolation reduces to the completeness of
 a scrub list — the #216/#222 bug class, permanently); **per-session ephemeral sandbox** (strongest and
 simplest to explain, but discards the warm-pool cold-start work).
+
+#### 2. Namespace collocation reaches the control plane's secrets from the harness pod
+
+`deploy/knative/control-plane.yaml:138` puts the `sh-control-plane` Deployment in namespace `default`
+— the same namespace as the harness — and `:200-214` injects `SH_SESSION_TOKEN_PRIVATE_KEY`,
+`SH_CREDENTIAL_KEK`, and `SH_EXCHANGE_TOKEN` as environment variables. `service.yaml:113-127` grants
+the harness ServiceAccount `pods/exec: ['create']` in `default` with **no `resourceNames`**
+restriction — it needs exec to run agent code in sandbox pods, and the sandbox pool lives in
+`default` too — and that same unscoped grant lets it `kubectl exec` into `deploy/sh-control-plane`
+and read all three secrets from `/proc/1/environ`. Both tiers run the same image, so a shell is
+present; `readOnlyRootFilesystem` and `runAsNonRoot` constrain what the exec'd process can do, not
+which pod it can reach. `harness-egress-policy.yaml:91-99` allows the egress this needs, to the API
+server on 443/6443.
+
+This is reachable from **code execution in the harness pod** — a compromise of the semi-trusted brain
+tier (§3.2) — not from the sandbox (hands) tier where model code actually runs: a leaf sandbox pod
+holds neither the harness's ServiceAccount nor a network path to the control plane. §8.1's _Token
+forgery_ row is qualified to that distinction, because it is what keeps this a bounded exposure rather
+than a broken design.
+
+The fix is namespace separation, not a new mechanism: move the `sh-control-plane` Deployment and its
+three Secrets out of `default` and into `sh-credentials`, the namespace the manifest already creates
+for the credential store (`control-plane.yaml:53-55`), so no RoleBinding gives the harness
+ServiceAccount reach into it. The split has to carry the RBAC with it: `sh-control-plane-pods`
+(`control-plane.yaml:110-118`), the Role backing `/resources`'s pod-phase read (§7.4), needs `get`/
+`list` on Pods in the **workload** namespace, not in `sh-credentials`, so it cannot move with the
+Deployment and has to be split out as a separate, narrower grant. Not done in slice 1 — tracked as
+[#248](https://github.com/rossoctl/serverless-harness/issues/248), which must land before any
+deployment sets `SH_REQUIRE_AUTH=true`. A CI tripwire in
+`packages/knative-server/test/control-plane-manifest.test.ts` refuses that combination until it does.
 
 ---
 
@@ -878,8 +971,9 @@ Three tests carry the design:
 
 Also: Ed25519 mint/verify (expiry, `aud`, `sid` binding, tampered signature, and that a
 harness-side verifier cannot sign); envelope crypto (round-trip, **AAD mismatch must fail**, wrong KEK
-must fail); cascade-delete ordering; cross-tenant negatives (A's token cannot drive B's `sid`; B's list
-omits A's sessions).
+must fail, and a **full rotation cycle** — read under the retired key, re-seal forward on write, retire
+the old key — with the AAD still enforced against every key in the ring); cascade-delete ordering;
+cross-tenant negatives (A's token cannot drive B's `sid`; B's list omits A's sessions).
 
 Live smoke gated by env var per existing convention: `MULTIUSER_LIVE_SMOKE=1` →
 `deploy/knative/demo-multiuser.sh`, in the style of `demo-promoted-workflow.sh`.

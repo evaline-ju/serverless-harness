@@ -57,11 +57,34 @@ export async function resolveTurnSandbox(
   return { config: await resolveSandboxConfig(env, headCwd) };
 }
 
+/**
+ * What rides in `Authorization: Bearer …` upstream — TAGGED, because the same field carries two
+ * incompatible things (MU1 spec §3.6):
+ *
+ *   placeholder — an inert, subject-derived stand-in; RC1's `static-inject` rewrites it to the real
+ *                 credential from a mounted secret_dir (P5 §3.1-§3.2).
+ *   direct      — the real token, resolved per subject by the control plane, with no injector in the
+ *                 path. MU1's interim mode; MU3 deletes it.
+ *
+ * A bare string would make the two indistinguishable, and both failure directions are silent: a
+ * placeholder-mode deployment with a misconfigured injector sends the placeholder upstream and gets an
+ * opaque auth error, while a direct-mode deployment that later grows an injector has its REAL key
+ * rewritten. The tag makes the mode assertable rather than inferred.
+ */
+export type UpstreamCredential =
+  { mode: 'placeholder'; value: string } | { mode: 'direct'; value: string };
+
 export interface TurnConfig {
   redisUrl?: string;
   cwd?: string;
   anthropicBaseUrl?: string;
   anthropicAuthToken?: string;
+  /**
+   * The per-request credential the control plane resolved for THIS turn's subject (MU1 spec §3.4).
+   * Takes precedence over `anthropicAuthToken` and the environment. Absent for every existing caller
+   * (leaf, CLI, unauthenticated `/turn`), which is what keeps this change additive.
+   */
+  upstreamCredential?: UpstreamCredential;
   model?: string;
   provider?: string;
 }
@@ -293,7 +316,7 @@ export interface TurnResult {
  */
 export function applyModelGateway<M extends { headers?: Record<string, unknown> }>(
   baseModel: M,
-  config?: Pick<TurnConfig, 'anthropicBaseUrl' | 'anthropicAuthToken'>,
+  config?: Pick<TurnConfig, 'anthropicBaseUrl' | 'anthropicAuthToken' | 'upstreamCredential'>,
 ): M {
   // The Anthropic gateway rewrite (Bearer + strip x-api-key + seed ANTHROPIC_API_KEY, and the
   // litellm compat-flag disables) applies ONLY to the Anthropic-messages path. OpenAI-compatible
@@ -303,7 +326,10 @@ export function applyModelGateway<M extends { headers?: Record<string, unknown> 
   if (api && api !== 'anthropic-messages') return baseModel;
   // `||` (not `??`) so an empty-string config value falls back to the env var rather than
   // suppressing it — "" is a "not set" sentinel here, not a meaningful credential.
-  const authToken = config?.anthropicAuthToken || process.env.ANTHROPIC_AUTH_TOKEN;
+  const authToken =
+    config?.upstreamCredential?.value ||
+    config?.anthropicAuthToken ||
+    process.env.ANTHROPIC_AUTH_TOKEN;
   // Intentional process.env mutation: some pi-ai code paths read ANTHROPIC_API_KEY at
   // invocation time, so seed it from the auth token. This now runs from two call sites
   // (runTurn and runLeaf via applyModelGateway) — do NOT "clean it up" into a local.

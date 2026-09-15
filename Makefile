@@ -1,5 +1,5 @@
 .PHONY: lint fmt test test-deploy typecheck demo-remote-sandbox demo-remote-sandbox-teardown \
-	demo-promoted-workflow demo-promoted-workflow-teardown
+	demo-promoted-workflow demo-promoted-workflow-teardown demo-multiuser demo-multiuser-teardown
 
 lint:
 	pre-commit run --all-files
@@ -20,8 +20,9 @@ test:
 # Failures are collected instead, so the target's verdict is unchanged while the output
 # says which suites failed AND proves the others actually ran.
 # deploy/claude/tests covers the /promote slash-command asset, which nothing else type-checks.
+# deploy/vm/tests covers setup-vm.sh, the single-VM systemd deployment (podman/systemctl mocked).
 test-deploy:
-	@failed=''; for t in deploy/knative/tests/*.test.sh deploy/claude/tests/*.test.sh deploy/microvm/tests/*.test.sh; do \
+	@failed=''; for t in deploy/knative/tests/*.test.sh deploy/claude/tests/*.test.sh deploy/microvm/tests/*.test.sh deploy/vm/tests/*.test.sh; do \
 		echo "== $$t"; \
 		bash "$$t" || failed="$$failed $$t"; \
 	done; \
@@ -51,3 +52,13 @@ demo-promoted-workflow:
 
 demo-promoted-workflow-teardown:
 	bash deploy/knative/demo-promoted-workflow.sh --teardown
+
+# MU1 multi-user demo: two GitHub logins, owned sessions, per-user credentials, and a credential
+# property that holds with the deployment's own key present in the environment. Needs a warm cluster,
+# a GitHub OAuth app with device flow enabled, and two GitHub accounts; it SKIPS with a message
+# otherwise. See docs/specs/2026-09-08-multi-user-control-plane-design.md §10.
+demo-multiuser:
+	bash deploy/knative/demo-multiuser.sh $(DEMO_ARGS)
+
+demo-multiuser-teardown:
+	bash deploy/knative/demo-multiuser.sh --teardown

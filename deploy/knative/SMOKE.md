@@ -102,3 +102,29 @@ pass** — health, scale-to-zero, scale-up-from-zero, 404, plus Redis session re
 response text only, not the harness or the setup.
 
 For storage/SCC, KEDA, Redis and kustomize notes, see [`README-ocp.md`](README-ocp.md).
+
+---
+
+# Multi-user demo (`MULTIUSER_LIVE_SMOKE=1`)
+
+`deploy/knative/demo-multiuser.sh` (`make demo-multiuser`) proves MU1's slice-1 claims against a warm
+cluster: two GitHub device-flow logins, a credential per user, owner-filtered session lists, a 404
+across tenants, `session_mismatch` when a valid token names another session, `token_required` under
+`SH_REQUIRE_AUTH=true`, a `/resources` projection, and — the load-bearing one — `credential_required`
+for a subject with no stored key **while the deployment's own `ANTHROPIC_AUTH_TOKEN` is mounted on the
+Service**.
+
+Gated three ways, and it **skips rather than fails** when any gate is unset:
+
+| Gate                     | Why                                                                                |
+| ------------------------ | ---------------------------------------------------------------------------------- |
+| `MULTIUSER_LIVE_SMOKE=1` | needs a live cluster and two model calls                                           |
+| `SH_GITHUB_CLIENT_ID`    | a GitHub OAuth app with **device flow enabled** (off by default); no client secret |
+| two GitHub accounts      | the subject is attested by GitHub, so the script cannot fabricate two of them      |
+
+It sets `SH_REQUIRE_AUTH=true` for the run — so the property demonstrated is the real one, not the
+permissive default — and restores `false` on exit, including on an aborted run.
+
+**What it does not show:** slice 1's sandbox pool is **shared**. Two users' leaves can be placed on the
+same pod; isolation holds at the API, the session store and the inference credential, not the sandbox.
+The tenant-labelled partition is MU2 (spec §8.2). The script says this out loud.
