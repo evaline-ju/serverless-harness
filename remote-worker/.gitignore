@@ -2,7 +2,18 @@
 /dist/
 /.rw-bin
 *.log
-# `go build ./...` drops the cmd/worker binary at the module root as ./worker.
-# (It was ./remote-worker before the entrypoint moved to cmd/worker.)
+# `go build ./...` drops one binary per cmd/* package at the module root, named
+# after its directory — ./worker, ./guest-agent, ./microvm-worker, ./vmpoolctl (plus
+# a .exe suffix on a GOOS=windows build). /worker's own entry predates this comment
+# (it was ./remote-worker before the entrypoint moved to cmd/worker); the rest are
+# added together so the six-way cross-platform `go build`/`go vet` check the P4
+# microVM tasks run from this directory never leaves an untracked-and-unignored
+# binary sitting next to go.mod again.
 /worker
 /remote-worker
+/guest-agent
+/guest-agent.exe
+/microvm-worker
+/microvm-worker.exe
+/vmpoolctl
+/vmpoolctl.exe

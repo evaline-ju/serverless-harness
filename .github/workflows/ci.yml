@@ -124,6 +124,55 @@ jobs:
           }
           bash deploy/knative/verify-sandbox-inventory.sh "$IMAGE"
 
+  # Spec §8's correctness gates for the microVM tier, and an explicit statement of the half
+  # of them this runner cannot exercise. Six of them need /dev/kvm AND a golden snapshot
+  # built by deploy/microvm/build-snapshot.sh -- a standard runner has neither, and the
+  # snapshot cannot be cached because spec §2.4 requires restore on identical hardware. Those
+  # run only from microvm-kvm-gates.yml on a rig.
+  #
+  # Before this job existed, `go test ./...` skipped all of them silently and the run looked
+  # green, which reads as "the isolation gates pass". So this job runs the hardware-free ones
+  # with -v (naming each), fails if NONE ran, and annotates every gate that did not run.
+  # remote-worker/internal/vmpool/gates_inventory_test.go is the drift check on that split and
+  # fails if this job or the manual workflow stops existing.
+  microvm-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: remote-worker/go.mod
+
+      - name: Run the gates that need no hypervisor
+        working-directory: remote-worker
+        run: |
+          set -u
+          log="$RUNNER_TEMP/gates.log"
+          rc=0
+          go test -race -v \
+            -run 'TestGate|TestTheGateInventoryMatchesTheCode|TestTheCIWorkflowsRunTheGates|TestTheSnapshotCredentialScannerFiresOnEveryPattern' \
+            ./internal/vmpool/ > "$log" 2>&1 || rc=$?
+          passed=$(grep -E '^--- PASS: ' "$log" | awk '{print $3}' | sort -u || true)
+          skipped=$(grep -E '^--- SKIP: ' "$log" | awk '{print $3}' | sort -u || true)
+          {
+            echo '### microVM spec §8 gates'
+            echo
+            printf 'Ran here:\n```\n%s\n```\n' "${passed:-(none)}"
+            printf 'NOT run here (need /dev/kvm + a golden snapshot; see microvm-kvm-gates.yml):\n```\n%s\n```\n' "${skipped:-(none)}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$skipped" ]; then
+            n=$(echo "$skipped" | wc -l | tr -d ' ')
+            echo "::warning title=$n microVM gates did NOT run::they need /dev/kvm and a golden snapshot, which this runner does not have; a green run here is NOT evidence for them. Run .github/workflows/microvm-kvm-gates.yml on the rig."
+          fi
+          if [ -z "$passed" ]; then
+            echo "::error title=No gate ran::this job asserted nothing"
+            rc=1
+          fi
+          cat "$log"
+          exit $rc
+
   proto:
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -109,6 +109,20 @@ real model. **PASS.** _Reproduce:_ `pnpm -C experiments test e5-budget-structura
   and an orchestrator `set -e` abort that skipped result-writing. The passing results below were
   produced _after_ those fixes, on green re-runs.
 
+## Other experiment tracks
+
+E1–E5 above are the pi-track (scale-to-zero harness) experiments and this file is their
+consolidated home; it does not cover later tracks. Later tracks follow the same
+driver-local / consolidated split E1/E3/E4 and E2/E5 already use here, but publish their
+own consolidated results file rather than extending this one:
+
+- **P4 — MicroVM sandbox tier (E10 lifecycle primitives, E11 density/replenishment
+  ceiling):** drivers live in `deploy/microvm/`; results are consolidated in
+  [`deploy/microvm/EXPERIMENTS.md`](../deploy/microvm/EXPERIMENTS.md). As of this writing,
+  E11's driver and its cluster-free test are built and green, but the density sweep has
+  only been exercised for shape (no run against real hardware) — see that file's E11
+  section for exactly which numbers are filled in and which are still named blanks.
+
 ## How to reproduce everything
 
 ```bash

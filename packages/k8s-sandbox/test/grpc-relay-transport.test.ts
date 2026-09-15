@@ -222,3 +222,40 @@ describe('GrpcRelayTransport extra semantics', () => {
     await expect(t.close()).resolves.toBeUndefined();
   });
 });
+
+describe('GrpcRelayTransport workspace key (spec §3.4)', () => {
+  // fakeClient's exec() auto-scripts an immediate End{exitCode: 0} via queueMicrotask
+  // (the file's existing "ending stream" shape, used by runConformance above); we wrap
+  // it only to observe the workspaceKey field on each outgoing ExecRequest.
+  function captureWorkspaceKeys(): { client: ExecClientLike; keys: (string | undefined)[] } {
+    const { client: inner } = fakeClient({ exitCode: 0 });
+    const keys: (string | undefined)[] = [];
+    const client: ExecClientLike = {
+      ...inner,
+      exec(request: ExecRequest) {
+        keys.push(request.exec?.workspaceKey);
+        return inner.exec(request);
+      },
+    };
+    return { client, keys };
+  }
+
+  it('stamps every Exec with the workspace key it was built for', async () => {
+    const { client, keys } = captureWorkspaceKeys();
+    const t = GrpcRelayTransport('sbx-1', client, { workspaceKey: 'leaf-abc123' });
+    await t.exec('true');
+    await t.exec('cat /workspace/README.md');
+    // Every Exec, not just the first: vmpool keys a per-run workspace on this and a
+    // missing key on any one command is refused on the VM path (spec §3.4).
+    expect(keys).toEqual(['leaf-abc123', 'leaf-abc123']);
+  });
+
+  it('sends an empty workspace key when none was supplied', async () => {
+    const { client, keys } = captureWorkspaceKeys();
+    await GrpcRelayTransport('sbx-1', client).exec('true');
+    // '' is today's behaviour on the container arm, and is REFUSED on the VM arm —
+    // which is the point: a caller that cannot supply a run id must fail loudly on
+    // the VM tier rather than share one workspace (spec §3.4).
+    expect(keys).toEqual(['']);
+  });
+});

@@ -67,14 +67,7 @@ export function buildServer(deps: RelayDeps): { server: Server } {
       call.on('cancelled', onCancelled);
 
       try {
-        for await (const ev of relay.routeExec(
-          req.sandboxId,
-          e.reqId,
-          e.command,
-          e.stdin,
-          e.timeoutS,
-          e.streaming,
-        )) {
+        for await (const ev of relay.routeExec(req.sandboxId, e)) {
           call.write(ev);
         }
         call.end();

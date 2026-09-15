@@ -1,0 +1,43 @@
+# deploy/microvm/microvm-vms.slice
+#
+# The parent cgroup slice Task 17 puts every VM's own cgroup under, for both VMM
+# arms (hardware-corrections D3): Firecracker's jailer targets this via
+# --parent-cgroup, and Cloud Hypervisor's launcher targets it via `systemd-run
+# --scope --slice=`. Neither arm's per-VM cgroup memory.max is set here — that is
+# each VM's OWN cgroup bound (jailer's --cgroup memory.max=, or systemd-run's -p
+# MemoryMax=), computed from vmpool.PerVMBytes(cfg) at launch time, never a fixed
+# constant in this file (spec §5.3: "two numbers that can drift is the bug").
+#
+# This slice's own MemoryMax is deliberately infinity: bounding the SLICE would
+# let one VM's memory pressure count against every other VM's headroom, which is
+# exactly the "ballooning guest is bounded by the whole slice, not by its own VM"
+# failure mode spec §6 mitigation #3 exists to avoid (hardware-corrections D1).
+# microvm-worker's own admission control (SH_MAX_COMMITTED_MB) is the real
+# density ceiling.
+#
+# What this slice is FOR, corrected after the final whole-branch review's H1 (the
+# previous wording here was wrong and the error was consequential): it is one
+# cgroup subtree holding microvm-worker.service AND every VM cgroup, so that
+# (a) the worker's own memory is accounted alongside the VMs it admits, (b)
+# `systemctl stop microvm-vms.slice` tears the whole tier down in one operation,
+# and (c) SweepOrphans has one slice to walk on the next start. It is NOT true
+# that KillMode=control-group on microvm-worker.service reaches the VM cgroups:
+# those are SIBLINGS of that unit's cgroup under this slice, not children of it,
+# so KillMode kills the worker's cgroup only. That is precisely why the start-up
+# sweep is the load-bearing half of spec §6's mitigation rather than a
+# belt-and-braces extra -- and why the sweep must never mistake
+# microvm-worker.service's own cgroup for a VM's (see cgroup.go's H1 block).
+
+[Unit]
+Description=Parent slice for ephemeral microVM sandboxes (serverless-harness P4)
+Documentation=https://github.com/kagenti/serverless-harness
+
+[Slice]
+# Swap is off host-wide already (spec §2.4) -- this makes that explicit for the
+# slice too, rather than relying on the host-wide setting alone: a future host
+# that re-enables swap must not silently let this slice's VMs balloon into it,
+# which would turn spec §6 mitigation #3's fast, attributable in-cgroup OOM kill
+# into a slow, host-wide thrash instead.
+MemorySwapMax=0
+MemoryMax=infinity
+TasksMax=infinity

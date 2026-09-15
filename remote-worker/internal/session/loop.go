@@ -689,11 +689,12 @@ func (s *Session) runOne(ctx context.Context, send func(*pb.WorkerFrame), e *pb.
 
 	sink := &frameSink{reqID: reqID, send: send}
 	code, err := s.runner.Run(ctx, wexec.Spec{
-		ReqID:     reqID,
-		Command:   e.GetCommand(),
-		Stdin:     e.GetStdin(),
-		TimeoutS:  e.GetTimeoutS(),
-		Streaming: e.GetStreaming(),
+		ReqID:        reqID,
+		Command:      e.GetCommand(),
+		Stdin:        e.GetStdin(),
+		TimeoutS:     e.GetTimeoutS(),
+		Streaming:    e.GetStreaming(),
+		WorkspaceKey: e.GetWorkspaceKey(),
 	}, sink)
 
 	var frame *pb.WorkerFrame

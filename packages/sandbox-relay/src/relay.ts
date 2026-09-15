@@ -1,5 +1,5 @@
 import type { RecordStore, SandboxRecord } from '@sh/harness';
-import type { ExecEvent, ServerFrame, WorkerFrame } from '@sh/k8s-sandbox';
+import type { Exec, ExecEvent, ServerFrame, WorkerFrame } from '@sh/k8s-sandbox';
 
 export interface AttachStream {
   metadata?: { get: (k: string) => string[] };
@@ -24,14 +24,17 @@ interface Parked {
 export interface Relay {
   onAttach(stream: AttachStream): void;
   parked(): string[];
-  routeExec(
-    sandboxId: string,
-    reqId: number,
-    command: string,
-    stdin: Uint8Array,
-    timeoutS: number,
-    streaming: boolean,
-  ): AsyncIterable<ExecEvent>;
+  /**
+   * Route one Exec to the parked worker and stream its events back.
+   *
+   * Takes the whole `Exec` message rather than a parameter per field. It used to
+   * destructure six of them and rebuild the message, which made every additive
+   * proto field a relay change — and silently dropped any field the relay had not
+   * been taught about. `workspace_key` was the field that made that concrete: the
+   * relay is a bridge keyed by sandbox_id, not a translator (worker DESIGN.md,
+   * "No matching in the relay").
+   */
+  routeExec(sandboxId: string, exec: Exec): AsyncIterable<ExecEvent>;
   routeAbort(sandboxId: string, reqId: number): void;
 }
 
@@ -104,14 +107,8 @@ export function createRelay(deps: RelayDeps): Relay {
     stream.on('error', teardown);
   }
 
-  async function* routeExec(
-    sandboxId: string,
-    reqId: number,
-    command: string,
-    stdin: Uint8Array,
-    timeoutS: number,
-    streaming: boolean,
-  ): AsyncGenerator<ExecEvent> {
+  async function* routeExec(sandboxId: string, exec: Exec): AsyncGenerator<ExecEvent> {
+    const reqId = exec.reqId;
     const parked = sessions.get(sandboxId);
     if (!parked) throw new Error(`no live worker for sandbox '${sandboxId}'`);
 
@@ -129,7 +126,7 @@ export function createRelay(deps: RelayDeps): Relay {
       notify?.();
     });
 
-    parked.stream.write({ exec: { reqId, command, stdin, timeoutS, streaming } } as ServerFrame);
+    parked.stream.write({ exec } as ServerFrame);
 
     try {
       while (true) {

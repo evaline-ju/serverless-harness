@@ -1,0 +1,95 @@
+package vmpool
+
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrTimeout means the command outlived Exec.TimeoutS and its VM was killed.
+// runner.go maps it to wexec.ErrTimeout, which the session turns into
+// ExecError{"timeout:<n>"} — byte-identical to what every other harness transport
+// rejects with (spec §4.1).
+var ErrTimeout = errors.New("vmpool: timeout")
+
+// ErrAborted means the caller's context was cancelled: the relay's Abort, or the
+// Attach stream dying. Same teardown as success — that is the point of §4.1's
+// single destroy path.
+var ErrAborted = errors.New("vmpool: aborted")
+
+// ErrKeyMismatch is spec §6's "catastrophic bug" row: a popped VM whose Key() is
+// not the requested one. A programming error, never retried.
+var ErrKeyMismatch = errors.New("vmpool: popped VM is bound to a different workspace_key")
+
+// ErrClosed means the pool is shutting down.
+var ErrClosed = errors.New("vmpool: closed")
+
+// ErrShortResponse means the guest closed, or the connection cut, before an explicit
+// End frame arrived. Spec §5.4: "A missing or short response is an ExecError, counted
+// — never coerced into a zero exit with truncated output." Firecracker documents vsock
+// packet loss as expected for resumed guests, so this is a routine condition to
+// report, not an impossible one to assert away.
+var ErrShortResponse = errors.New("vmpool: guest closed before End")
+
+// ErrGuest wraps a KindError the agent sent — a fork failure, an unreadable command
+// file. The guest's own message is preserved, because "exec failed" without it is
+// undiagnosable at 200 VMs a second.
+var ErrGuest = errors.New("vmpool: guest error")
+
+// RefusalReason names why the pool declined. Spec §6 requires a memory-driven
+// refusal to be recorded DISTINCTLY from a MaxRuns refusal — "or the two ceilings
+// get conflated and neither is diagnosable" — and §7.3 reports ExecErrors by cause.
+type RefusalReason string
+
+const (
+	RefuseEmptyKey      RefusalReason = "empty-workspace-key"
+	RefuseInvalidKey    RefusalReason = "invalid-workspace-key"
+	RefuseMemoryBudget  RefusalReason = "memory-budget"
+	RefuseMaxRuns       RefusalReason = "max-runs"
+	RefuseSpawn         RefusalReason = "spawn-failure"
+	RefuseShortResponse RefusalReason = "vsock-short-response"
+)
+
+// RefusalError carries a reason to microvm-worker, which counts it and returns an
+// ExecError. There is no "busy" frame in the wire contract (spec §6), so a refusal
+// can only be an error — which is exactly why the lease cap one tier up is primary
+// admission control and MaxRuns is a backstop.
+type RefusalError struct {
+	Reason RefusalReason
+	Detail string
+}
+
+func (e *RefusalError) Error() string { return fmt.Sprintf("%s: %s", e.Reason, e.Detail) }
+
+// Unwrap lets errors.Is see ErrShortResponse through the RefusalError wrapper, so
+// callers can match on the sentinel while operators still get the counted reason via
+// ReasonOf.
+func (e *RefusalError) Unwrap() error {
+	if e.Reason == RefuseShortResponse {
+		return ErrShortResponse
+	}
+	return nil
+}
+
+func refusal(r RefusalReason, format string, a ...any) *RefusalError {
+	return &RefusalError{Reason: r, Detail: fmt.Sprintf(format, a...)}
+}
+
+// ReasonOf returns the RefusalReason in err, or "" if err is not a refusal.
+func ReasonOf(err error) RefusalReason {
+	var re *RefusalError
+	if errors.As(err, &re) {
+		return re.Reason
+	}
+	return ""
+}
+
+// ColdCause attributes a cold acquire. Spec §4.4: cold acquires must be attributed
+// by cause, "otherwise a gate-heavy or checkpoint-heavy workload reads as
+// replenishment falling behind when nothing is behind."
+type ColdCause string
+
+const (
+	ColdFirstExec ColdCause = "first-exec" // an unseen workspace_key
+	ColdParked    ColdCause = "parked"     // StandbyIdle had dropped this run's standbys
+	ColdExhausted ColdCause = "exhausted"  // replenishment behind the Exec rate — the real signal
+)

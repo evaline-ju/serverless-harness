@@ -106,6 +106,7 @@ describe('relay server exec cancellation wiring (via the real registered handler
         stdin: new Uint8Array(),
         timeoutS: 0,
         streaming: true,
+        workspaceKey: '',
       },
     });
     exec(call);
@@ -143,7 +144,14 @@ describe('relay server exec cancellation wiring (via the real registered handler
 
     const call = fakeExecCall({
       sandboxId: 'ghost',
-      exec: { reqId: 1, command: 'x', stdin: new Uint8Array(), timeoutS: 0, streaming: true },
+      exec: {
+        reqId: 1,
+        command: 'x',
+        stdin: new Uint8Array(),
+        timeoutS: 0,
+        streaming: true,
+        workspaceKey: '',
+      },
     });
     exec(call);
 

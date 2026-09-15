@@ -1,0 +1,97 @@
+package vmpool
+
+// admitLocked decides whether one more VM may be committed. Caller holds p.mu.
+//
+// TWO CEILINGS, RECORDED DISTINCTLY. Spec §6: "A memory-driven refusal is recorded
+// distinctly from a MaxRuns refusal, or the two ceilings get conflated and neither
+// is diagnosable." E11 reports ExecErrors by cause for exactly this reason (§7.3).
+//
+// MaxRuns IS A BACKSTOP, not primary admission control. There is no "busy" frame in
+// the wire contract, so a MaxRuns refusal reaches the harness as a failed exec
+// rather than as back-pressure — while the harness already has the right mechanism
+// one tier up: SandboxPoolSaturatedError at lease time under KAGENTI_SANDBOX_CAP.
+// The consistency requirement is therefore
+//
+//	MaxRuns >= cap x (records this worker advertises)
+//
+// and violating it refuses work the harness believed it had capacity for, which is
+// P6 §3.9's spurious-429s-truncate-the-rungs failure one tier down.
+//
+// PARKED RUNS DO NOT COUNT, and that is what makes the condition above true rather
+// than aspirational. It used to count len(p.runs), which includes the parked entries
+// the sweep deliberately keeps for WorkspaceIdle (30 minutes by default) — and a
+// parked run holds ZERO VMs by construction, since sweepOnce only sets parked once
+// len(rp.ready) has reached zero on a run that is not busy. With the shipped
+// SH_MAX_RUNS=64, 64 short-lived sandboxes finishing inside a minute left 64
+// zero-VM parked entries, and the 65th lease the harness legitimately granted was
+// refused RefuseMaxRuns for the next ~29 minutes while nothing was resident. During
+// E11 that would read as back-pressure from the tier rather than as the bug it is.
+// Pool.Reclaim is the only thing that releases a key early and it has no production
+// caller, so nothing else was going to shorten that window.
+//
+// What still bounds the parked set is WorkspaceIdle, and what it costs is disk rather
+// than RAM (spec §4.4's whole reason for two thresholds). What bounds VMs is the
+// memory gate below, which counts every VM a parked run does not have.
+//
+// The memory gate exists so spec §7.4's prediction 1 ("replenishment binds on
+// process/memory count before CPU") is observable AS BACK-PRESSURE. Without it the
+// prediction would be "confirmed" by the host falling over, which is not a
+// measurement.
+func (p *pool) admitLocked(newRun bool) error {
+	if unparked := p.unparkedRunsLocked(); newRun && unparked >= p.cfg.MaxRuns {
+		return refusal(RefuseMaxRuns,
+			"MaxRuns=%d reached with %d unparked runs (%d entries incl. parked); the lease cap "+
+				"one tier up is primary admission control and this is its backstop (spec §6)",
+			p.cfg.MaxRuns, unparked, len(p.runs))
+	}
+	committed := p.committedLocked()
+	budget := p.cfg.MaxCommittedBytes - p.cfg.MemoryReserveBytes
+	if next := committed + p.perVMBytes(); next > budget {
+		return refusal(RefuseMemoryBudget,
+			"committing %d more bytes would reach %d against a budget of %d "+
+				"(MaxCommittedBytes %d less MemoryReserveBytes %d)",
+			p.perVMBytes(), next, budget, p.cfg.MaxCommittedBytes, p.cfg.MemoryReserveBytes)
+	}
+	return nil
+}
+
+// unparkedRunsLocked counts the runs MaxRuns is about: those not sitting in RunParked
+// with zero VMs. Caller holds p.mu.
+//
+// Deliberately NOT the same quantity as Stats().ActiveRuns, which counts every map entry
+// and reports the parked subset separately — Stats describes what the host is holding
+// (including workspaces on disk), while this describes what the ceiling is for. The
+// relationship is ActiveRuns - ParkedRuns == this.
+func (p *pool) unparkedRunsLocked() int {
+	n := 0
+	for _, rp := range p.runs {
+		if !rp.parked {
+			n++
+		}
+	}
+	return n
+}
+
+// committedLocked is every VM this host is holding, in bytes. Caller holds p.mu.
+//
+// Standbys are charged their FULL guest RAM even though they are paused and their
+// memory files are CoW-shared, because a standby is one Resume away from consuming
+// all of it. Admission control that charged the paused footprint would admit a host
+// it cannot then run — the opposite of the PSS-vs-RSS error in spec §7.3, and in the
+// dangerous direction rather than the pessimistic one.
+func (p *pool) committedLocked() int64 {
+	var vms int64
+	for _, rp := range p.runs {
+		vms += int64(len(rp.ready) + rp.inFlight + rp.warming)
+	}
+	return vms * p.perVMBytes()
+}
+
+// countRefusal records an already-built refusal and returns it unchanged, so the
+// construction site keeps the detailed message and the counting stays in one place.
+func (p *pool) countRefusal(err error) error {
+	if r := ReasonOf(err); r != "" {
+		p.counters.refuse(r)
+	}
+	return err
+}

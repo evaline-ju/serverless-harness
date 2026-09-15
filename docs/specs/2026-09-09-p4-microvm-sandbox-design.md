@@ -926,7 +926,9 @@ KVM-requiring tests gated by an env var and skipped by default so `make test` st
 from Firecracker's documentation. **Cloud Hypervisor's equivalents are unverified** — vsock behaviour
 across restore, path constraints, multi-resume guidance — and §4.3 leans on Cloud Hypervisor for
 correctness reasons. If its caveats are worse or less documented, the design's preferred arm weakens.
-Confirming them is E10's **first** task, not its last.
+Confirming them is E10's **first** task, not its last. Verified 2026-09-10 in
+[`docs/notes/cloud-hypervisor-snapshot-facts.md`](../notes/cloud-hypervisor-snapshot-facts.md) — that
+note, not this paragraph, is the current state of the question.
 
 ## 10. Implementation notes for a fresh session
 

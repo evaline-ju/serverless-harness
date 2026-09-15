@@ -1,0 +1,155 @@
+# deploy/microvm/microvm-worker.service
+#
+# Runs cmd/microvm-worker (see remote-worker/cmd/microvm-worker/main.go), the process
+# that creates every VM's cgroup under microvm-vms.slice for the lifetime of the
+# process (Task 17, spec §6's #1 practical failure: "Worker crash leaks VMs").
+#
+# WHERE EACH CGROUP ACTUALLY LANDS, because the final whole-branch review's H1 was a
+# false premise about exactly this. Slice=microvm-vms.slice below makes systemd nest
+# THIS UNIT's cgroup under that slice (systemd.slice(5): a unit assigned to a slice is
+# placed beneath it in the cgroup tree -- the same shape as system.slice/sshd.service),
+# while both launcher arms place each VM's cgroup under the same slice as a SIBLING of
+# this unit, not as a child of it:
+#
+#   /sys/fs/cgroup/microvm-vms.slice/
+#   |-- microvm-worker.service/   <-- this unit; cgroup.procs holds the worker's own pid
+#   |-- vm-9/                     <-- Firecracker: jailer --parent-cgroup + --cgroup
+#   `-- vm-vm-9.scope/            <-- Cloud Hypervisor: systemd-run --scope --slice=
+#
+# Two consequences follow, and both are load-bearing:
+#
+#  1. KillMode=control-group below kills what is in THIS UNIT's control group, which is
+#     the worker (and any process it left in its own cgroup) -- NOT the sibling VM
+#     cgroups. Tearing those down on a clean stop is `systemctl stop
+#     microvm-vms.slice`, which stops the whole slice subtree. An earlier version of
+#     this comment claimed KillMode=control-group reached the VM cgroups; it does not,
+#     and stating it did is what made the crash-recovery sweep look optional.
+#  2. Because the worker is a sibling of the VM cgroups rather than their parent,
+#     SweepOrphans (called from main(), before Probe) must be able to tell them apart.
+#     It does: it sweeps only directory names this pool itself created and never its
+#     own cgroup (see cgroup.go's H1 block). It is the crash-recovery half of the
+#     mitigation regardless -- a kill-9/OOM/power-loss leaves VM cgroups behind no
+#     matter which cgroup the worker occupied.
+#
+# Slice=microvm-vms.slice is KEPT deliberately, not left in place by inertia: it puts
+# the worker's own memory in the same accounting scope as the VMs it admits (which is
+# what SH_MAX_COMMITTED_MB is reasoning about), and it makes the slice one unit an
+# operator can stop or inspect to reach the whole tier. Moving the worker out would
+# make "every child of the slice is a VM" true, but it would NOT remove the need for
+# the sweep, and it would split the tier across two accounting scopes to buy a
+# simplification the sweep no longer needs.
+
+[Unit]
+Description=microvm-worker: ephemeral microVM sandbox tier (serverless-harness P4)
+Documentation=https://github.com/kagenti/serverless-harness
+After=network-online.target
+Wants=network-online.target
+# Spec §6: "KVM unavailable at startup ... Fail the unit at start with an explicit
+# message; never fall back to running commands on the host." AssertPathExists fails
+# the unit before ExecStart even runs, which is a stronger, earlier form of that
+# posture than leaving it to the process's own vmpool.New/Probe checks alone.
+AssertPathExists=/dev/kvm
+# A permanently-broken host must reach `failed`, not restart forever.
+#
+# Restart=on-failure with RestartSec=5s and systemd's DEFAULTS
+# (DefaultStartLimitBurst=5 over DefaultStartLimitIntervalSec=10s) never trips the rate
+# limiter: at one start per 5s at most 2-3 starts land in any 10s window, so the unit
+# sits in activating/auto-restart indefinitely while `systemctl is-failed` reports
+# success and monitoring sees a healthy host. This branch has already produced two
+# crash-loops of exactly that shape (an unstated jailer path, a missing snapshot), and
+# every remaining startup-failure path still reaches it: no /srv/snapshots/default, a
+# manifest hash mismatch, the SH_MAX_COMMITTED_MB refusal, a VMM socket already in use.
+#
+# 5 starts per 5 minutes: a transient failure (a slow /dev/kvm, a race with a mount)
+# still gets its retries, and a host that is simply broken lands in `failed` inside half
+# a minute and pages someone. Both keys belong in [Unit], not [Service] -- systemd 255
+# reports "Unknown key name 'StartLimitIntervalSec' in section 'Service'" and ignores
+# them there, which is the silent no-op this comment exists to prevent someone
+# reintroducing.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# The admission budget below (SH_MAX_COMMITTED_MB) is a promise about how much memory
+# this host has, and nothing in the worker reads MemTotal. On a host with less RAM than
+# the budget the gate therefore cannot refuse before the OOM killer arrives -- it admits
+# VMs against memory that does not exist, and spec §7.4's prediction 1 ("replenishment
+# binds on process/memory count before CPU") gets "confirmed" by a gate that never
+# refuses at all. Every other invariant in this tier fails at start rather than trusting
+# the operator (AssertPathExists=/dev/kvm above, SH_MAX_COMMITTED_MB being mandatory,
+# Config.Normalize's cross-field checks); the one that was missing is the check against
+# the host this unit is actually running on. A comment is not a control.
+#
+# AssertMemory compares the amount of PHYSICAL memory in the system (in a container, the
+# memory assigned to it) -- systemd's ConditionMemory family, available since v244 -- so
+# it is the same fact the budget is asserting, read from the host. Assertion rather than
+# Condition deliberately: a Condition silently skips the start, an Assert fails it
+# loudly. And like AssertPathExists it does NOT trigger Restart=, so it cannot produce
+# the crash-loop the StartLimit keys above exist to bound.
+#
+# 23G against a 24 GiB SH_MAX_COMMITTED_MB, not 24G: physical memory here is MemTotal,
+# which is always somewhat BELOW nominal RAM (firmware and kernel reservations), so a
+# threshold equal to the budget would refuse to start on a genuine 24 GiB host. The band
+# is deliberate -- this catches "the budget is bigger than the machine" (a 16 GiB host
+# refuses), not a 1% discrepancy. deploy/microvm/tests/systemd-units.test.sh does that
+# arithmetic against SH_MAX_COMMITTED_MB below and against that tolerance, so raising
+# either value alone is a test failure rather than a discovery made by the OOM killer.
+AssertMemory=>=23G
+
+[Service]
+Type=simple
+Slice=microvm-vms.slice
+ExecStart=/usr/local/bin/microvm-worker
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5s
+
+# RLIMIT_MEMLOCK: PinMemoryFile (memfile mlock, spec §4.3) and, per VM, the guest's
+# own memory need to be lockable. main() also calls vmpool.RaiseMemlockLimit() at
+# startup to raise the soft limit to the hard limit within whatever this unit grants,
+# but the unit's own ceiling is the hard cap that call cannot exceed -- infinity here
+# is deliberate for exactly the reason spec §7.5 names: a kernel limit mistaken for a
+# density ceiling fails at 500 VMs after working at 20, indistinguishably from the
+# real thing, so this must not be the thing that silently caps density.
+LimitMEMLOCK=infinity
+# Every VM's vsock/API socket, plus the relay connection and whatever standby depth
+# is configured, each cost file descriptors; spec §7.5 names nofile as one of the
+# kernel limits that must be raised deliberately rather than discovered at 500 VMs.
+LimitNOFILE=1048576
+
+# The VMM binaries this tier cannot run without, stated explicitly rather than left to
+# the code defaults (/usr/bin/jailer, /usr/bin/firecracker). Verified on hardware: with
+# these unset the worker starts, sweeps correctly, and then dies in its startup probe with
+# "start jailer: fork/exec /usr/bin/jailer: no such file or directory", crash-looping every
+# 5s. Firecracker's own release tarball and this unit's own ExecStart both live under
+# /usr/local/bin, so /usr/bin was an unstated assumption the unit disagreed with itself
+# about. Override per-host if your packaging installs them elsewhere.
+Environment=SH_JAILER_BIN=/usr/local/bin/jailer
+Environment=SH_FIRECRACKER_BIN=/usr/local/bin/firecracker
+# The golden snapshot is SH_SNAPSHOT_DIR/SH_SNAPSHOT_IMAGE (main.go joins the two), so the
+# deployed snapshot lives at /srv/snapshots/default unless this is changed. Stated rather
+# than relying on the code default, because a missing image directory presents as a
+# device-check failure naming a path nobody configured.
+Environment=SH_SNAPSHOT_IMAGE=default
+Environment=SH_VMM=firecracker
+Environment=SH_SNAPSHOT_DIR=/srv/snapshots
+Environment=SH_WORKSPACE_ROOT=/srv/workspaces
+Environment=SH_CHROOT_BASE=/srv/jail
+# Slice-RELATIVE, and spelling the full systemd hierarchy. Both halves were wrong
+# before, each in a way that looked right. Verified on hardware (jailer v1.17.0,
+# cgroup v2): jailer REFUSES an absolute --parent-cgroup ("Path should not be
+# absolute"), so every restore failed; and a bare "microvm-vms.slice" created a new
+# top-level cgroup OUTSIDE this slice, with memory.max set on it so it looked correct
+# while the slice accounted none of it. systemd expands a dashed slice name into a
+# hierarchy, so this unit's own Slice=microvm-vms.slice lives at
+# /sys/fs/cgroup/microvm.slice/microvm-vms.slice -- and /sys/fs/cgroup/microvm-vms.slice
+# does not exist at all, which is why the orphan sweep silently swept nothing.
+Environment=SH_PARENT_CGROUP=microvm.slice/microvm-vms.slice
+Environment=SH_STANDBY_DEPTH=2
+Environment=SH_GUEST_RAM_MB=256
+Environment=SH_MAX_RUNS=64
+Environment=SH_MAX_COMMITTED_MB=24576
+Environment=SH_MEMORY_RESERVE_MB=4096
+
+[Install]
+WantedBy=multi-user.target
