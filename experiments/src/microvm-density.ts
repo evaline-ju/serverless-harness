@@ -196,7 +196,7 @@ function scorePrediction1(baseline: RungSample, rest: RungSample[]): Verdict {
  * meets Exec rate, then rises sharply." A SHAPE claim -- a gradual rise falsifies it even
  * if the endpoint value matches, so this checks the whole curve, not just the last rung.
  */
-function scoreColdAcquireShape(sortedByC: RungSample[]): Verdict {
+function scoreColdAcquireShape(sortedByC: RungSample[], knee: number): Verdict {
   if (sortedByC.length < 2) return 'inconclusive';
 
   // Refuse to score when the cold/warm CLASSIFIER cannot discriminate on this arm.
@@ -217,13 +217,32 @@ function scoreColdAcquireShape(sortedByC: RungSample[]): Verdict {
     return 'inconclusive';
   }
 
-  const early = sortedByC.slice(0, -1);
-  const last = sortedByC[sortedByC.length - 1];
-  const earlyAllNearZero = early.every((r) => r.coldAcquireRate <= NEAR_ZERO_COLD_ACQUIRE);
-  const maxEarly = Math.max(...early.map((r) => r.coldAcquireRate));
-  const sharpRise = last.coldAcquireRate - maxEarly >= 0.3;
-  if (earlyAllNearZero && sharpRise) return 'supported';
-  if (early.some((r) => r.coldAcquireRate > NEAR_ZERO_COLD_ACQUIRE)) return 'falsified';
+  // Split on the DETECTED KNEE, not on "everything except the last rung". The prediction says
+  // the rate stays near zero *until replenishment rate meets Exec rate* and then rises sharply,
+  // and the knee is by definition where that happens -- so the knee is what separates the two
+  // halves of the claim.
+  //
+  // The old split assumed the ladder STOPS at the knee, so that the last rung was the only
+  // saturated one. But locating a knee requires sweeping PAST it, and then "everything except
+  // the last" fills up with saturated rungs and the shape test inverts. Measured on metal with
+  // ACTIVE_RUNS="1 2 4 8 16 32 64", knee 8:
+  //     c:     1     2     4     8    16    32    64
+  //     cold: 0.00  0.00  0.03  0.22  0.84  1.00  1.00
+  // which is exactly the predicted shape -- flat, then a sharp rise at the knee -- and the old
+  // split scored it 'falsified' on BOTH arms, because c=8/16/32 sat in its "early" set. A wrong
+  // verdict on a sealed prediction.
+  const pre = sortedByC.filter((r) => r.c < knee);
+  const post = sortedByC.filter((r) => r.c >= knee);
+  // With the knee at the very first rung there is no pre-knee region to characterise, and with
+  // nothing at or past it there is no rise to see. Either way the shape is unobserved, not
+  // contradicted.
+  if (pre.length === 0 || post.length === 0) return 'inconclusive';
+  const preAllNearZero = pre.every((r) => r.coldAcquireRate <= NEAR_ZERO_COLD_ACQUIRE);
+  const maxPre = Math.max(...pre.map((r) => r.coldAcquireRate));
+  const maxPost = Math.max(...post.map((r) => r.coldAcquireRate));
+  const sharpRise = maxPost - maxPre >= 0.3;
+  if (preAllNearZero && sharpRise) return 'supported';
+  if (pre.some((r) => r.coldAcquireRate > NEAR_ZERO_COLD_ACQUIRE)) return 'falsified';
   return 'inconclusive';
 }
 
@@ -241,12 +260,16 @@ function scorePrediction(
   baseline: RungSample,
   rest: RungSample[],
   sortedByC: RungSample[],
+  // Threaded through for prediction 3, whose claim is explicitly about what happens BEFORE
+  // versus AFTER the knee -- see scoreColdAcquireShape for what splitting on the wrong
+  // boundary did to a sealed prediction on real metal data.
+  knee: number,
 ): Verdict {
   switch (id) {
     case 1:
       return scorePrediction1(baseline, rest);
     case 3:
-      return scoreColdAcquireShape(sortedByC);
+      return scoreColdAcquireShape(sortedByC, knee);
     default:
       return 'inconclusive';
   }
@@ -293,7 +316,7 @@ export function analyzeLadder(samples: RungSample[]): DensityReport {
   const kneeRung = sortedByC.find((s) => s.c === knee) ?? baseline;
 
   const predictions = Object.fromEntries(
-    pinnedPredictionIds().map((id) => [id, scorePrediction(id, baseline, rest, sortedByC)]),
+    pinnedPredictionIds().map((id) => [id, scorePrediction(id, baseline, rest, sortedByC, knee)]),
   );
 
   return {

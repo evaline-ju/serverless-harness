@@ -77,6 +77,82 @@ describe('E11 ladder analysis', () => {
     ).toThrow(/lease/i);
   });
 
+  it('scores prediction 3 against the KNEE, not against "all but the last rung"', () => {
+    // The real metal ladder, ACTIVE_RUNS="1 2 4 8 16 32 64", knee 8. This is exactly the shape
+    // prediction 3 asserts -- cold-acquire flat near zero, then a sharp rise once replenishment
+    // stops keeping up -- and the old split scored it 'falsified' on BOTH arms, because it
+    // treated everything except c=64 as the pre-knee region and c=8/16/32 are past saturation.
+    // Locating a knee REQUIRES sweeping past it, so that split was wrong for any ladder long
+    // enough to find one.
+    const metalMicrovm = analyzeLadder([
+      rung({
+        c: 1,
+        coldAcquireRate: 0.0,
+        p95Ms: 124,
+        coldLatencyThresholdMs: 145,
+        throughput: 6.73,
+      }),
+      rung({
+        c: 2,
+        coldAcquireRate: 0.0,
+        p95Ms: 121,
+        coldLatencyThresholdMs: 145,
+        throughput: 13.01,
+      }),
+      rung({
+        c: 4,
+        coldAcquireRate: 0.03,
+        p95Ms: 142,
+        coldLatencyThresholdMs: 145,
+        throughput: 23.37,
+      }),
+      rung({
+        c: 8,
+        coldAcquireRate: 0.22,
+        p95Ms: 175,
+        coldLatencyThresholdMs: 145,
+        throughput: 39.04,
+      }),
+      rung({
+        c: 16,
+        coldAcquireRate: 0.84,
+        p95Ms: 353,
+        coldLatencyThresholdMs: 145,
+        throughput: 43.31,
+      }),
+      rung({
+        c: 32,
+        coldAcquireRate: 1.0,
+        p95Ms: 788,
+        coldLatencyThresholdMs: 145,
+        throughput: 35.0,
+      }),
+      rung({
+        c: 64,
+        coldAcquireRate: 1.0,
+        p95Ms: 1686,
+        coldLatencyThresholdMs: 145,
+        throughput: 32.84,
+      }),
+    ]);
+    // The knee is real here: c=16's p95 (353) exceeds 2x the c=1 baseline (248), so 8 is the
+    // last healthy rung rather than the top of the sweep.
+    expect(metalMicrovm.knee).toBe(8);
+    expect(metalMicrovm.predictions[3]).toBe('supported');
+  });
+
+  it('still falsifies prediction 3 when the rate is already high BEFORE the knee', () => {
+    // The converse, and the reason the split matters rather than just the threshold: a rate
+    // that is already elevated in the pre-knee region contradicts "stays approximately 0
+    // until replenishment rate meets Exec rate", and must still be caught after the change.
+    const preKneeAlreadyHot = analyzeLadder([
+      rung({ c: 1, coldAcquireRate: 0.4, p95Ms: 20, coldLatencyThresholdMs: 200 }),
+      rung({ c: 2, coldAcquireRate: 0.45, p95Ms: 22, coldLatencyThresholdMs: 200 }),
+      rung({ c: 4, coldAcquireRate: 0.9, p95Ms: 300, coldLatencyThresholdMs: 200, throughput: 3 }),
+    ]);
+    expect(preKneeAlreadyHot.predictions[3]).toBe('falsified');
+  });
+
   it('refuses to score prediction 3 when the cold/warm classifier cannot discriminate', () => {
     // The real microVM ladder from the validation rig. coldAcquireRate is a LATENCY proxy:
     // an Exec counts as cold at or above coldLatencyThresholdMs. Here the threshold is the
