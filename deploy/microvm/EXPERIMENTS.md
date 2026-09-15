@@ -652,15 +652,117 @@ reproduced 30-second `Restore()` timeout, not a flaky or partial result.
 
 ### E10 — the lifecycle primitive ladder
 
-Not yet run. Depends on the rig and a built golden snapshot, same as the
-correctness gates above. Driver: `deploy/microvm/e10-lifecycle.sh`; cluster-free
-proof of its structure: `deploy/microvm/tests/e10-lifecycle.test.sh` (46/46
-checks pass standalone). See the rig command section above and task-20's own
-brief for the invocation.
+**RUN ON BARE METAL. These are the first quotable numbers in this task.**
+
+Host: Supermicro SYS-7049GP-TRT, 72 cpus, 754 GiB, Ubuntu 24.04.4, kernel
+6.8.0-1061-nvidia. Verified genuinely bare metal three ways before
+`SH_SUBSTRATE=metal` was used anywhere — `systemd-detect-virt` reported `none`, the
+DMI product is a physical server, and **0 of 72 cpus carried the hypervisor flag**.
+Governor `performance`, swap off, load 0.08, no other users. `ITERS=200 WARMUP=20`.
+The golden snapshot was built on that box (spec §2.4) and its rootfs digest was
+verified identical before and after every run.
+
+Run twice — the first exposed the replenishment-CPU defect below — and the two agree:
+
+| term                            | run 1    | run 2        |
+| ------------------------------- | -------- | ------------ |
+| warm hot path p50               | 50.06 ms | **52.74 ms** |
+| container baseline p50 (rung 1) | 41 ms    | **41 ms**    |
+| ratio                           | 1.22x    | **1.29x**    |
+| rung 2 acquire mix (warm/cold)  | 143 / 57 | 143 / 57     |
+| replenishment CPU, mean/restore | 10.71 ms | **10.98 ms** |
+
+**§7.2 decision rule: STOP.** Warm hot path 52.74 ms ≥ 15 ms on metal — the design
+fails the bar it set itself. The replenishment-CPU row is **row 1, PROCEED** at
+10.98 ms per restore.
+
+**Sealed prediction 2 is SUPPORTED** (1.29x, inside 2x). Note what that means beside
+the STOP: the warm path is within 2x of the container baseline _and_ 3.5x the 15 ms
+bar, because **the baseline is itself 41 ms**. "Within 2x of the baseline" and "fast
+enough" are not the same claim.
+
+**The structural finding, and it is not what the design's model assumes.** Rung 2
+decomposes as:
+
+    acquire 0.00 ms   resume 28.58 ms   run 2.85 ms   destroy 21.31 ms   total 55.32 ms
+
+A warm acquire is **free** — the median is 0.00 ms, a standby pop — while **resume and
+destroy are 49.9 of 55.3 ms**. The design already moved machine _building_ off the hot
+path; what remains on it is resume and destroy, and they are the entire cost. Rung 1
+having its own 41 ms floor is why the ratio row passes while the absolute row does not.
+
+Driver: `deploy/microvm/e10-lifecycle.sh`; cluster-free proof of its structure:
+`deploy/microvm/tests/e10-lifecycle.test.sh`.
 
 ### E11 — density, the replenishment ceiling, and the write-up
 
-**Status: instrument built and locally verified; not yet run.** Per the
+**RUN ON BARE METAL, 14 rungs, exit 0.** `SH_E11_ACTIVE_RUNS="1 2 4 8 16 32 64"`,
+`ITERS_PER_SLOT=20`, `SH_E11_COLD_LATENCY_MS=145`, same host and snapshot as E10.
+
+| c   | microVM tput | p95     | cold | container tput | p95     | cold |
+| --- | ------------ | ------- | ---- | -------------- | ------- | ---- |
+| 1   | 6.73         | 124 ms  | 0.00 | 9.68           | 78 ms   | 0.00 |
+| 2   | 13.01        | 121 ms  | 0.00 | 20.96          | 73 ms   | 0.00 |
+| 4   | 23.37        | 142 ms  | 0.03 | 38.15          | 83 ms   | 0.00 |
+| 8   | 39.04        | 175 ms  | 0.22 | 55.32          | 124 ms  | 0.00 |
+| 16  | 43.31        | 353 ms  | 0.84 | 57.03          | 333 ms  | 0.65 |
+| 32  | 35.00        | 788 ms  | 1.00 | 49.15          | 840 ms  | 0.97 |
+| 64  | 32.84        | 1686 ms | 1.00 | 41.30          | 2138 ms | 0.99 |
+
+**knee = 8 on both arms, and it is a real knee** — the last _healthy_ rung, not the top
+of the sweep: c=16's p95 (353 ms) exceeds twice the c=1 baseline (248 ms). Throughput
+peaks at c=16 and then **declines** while p95 grows tenfold to c=64. `bound` is
+**replenishment** on both arms.
+
+**Nothing resembling a CPU or memory ceiling was reached.** `hostCpuFraction` is 0.001
+flat across the entire ladder and Σ PSS never exceeds 0.41 GB at 128 microVMs. On a
+72-cpu / 754 GiB host, what binds is replenishment.
+
+**Sealed prediction 3 is SUPPORTED on both arms**: cold-acquire stays inside the
+near-zero band before the knee (0.00, 0.00, 0.03) and rises sharply at and past it
+(0.22 → 0.84 → 1.00). It first scored _falsified_ — see the analysis-machinery note
+below; the curve was right and the scorer's pre/post split was wrong.
+
+**Sealed prediction 1 is INCONCLUSIVE, stated precisely.** Its scorer needs a threshold
+_crossing_ on memory or process count, and this host never produces one. What was
+observed is that CPU demonstrably never bound and the knee was replenishment-bound —
+consistent with the prediction's direction, but **not a scored result**, and it should
+not be reported as one. Confirming prediction 1 on this class of hardware needs a
+ladder that reaches an actual memory or process ceiling.
+
+**Prediction 4 is NOT EVALUABLE**: it compares Cloud Hypervisor's virtio-fs against
+Firecracker's block, and the CH arm is deliberately off at 3/10 gates — there is no
+second arm. **Prediction 5 is INCONCLUSIVE**: `analyzeLadder` cannot score it from a
+ladder of `RungSample`; it needs the post-rung convergence series.
+
+#### Three defects in the ANALYSIS machinery, all found only by running at real scale
+
+Each compared the wrong quantity, and two produced a wrong verdict on a sealed
+prediction or on the STOP row itself. They are recorded here because the numbers were
+never the fragile part — the machinery deciding what they _meant_ was.
+
+1. The §7.2 verdict never asked whether the **warm** rung was warm. At `ITERS=5` the
+   standby pool cannot refill between back-to-back Execs, so one acquire in five was
+   warm and the rung measured the cold path; the driver printed
+   `STOP: warm hot path 69.87ms` from it. Now refused unless warm acquires are a strict
+   majority — which is exactly the condition under which a p50 _median_ lands in the
+   warm population.
+2. The replenishment-CPU row compared `cpu_child_us`, a **run total**, against a
+   per-restore threshold, so it scaled with `ITERS`: 1927 ms and `MANDATORY` where the
+   real figure is 10.71 ms and row 1. The nested rig had passed that row only because
+   `ITERS=5` made the sum small — the same artefact wearing the opposite sign.
+3. Prediction 3's scorer split pre/post as "everything except the final rung", which
+   only holds if the ladder _stops_ at the knee — and locating a knee requires sweeping
+   past it. It now splits on the detected knee.
+
+Driver: `deploy/microvm/e11-density.sh`. Cluster-free proof of its structure:
+`deploy/microvm/tests/e11-density.test.sh`. Analysis: `analyzeLadder` in
+`experiments/src/microvm-density.ts`, which reuses `detectKnee` (spec §7.3) and scores
+predictions pinned in `deploy/microvm/predictions.json`.
+
+#### The original pre-run status, kept for the record
+
+Per the
 project owner's resequencing of this endgame — build everything, then
 validate hypotheses on a virtualized box, then a reviewed PR, then the metal
 run last (pre-run hardware correction F1; a build-time note, not committed) — this task built the sweep
